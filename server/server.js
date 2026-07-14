@@ -47,7 +47,7 @@ app.post("/tts", async (req, res) => {
     if (text.length > 4000) return res.status(400).json({ error: "Seslendirilecek metin çok uzun." });
     const speech = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
-      voice: "coral",
+      voice: "alloy",
       input: text,
       instructions: `Speak naturally and clearly in ${language}. Use a warm, calm conversational tone. Do not translate, explain, or add any words.`,
       response_format: "mp3",
