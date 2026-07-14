@@ -8,62 +8,57 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({limit: "1mb"}));
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+if (!process.env.OPENAI_API_KEY) {
+  console.error("OPENAI_API_KEY bulunamadı.");
+  process.exit(1);
+}
+
+const openai = new OpenAI({apiKey: process.env.OPENAI_API_KEY});
 
 app.get("/", (req, res) => {
-  res.send("🚀 AyTalk Server is Running!");
+  res.send("AyTalk Server Çalışıyor");
 });
 
 app.post("/chat", async (req, res) => {
   try {
-    const { message } = req.body;
+    const message = String(req.body?.message || "").trim();
+    const from = String(req.body?.from || "Turkish").trim();
+    const to = String(req.body?.to || "English").trim();
 
-    if (!message || typeof message !== "string") {
-      return res.status(400).json({
-        error: "Gönderilecek mesaj bulunamadı.",
-      });
+    if (!message) {
+      return res.status(400).json({error: "Mesaj boş."});
     }
 
-    const response = await openai.chat.completions.create({
+    const response = await openai.responses.create({
       model: "gpt-4.1-mini",
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are AyTalk, a helpful AI translator. Translate accurately and naturally.",
-        },
-        {
-          role: "user",
-          content: message,
-        },
-      ],
+      instructions:
+        "You are AyTalk, an accurate natural-language translator. " +
+        "Return only the translated text. Do not explain, label, quote, " +
+        "summarize, or add commentary. Preserve names, numbers, meaning, " +
+        "tone, punctuation, and question/statement form.",
+      input:
+        `Source language: ${from}\n` +
+        `Target language: ${to}\n\n` +
+        `Text:\n${message}`,
     });
 
-    const reply = response.choices[0]?.message?.content;
+    const reply = String(response.output_text || "").trim();
+    if (!reply) throw new Error("OpenAI boş yanıt döndürdü.");
 
-    if (!reply) {
-      throw new Error("OpenAI geçerli bir cevap göndermedi.");
-    }
-
-    res.json({
-      reply,
-    });
+    return res.json({reply});
   } catch (error) {
-    console.error("AyTalk server hatası:", error);
-
-    res.status(500).json({
-      error:
-        error instanceof Error
-          ? error.message
-          : "Bilinmeyen bir sunucu hatası oluştu.",
+    console.error("AyTalk server error:", error);
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : "Bilinmeyen sunucu hatası.",
     });
   }
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log("================================");
+  console.log("AyTalk Server Başladı");
+  console.log(`Port: ${PORT}`);
+  console.log("================================");
 });
