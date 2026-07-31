@@ -18,6 +18,21 @@ app.disable("x-powered-by");
 app.use(cors());
 app.use(express.json({limit: "2mb"}));
 
+function prepareStreamResponse(res) {
+  res.status(200);
+  res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+}
+
+function writeStreamEvent(res, payload) {
+  if (!res.writableEnded) {
+    res.write(`${JSON.stringify(payload)}\n`);
+  }
+}
+
 if (!process.env.OPENAI_API_KEY) {
   console.error("OPENAI_API_KEY bulunamadı.");
   process.exit(1);
@@ -28,7 +43,7 @@ app.get("/", (_req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ok: true, service: "AyTalk", version: "fast-1.1"});
+  res.json({ok: true, service: "AyTalk", version: "stream-1.2"});
 });
 
 // HIZLI ÇEVİRİ
@@ -98,6 +113,105 @@ app.post("/chat", async (req, res) => {
   }
 });
 
+
+// STREAMING ÇEVİRİ
+app.post("/chat-stream", async (req, res) => {
+  const startedAt = Date.now();
+  let clientClosed = false;
+
+  req.on("close", () => {
+    clientClosed = true;
+  });
+
+  try {
+    const message = String(req.body?.message || "").trim();
+    const from = String(req.body?.from || "Turkish").trim();
+    const to = String(req.body?.to || "English").trim();
+
+    if (!message) {
+      return res.status(400).json({error: "Mesaj boş."});
+    }
+
+    if (message.length > 12000) {
+      return res.status(400).json({
+        error: "Metin çok uzun. En fazla 12.000 karakter gönder.",
+      });
+    }
+
+    prepareStreamResponse(res);
+    writeStreamEvent(res, {type: "start"});
+
+    const stream = await openai.responses.create({
+      model: "gpt-4.1-nano",
+      store: false,
+      stream: true,
+      max_output_tokens: Math.min(
+        3000,
+        Math.max(120, Math.ceil(message.length * 1.35))
+      ),
+      instructions:
+        `Translate from ${from} to ${to}. ` +
+        "Return only the translation. Preserve meaning, names, numbers, " +
+        "punctuation, paragraphs, tone, and question form.",
+      input: message,
+    });
+
+    let fullText = "";
+
+    for await (const event of stream) {
+      if (clientClosed || res.writableEnded) break;
+
+      if (event.type === "response.output_text.delta") {
+        const delta = String(event.delta || "");
+        if (delta) {
+          fullText += delta;
+          writeStreamEvent(res, {type: "delta", delta});
+        }
+      }
+
+      if (event.type === "response.failed") {
+        throw new Error(
+          event.response?.error?.message || "OpenAI streaming başarısız oldu."
+        );
+      }
+    }
+
+    if (!clientClosed && !res.writableEnded) {
+      const reply = fullText.trim();
+
+      if (!reply) {
+        throw new Error("OpenAI boş yanıt döndürdü.");
+      }
+
+      writeStreamEvent(res, {
+        type: "done",
+        reply,
+        elapsedMs: Date.now() - startedAt,
+      });
+      res.end();
+    }
+
+    console.log(`Streaming translation completed in ${Date.now() - startedAt} ms`);
+  } catch (error) {
+    console.error(
+      `Streaming translation error after ${Date.now() - startedAt} ms:`,
+      error
+    );
+
+    if (!res.headersSent) {
+      return res.status(500).json({
+        error: error instanceof Error ? error.message : "Bilinmeyen sunucu hatası.",
+      });
+    }
+
+    writeStreamEvent(res, {
+      type: "error",
+      error: error instanceof Error ? error.message : "Bilinmeyen sunucu hatası.",
+    });
+    res.end();
+  }
+});
+
 // YAPAY ZEKÂ ASİSTANI
 app.post("/assistant", async (req, res) => {
   const startedAt = Date.now();
@@ -162,6 +276,115 @@ app.post("/assistant", async (req, res) => {
           ? error.message
           : "Bilinmeyen sunucu hatası.",
     });
+  }
+});
+
+
+// STREAMING YAPAY ZEKÂ ASİSTANI
+app.post("/assistant-stream", async (req, res) => {
+  const startedAt = Date.now();
+  let clientClosed = false;
+
+  req.on("close", () => {
+    clientClosed = true;
+  });
+
+  try {
+    const message = String(req.body?.message || "").trim();
+    const language = String(req.body?.language || "Turkish").trim();
+    const history = Array.isArray(req.body?.history)
+      ? req.body.history.slice(-8)
+      : [];
+
+    if (!message) {
+      return res.status(400).json({error: "Mesaj boş."});
+    }
+
+    if (message.length > 8000) {
+      return res.status(400).json({
+        error: "Mesaj çok uzun. En fazla 8.000 karakter gönder.",
+      });
+    }
+
+    const safeHistory = history
+      .filter(
+        item =>
+          item &&
+          (item.role === "user" || item.role === "assistant")
+      )
+      .map(item => ({
+        role: item.role,
+        content: String(item.content || "").slice(0, 2500),
+      }));
+
+    prepareStreamResponse(res);
+    writeStreamEvent(res, {type: "start"});
+
+    const stream = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      store: false,
+      stream: true,
+      max_output_tokens: 900,
+      instructions:
+        `You are AyTalk AI, a helpful and practical assistant. ` +
+        `Answer in ${language} unless another language is requested. ` +
+        "Be clear and concise. Do not claim actions you did not perform.",
+      input: [...safeHistory, {role: "user", content: message}],
+    });
+
+    let fullText = "";
+
+    for await (const event of stream) {
+      if (clientClosed || res.writableEnded) break;
+
+      if (event.type === "response.output_text.delta") {
+        const delta = String(event.delta || "");
+        if (delta) {
+          fullText += delta;
+          writeStreamEvent(res, {type: "delta", delta});
+        }
+      }
+
+      if (event.type === "response.failed") {
+        throw new Error(
+          event.response?.error?.message || "OpenAI streaming başarısız oldu."
+        );
+      }
+    }
+
+    if (!clientClosed && !res.writableEnded) {
+      const reply = fullText.trim();
+
+      if (!reply) {
+        throw new Error("OpenAI boş yanıt döndürdü.");
+      }
+
+      writeStreamEvent(res, {
+        type: "done",
+        reply,
+        elapsedMs: Date.now() - startedAt,
+      });
+      res.end();
+    }
+
+    console.log(`Streaming assistant completed in ${Date.now() - startedAt} ms`);
+  } catch (error) {
+    console.error(
+      `Streaming assistant error after ${Date.now() - startedAt} ms:`,
+      error
+    );
+
+    if (!res.headersSent) {
+      return res.status(500).json({
+        error: error instanceof Error ? error.message : "Bilinmeyen sunucu hatası.",
+      });
+    }
+
+    writeStreamEvent(res, {
+      type: "error",
+      error: error instanceof Error ? error.message : "Bilinmeyen sunucu hatası.",
+    });
+    res.end();
   }
 });
 
