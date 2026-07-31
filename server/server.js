@@ -16,7 +16,7 @@ const openai = new OpenAI({
 
 app.disable("x-powered-by");
 app.use(cors());
-app.use(express.json({limit: "2mb"}));
+app.use(express.json({limit: "12mb"}));
 
 function prepareStreamResponse(res) {
   res.status(200);
@@ -43,7 +43,7 @@ app.get("/", (_req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ok: true, service: "AyTalk", version: "stream-1.2.1"});
+  res.json({ok: true, service: "AyTalk", version: "vision-1.3"});
 });
 
 // HIZLI ÇEVİRİ
@@ -389,6 +389,83 @@ app.post("/assistant-stream", async (req, res) => {
       error: error instanceof Error ? error.message : "Bilinmeyen sunucu hatası.",
     });
     res.end();
+  }
+});
+
+
+// BULUT GÖRSEL OKUMA (ÇOK DİLLİ OCR)
+app.post("/vision-ocr", async (req, res) => {
+  const startedAt = Date.now();
+
+  try {
+    const imageBase64 = String(req.body?.imageBase64 || "").trim();
+    const mimeType = String(req.body?.mimeType || "image/jpeg").trim();
+    const language = String(req.body?.language || "Unknown").trim();
+
+    if (!imageBase64) {
+      return res.status(400).json({error: "Görsel verisi boş."});
+    }
+
+    if (imageBase64.length > 10_000_000) {
+      return res.status(400).json({
+        error: "Görsel çok büyük. Daha düşük çözünürlüklü bir fotoğraf seç.",
+      });
+    }
+
+    const response = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      store: false,
+      max_output_tokens: 2200,
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text:
+                `Read and transcribe every visible text from this image. ` +
+                `The expected language is ${language}. ` +
+                "Return only the extracted text, preserving line breaks and reading order. " +
+                "Do not translate, explain, summarize, or add labels. " +
+                "If there is no readable text, return exactly: NO_TEXT",
+            },
+            {
+              type: "input_image",
+              image_url: `data:${mimeType};base64,${imageBase64}`,
+              detail: "high",
+            },
+          ],
+        },
+      ],
+    });
+
+    const text = String(response.output_text || "").trim();
+
+    if (!text || text === "NO_TEXT") {
+      return res.status(422).json({
+        error: "Fotoğrafta okunabilir metin bulunamadı.",
+      });
+    }
+
+    res.json({
+      text,
+      provider: "openai-vision",
+      elapsedMs: Date.now() - startedAt,
+    });
+
+    console.log(`Vision OCR completed in ${Date.now() - startedAt} ms`);
+  } catch (error) {
+    console.error(
+      `Vision OCR error after ${Date.now() - startedAt} ms:`,
+      error,
+    );
+
+    res.status(500).json({
+      error:
+        error instanceof Error
+          ? error.message
+          : "Bulut görsel okuma sırasında bilinmeyen hata oluştu.",
+    });
   }
 });
 
