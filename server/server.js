@@ -43,7 +43,7 @@ app.get("/", (_req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ok: true, service: "AyTalk", version: "stream-1.2"});
+  res.json({ok: true, service: "AyTalk", version: "stream-1.2.1"});
 });
 
 // HIZLI ÇEVİRİ
@@ -119,8 +119,10 @@ app.post("/chat-stream", async (req, res) => {
   const startedAt = Date.now();
   let clientClosed = false;
 
-  req.on("close", () => {
-    clientClosed = true;
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      clientClosed = true;
+    }
   });
 
   try {
@@ -159,7 +161,7 @@ app.post("/chat-stream", async (req, res) => {
     let fullText = "";
 
     for await (const event of stream) {
-      if (clientClosed || res.writableEnded) break;
+      if (clientClosed || res.destroyed || res.writableEnded) break;
 
       if (event.type === "response.output_text.delta") {
         const delta = String(event.delta || "");
@@ -285,8 +287,10 @@ app.post("/assistant-stream", async (req, res) => {
   const startedAt = Date.now();
   let clientClosed = false;
 
-  req.on("close", () => {
-    clientClosed = true;
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      clientClosed = true;
+    }
   });
 
   try {
@@ -335,7 +339,7 @@ app.post("/assistant-stream", async (req, res) => {
     let fullText = "";
 
     for await (const event of stream) {
-      if (clientClosed || res.writableEnded) break;
+      if (clientClosed || res.destroyed || res.writableEnded) break;
 
       if (event.type === "response.output_text.delta") {
         const delta = String(event.delta || "");
