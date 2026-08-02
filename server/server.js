@@ -488,6 +488,7 @@ app.post("/tts", async (req, res) => {
     const pace = ["slow", "normal", "fast"].includes(voiceStyle?.pace)
       ? voiceStyle.pace
       : "normal";
+    const requestedVoice = voiceStyle?.voice === "male" ? "onyx" : "coral";
 
     if (!text) {
       return res.status(400).json({
@@ -503,23 +504,16 @@ app.post("/tts", async (req, res) => {
 
     const speech = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
-      voice: "coral",
+      voice: requestedVoice,
       input: text,
       response_format: "mp3",
-      instructions: [
-        language
-          ? `Speak naturally and clearly in ${language}.`
-          : "Speak naturally and clearly.",
-        followSpeaker
-          ? "Match the speaker's conversational rhythm without imitating their identity, accent, or unique voiceprint."
-          : "Use a clear, neutral, friendly delivery.",
+      instructions: `${language ? `Speak in ${language}. ` : ""}${
         pace === "fast"
-          ? "Use a lively, slightly faster pace while staying intelligible."
+          ? "Speak slightly fast and clearly."
           : pace === "slow"
-            ? "Use a calm, measured, slightly slower pace."
-            : "Use a natural medium pace.",
-        "Keep the result warm, expressive, and suitable for everyday conversation.",
-      ].join(" "),
+            ? "Speak calmly and slightly slowly."
+            : "Speak naturally at a normal pace."
+      } ${followSpeaker ? "Keep a natural conversational rhythm." : "Use a clear neutral delivery."}`,
     });
 
     const buffer = Buffer.from(await speech.arrayBuffer());
