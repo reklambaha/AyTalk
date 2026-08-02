@@ -24,13 +24,22 @@ function prepareStreamResponse(res) {
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
+  res.setHeader("Transfer-Encoding", "chunked");
+  res.socket?.setNoDelay?.(true);
   res.flushHeaders?.();
 }
 
 function writeStreamEvent(res, payload) {
   if (!res.writableEnded) {
     res.write(`${JSON.stringify(payload)}\n`);
+    res.flush?.();
   }
+}
+
+function writeStreamStart(res) {
+  // Bazı mobil ağlar ve reverse proxy'ler çok küçük ilk parçaları tamponlar.
+  // Padding tek bir geçerli NDJSON olayıdır; istemci fazladan alanı yok sayar.
+  writeStreamEvent(res, {type: "start", padding: " ".repeat(2048)});
 }
 
 if (!process.env.OPENAI_API_KEY) {
@@ -141,7 +150,7 @@ app.post("/chat-stream", async (req, res) => {
     }
 
     prepareStreamResponse(res);
-    writeStreamEvent(res, {type: "start"});
+    writeStreamStart(res);
 
     const stream = await openai.responses.create({
       model: "gpt-4.1-nano",
@@ -322,7 +331,7 @@ app.post("/assistant-stream", async (req, res) => {
       }));
 
     prepareStreamResponse(res);
-    writeStreamEvent(res, {type: "start"});
+    writeStreamStart(res);
 
     const stream = await openai.responses.create({
       model: "gpt-4.1-mini",
