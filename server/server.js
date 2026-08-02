@@ -483,6 +483,11 @@ app.post("/tts", async (req, res) => {
   try {
     const text = String(req.body?.text || "").trim();
     const language = String(req.body?.language || "").trim();
+    const voiceStyle = req.body?.voiceStyle || {};
+    const followSpeaker = voiceStyle?.followSpeaker === true;
+    const pace = ["slow", "normal", "fast"].includes(voiceStyle?.pace)
+      ? voiceStyle.pace
+      : "normal";
 
     if (!text) {
       return res.status(400).json({
@@ -501,9 +506,20 @@ app.post("/tts", async (req, res) => {
       voice: "coral",
       input: text,
       response_format: "mp3",
-      instructions: language
-        ? `Speak naturally and clearly in ${language}.`
-        : "Speak naturally and clearly.",
+      instructions: [
+        language
+          ? `Speak naturally and clearly in ${language}.`
+          : "Speak naturally and clearly.",
+        followSpeaker
+          ? "Match the speaker's conversational rhythm without imitating their identity, accent, or unique voiceprint."
+          : "Use a clear, neutral, friendly delivery.",
+        pace === "fast"
+          ? "Use a lively, slightly faster pace while staying intelligible."
+          : pace === "slow"
+            ? "Use a calm, measured, slightly slower pace."
+            : "Use a natural medium pace.",
+        "Keep the result warm, expressive, and suitable for everyday conversation.",
+      ].join(" "),
     });
 
     const buffer = Buffer.from(await speech.arrayBuffer());
