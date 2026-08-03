@@ -2,9 +2,10 @@
   "name": "server",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "check": "node --check server.js"
   },
   "keywords": [],
   "author": "",
@@ -16,6 +17,7 @@
     "express": "^5.2.1",
     "formidable": "^3.5.4",
     "multer": "^2.2.0",
-    "openai": "^6.46.0"
+    "openai": "^6.46.0",
+    "livekit-server-sdk": "^2.17.0"
   }
 }
