@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const OpenAI = require("openai");
+const {AccessToken} = require("livekit-server-sdk");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -24,22 +25,13 @@ function prepareStreamResponse(res) {
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
-  res.setHeader("Transfer-Encoding", "chunked");
-  res.socket?.setNoDelay?.(true);
   res.flushHeaders?.();
 }
 
 function writeStreamEvent(res, payload) {
   if (!res.writableEnded) {
     res.write(`${JSON.stringify(payload)}\n`);
-    res.flush?.();
   }
-}
-
-function writeStreamStart(res) {
-  // Bazı mobil ağlar ve reverse proxy'ler çok küçük ilk parçaları tamponlar.
-  // Padding tek bir geçerli NDJSON olayıdır; istemci fazladan alanı yok sayar.
-  writeStreamEvent(res, {type: "start", padding: " ".repeat(2048)});
 }
 
 if (!process.env.OPENAI_API_KEY) {
@@ -49,6 +41,80 @@ if (!process.env.OPENAI_API_KEY) {
 
 app.get("/", (_req, res) => {
   res.send("AyTalk Server Çalışıyor");
+});
+
+
+// LIVEKIT UZAK GÖRÜŞME TOKEN ENDPOINT
+app.post("/livekit/token", async (req, res) => {
+  try {
+    const livekitUrl = String(process.env.LIVEKIT_URL || "").trim();
+    const apiKey = String(process.env.LIVEKIT_API_KEY || "").trim();
+    const apiSecret = String(process.env.LIVEKIT_API_SECRET || "").trim();
+
+    if (!livekitUrl || !apiKey || !apiSecret) {
+      return res.status(503).json({
+        error:
+          "LiveKit henüz yapılandırılmadı. LIVEKIT_URL, LIVEKIT_API_KEY ve LIVEKIT_API_SECRET eklenmeli.",
+      });
+    }
+
+    const roomName = String(req.body?.roomName || "")
+      .trim()
+      .toUpperCase()
+      .replace(/[^A-Z0-9-]/g, "")
+      .slice(0, 64);
+
+    const participantIdentity = String(
+      req.body?.participantIdentity || "",
+    )
+      .trim()
+      .replace(/[^a-zA-Z0-9_-]/g, "")
+      .slice(0, 64);
+
+    const participantName = String(req.body?.participantName || "")
+      .trim()
+      .slice(0, 64);
+
+    if (roomName.length < 4) {
+      return res.status(400).json({error: "Geçerli bir oda kodu gerekli."});
+    }
+
+    if (!participantIdentity || !participantName) {
+      return res.status(400).json({
+        error: "Katılımcı kimliği ve adı gerekli.",
+      });
+    }
+
+    const accessToken = new AccessToken(apiKey, apiSecret, {
+      identity: participantIdentity,
+      name: participantName,
+      ttl: "2h",
+    });
+
+    accessToken.addGrant({
+      roomJoin: true,
+      room: roomName,
+      canPublish: true,
+      canSubscribe: true,
+      canPublishData: true,
+    });
+
+    const participantToken = await accessToken.toJwt();
+
+    return res.status(201).json({
+      serverUrl: livekitUrl,
+      participantToken,
+    });
+  } catch (error) {
+    console.error("LiveKit token error:", error);
+
+    return res.status(500).json({
+      error:
+        error instanceof Error
+          ? error.message
+          : "LiveKit token üretilemedi.",
+    });
+  }
 });
 
 app.get("/health", (_req, res) => {
@@ -150,7 +216,7 @@ app.post("/chat-stream", async (req, res) => {
     }
 
     prepareStreamResponse(res);
-    writeStreamStart(res);
+    writeStreamEvent(res, {type: "start"});
 
     const stream = await openai.responses.create({
       model: "gpt-4.1-nano",
@@ -331,7 +397,7 @@ app.post("/assistant-stream", async (req, res) => {
       }));
 
     prepareStreamResponse(res);
-    writeStreamStart(res);
+    writeStreamEvent(res, {type: "start"});
 
     const stream = await openai.responses.create({
       model: "gpt-4.1-mini",
@@ -483,12 +549,6 @@ app.post("/tts", async (req, res) => {
   try {
     const text = String(req.body?.text || "").trim();
     const language = String(req.body?.language || "").trim();
-    const voiceStyle = req.body?.voiceStyle || {};
-    const followSpeaker = voiceStyle?.followSpeaker === true;
-    const pace = ["slow", "normal", "fast"].includes(voiceStyle?.pace)
-      ? voiceStyle.pace
-      : "normal";
-    const requestedVoice = voiceStyle?.voice === "male" ? "onyx" : "coral";
 
     if (!text) {
       return res.status(400).json({
@@ -504,16 +564,12 @@ app.post("/tts", async (req, res) => {
 
     const speech = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
-      voice: requestedVoice,
+      voice: "coral",
       input: text,
       response_format: "mp3",
-      instructions: `${language ? `Speak in ${language}. ` : ""}${
-        pace === "fast"
-          ? "Speak slightly fast and clearly."
-          : pace === "slow"
-            ? "Speak calmly and slightly slowly."
-            : "Speak naturally at a normal pace."
-      } ${followSpeaker ? "Keep a natural conversational rhythm." : "Use a clear neutral delivery."}`,
+      instructions: language
+        ? `Speak naturally and clearly in ${language}.`
+        : "Speak naturally and clearly.",
     });
 
     const buffer = Buffer.from(await speech.arrayBuffer());
