@@ -75,6 +75,19 @@ app.post("/livekit/token", async (req, res) => {
       .trim()
       .slice(0, 64);
 
+    const sourceLanguage = String(req.body?.sourceLanguage || "Auto")
+      .trim()
+      .slice(0, 48);
+    const targetLanguage = String(req.body?.targetLanguage || "English")
+      .trim()
+      .slice(0, 48);
+    const sourceLocale = String(req.body?.sourceLocale || "")
+      .trim()
+      .slice(0, 24);
+    const targetLocale = String(req.body?.targetLocale || "")
+      .trim()
+      .slice(0, 24);
+
     if (roomName.length < 4) {
       return res.status(400).json({error: "Geçerli bir oda kodu gerekli."});
     }
@@ -89,6 +102,13 @@ app.post("/livekit/token", async (req, res) => {
       identity: participantIdentity,
       name: participantName,
       ttl: "2h",
+      attributes: {
+        "aytalk.role": "human",
+        "aytalk.sourceLanguage": sourceLanguage || "Auto",
+        "aytalk.targetLanguage": targetLanguage || "English",
+        "aytalk.sourceLocale": sourceLocale,
+        "aytalk.targetLocale": targetLocale,
+      },
     });
 
     accessToken.addGrant({
@@ -587,170 +607,6 @@ app.post("/tts", async (req, res) => {
           : "Bilinmeyen seslendirme hatası.",
     });
   }
-});
-
-
-// AYTalk Social Calling - ilk güvenli sürüm.
-// Render yeniden başlatıldığında bellek temizlenir; istemci kişi listesini
-// AsyncStorage'da sakladığı için temel kullanım devam eder.
-const socialUsers = new Map();
-const socialFriendships = new Map();
-
-function normalizeSocialId(value) {
-  return String(value || "")
-    .trim()
-    .toUpperCase()
-    .replace(/[^A-Z0-9-]/g, "")
-    .slice(0, 20);
-}
-
-function socialUserView(user) {
-  if (!user) return null;
-  const online = Date.now() - Number(user.lastHeartbeat || 0) < 45000;
-  return {
-    aytalkId: user.aytalkId,
-    name: user.name,
-    language: user.language,
-    country: user.country,
-    online,
-    lastSeen: new Date(user.lastHeartbeat || user.updatedAt).toISOString(),
-  };
-}
-
-app.post("/social/register", (req, res) => {
-  const aytalkId = normalizeSocialId(req.body?.aytalkId);
-  const name = String(req.body?.name || "AyTalk Kullanıcısı").trim().slice(0, 50);
-  const language = String(req.body?.language || "Turkish").trim().slice(0, 40);
-  const country = String(req.body?.country || "").trim().slice(0, 50);
-
-  if (aytalkId.length < 5) {
-    return res.status(400).json({error: "Geçerli AyTalk ID gerekli."});
-  }
-
-  const now = Date.now();
-  const previous = socialUsers.get(aytalkId);
-
-  const user = {
-    aytalkId,
-    name,
-    language,
-    country,
-    createdAt: previous?.createdAt || now,
-    updatedAt: now,
-    lastHeartbeat: now,
-  };
-
-  socialUsers.set(aytalkId, user);
-
-  return res.status(previous ? 200 : 201).json({
-    user: socialUserView(user),
-  });
-});
-
-app.post("/social/heartbeat", (req, res) => {
-  const aytalkId = normalizeSocialId(req.body?.aytalkId);
-  const user = socialUsers.get(aytalkId);
-
-  if (!user) {
-    return res.status(404).json({error: "Kullanıcı bulunamadı."});
-  }
-
-  user.lastHeartbeat = Date.now();
-  user.updatedAt = Date.now();
-  socialUsers.set(aytalkId, user);
-
-  return res.json({ok: true, user: socialUserView(user)});
-});
-
-app.get("/social/user/:aytalkId", (req, res) => {
-  const aytalkId = normalizeSocialId(req.params?.aytalkId);
-  const user = socialUsers.get(aytalkId);
-
-  if (!user) {
-    return res.status(404).json({error: "AyTalk kullanıcısı bulunamadı."});
-  }
-
-  return res.json({user: socialUserView(user)});
-});
-
-app.post("/social/presence", (req, res) => {
-  const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
-  const users = ids
-    .map(normalizeSocialId)
-    .filter(Boolean)
-    .map(id => {
-      const user = socialUsers.get(id);
-      if (user) return socialUserView(user);
-      return {
-        aytalkId: id,
-        name: "",
-        language: "",
-        country: "",
-        online: false,
-        lastSeen: "",
-      };
-    });
-
-  return res.json({users});
-});
-
-app.post("/social/friend/add", (req, res) => {
-  const ownerId = normalizeSocialId(req.body?.ownerId);
-  const friendId = normalizeSocialId(req.body?.friendId);
-
-  if (!ownerId || !friendId || ownerId === friendId) {
-    return res.status(400).json({error: "Geçerli kişi bilgileri gerekli."});
-  }
-
-  const current = socialFriendships.get(ownerId) || new Set();
-  current.add(friendId);
-  socialFriendships.set(ownerId, current);
-
-  return res.status(201).json({
-    ok: true,
-    ownerId,
-    friendId,
-  });
-});
-
-app.get("/social/friends/:ownerId", (req, res) => {
-  const ownerId = normalizeSocialId(req.params?.ownerId);
-  const ids = Array.from(socialFriendships.get(ownerId) || []);
-  const friends = ids.map(id => {
-    const user = socialUsers.get(id);
-    return user
-      ? socialUserView(user)
-      : {
-          aytalkId: id,
-          name: id,
-          language: "",
-          country: "",
-          online: false,
-          lastSeen: "",
-        };
-  });
-
-  return res.json({friends});
-});
-
-app.post("/social/call/start", (req, res) => {
-  const callerId = normalizeSocialId(req.body?.callerId);
-  const calleeId = normalizeSocialId(req.body?.calleeId);
-  const translated = Boolean(req.body?.translated);
-
-  if (!callerId || !calleeId) {
-    return res.status(400).json({error: "Arayan ve aranan kullanıcı gerekli."});
-  }
-
-  const roomName = `AY-${callerId}-${calleeId}-${Date.now().toString(36)}`
-    .replace(/[^A-Z0-9-]/g, "")
-    .slice(0, 64);
-
-  return res.status(201).json({
-    roomName,
-    translated,
-    createdAt: new Date().toISOString(),
-  });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
