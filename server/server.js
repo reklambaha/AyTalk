@@ -75,19 +75,6 @@ app.post("/livekit/token", async (req, res) => {
       .trim()
       .slice(0, 64);
 
-    const sourceLanguage = String(req.body?.sourceLanguage || "Auto")
-      .trim()
-      .slice(0, 48);
-    const targetLanguage = String(req.body?.targetLanguage || "English")
-      .trim()
-      .slice(0, 48);
-    const sourceLocale = String(req.body?.sourceLocale || "")
-      .trim()
-      .slice(0, 24);
-    const targetLocale = String(req.body?.targetLocale || "")
-      .trim()
-      .slice(0, 24);
-
     if (roomName.length < 4) {
       return res.status(400).json({error: "Geçerli bir oda kodu gerekli."});
     }
@@ -98,26 +85,10 @@ app.post("/livekit/token", async (req, res) => {
       });
     }
 
-    const participantMetadata = JSON.stringify({
-      aytalkRole: "human",
-      sourceLanguage: sourceLanguage || "Auto",
-      targetLanguage: targetLanguage || "English",
-      sourceLocale,
-      targetLocale,
-    });
-
     const accessToken = new AccessToken(apiKey, apiSecret, {
       identity: participantIdentity,
       name: participantName,
       ttl: "2h",
-      metadata: participantMetadata,
-      attributes: {
-        "aytalk.role": "human",
-        "aytalk.sourceLanguage": sourceLanguage || "Auto",
-        "aytalk.targetLanguage": targetLanguage || "English",
-        "aytalk.sourceLocale": sourceLocale,
-        "aytalk.targetLocale": targetLocale,
-      },
     });
 
     accessToken.addGrant({
@@ -148,6 +119,71 @@ app.post("/livekit/token", async (req, res) => {
 
 app.get("/health", (_req, res) => {
   res.json({ok: true, service: "AyTalk", version: "vision-1.3"});
+});
+
+// GÖRÜŞME İÇİN BAĞLAMLI VE SIKI ÇEVİRİ
+app.post("/call/translate", async (req, res) => {
+  const startedAt = Date.now();
+
+  try {
+    const message = String(req.body?.message || "").trim();
+    const from = String(req.body?.from || "Auto").trim();
+    const to = String(req.body?.to || "English").trim();
+    const rawContext = Array.isArray(req.body?.context) ? req.body.context : [];
+    const context = rawContext
+      .slice(-5)
+      .map(item => ({
+        source: String(item?.source || "").trim().slice(0, 1200),
+        translation: String(item?.translation || "").trim().slice(0, 1200),
+      }))
+      .filter(item => item.source || item.translation);
+
+    if (!message) {
+      return res.status(400).json({error: "Mesaj boş."});
+    }
+
+    if (message.length > 4000) {
+      return res.status(400).json({error: "Konuşma bölümü çok uzun."});
+    }
+
+    const contextText = context.length
+      ? context
+          .map((item, index) =>
+            `${index + 1}. SOURCE: ${item.source}\nTRANSLATION: ${item.translation}`,
+          )
+          .join("\n\n")
+      : "No previous context.";
+
+    const response = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      store: false,
+      max_output_tokens: Math.min(1200, Math.max(80, Math.ceil(message.length * 1.6))),
+      instructions:
+        "You are AyTalk's professional live interpreter. " +
+        `Translate the CURRENT utterance from ${from} to ${to}. ` +
+        "Use previous context only to resolve pronouns, names, terminology and meaning. " +
+        "Never add facts, explanations, summaries, politeness, completions, or guesses. " +
+        "Never answer the speaker. Never continue an unfinished thought. " +
+        "Preserve names, numbers, medical/legal/technical terms, tone, negation and question form. " +
+        "If the utterance is a fragment, translate it as a fragment. " +
+        "Return ONLY the translation of CURRENT_UTTERANCE.",
+      input:
+        `PREVIOUS_CONTEXT:\n${contextText}\n\n` +
+        `CURRENT_UTTERANCE:\n${message}`,
+    });
+
+    const reply = String(response.output_text || "").trim();
+    if (!reply) {
+      throw new Error("OpenAI boş çeviri döndürdü.");
+    }
+
+    return res.json({reply, elapsedMs: Date.now() - startedAt});
+  } catch (error) {
+    console.error("Call translation error:", error);
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : "Görüşme çevirisi başarısız.",
+    });
+  }
 });
 
 // HIZLI ÇEVİRİ
