@@ -98,10 +98,19 @@ app.post("/livekit/token", async (req, res) => {
       });
     }
 
+    const participantMetadata = JSON.stringify({
+      aytalkRole: "human",
+      sourceLanguage: sourceLanguage || "Auto",
+      targetLanguage: targetLanguage || "English",
+      sourceLocale,
+      targetLocale,
+    });
+
     const accessToken = new AccessToken(apiKey, apiSecret, {
       identity: participantIdentity,
       name: participantName,
       ttl: "2h",
+      metadata: participantMetadata,
       attributes: {
         "aytalk.role": "human",
         "aytalk.sourceLanguage": sourceLanguage || "Auto",
