@@ -118,7 +118,23 @@ app.post("/livekit/token", async (req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ok: true, service: "AyTalk", version: "vision-1.3"});
+  res.json({ok: true, service: "LiveBridge", version: "7.0-demo"});
+});
+
+app.get("/livebridge/voice/capabilities", (_req, res) => {
+  const customVoiceEnabled =
+    String(process.env.LIVEBRIDGE_CUSTOM_VOICE_ENABLED || "")
+      .trim()
+      .toLowerCase() === "true";
+
+  res.json({
+    customVoiceEnabled,
+    requiresExplicitConsent: true,
+    mode: customVoiceEnabled ? "custom-voice" : "device-tts",
+    note: customVoiceEnabled
+      ? "Custom voice can be used only after explicit consent."
+      : "Demo uses device TTS until eligible custom-voice access is configured.",
+  });
 });
 
 // GÖRÜŞME İÇİN BAĞLAMLI VE SIKI ÇEVİRİ
