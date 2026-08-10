@@ -136,7 +136,7 @@ app.post("/livebridge/call/start",(req,res)=>{
   const id=`LBC-${Math.random().toString(36).slice(2,10).toUpperCase()}`;
   const roomName=`LB-${Math.random().toString(36).slice(2,10).toUpperCase()}`;
   const call={id,roomName,callerPhone,callerName:String(req.body?.callerName||"LiveBridge Kullanıcısı").slice(0,80),
-    calleePhone:resolvedCalleePhone,mode:req.body?.mode==="audio"?"audio":"video",status:"ringing",createdAt:liveBridgeNow(),updatedAt:liveBridgeNow()};
+    calleePhone:resolvedCalleePhone,mode:req.body?.mode==="chat"?"chat":req.body?.mode==="audio"?"audio":"video",status:"ringing",createdAt:liveBridgeNow(),updatedAt:liveBridgeNow()};
   liveBridgeCalls.set(id,call); res.json({ok:true,call});
 });
 app.get("/livebridge/call/incoming",(req,res)=>{
@@ -255,7 +255,7 @@ app.post("/livekit/token", async (req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ok: true, service: "LiveBridge", version: "7.2.1-contact-match"});
+  res.json({ok: true, service: "LiveBridge", version: "7.4-chat-files"});
 });
 
 app.get("/livebridge/voice/capabilities", (_req, res) => {
