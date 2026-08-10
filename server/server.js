@@ -22,7 +22,53 @@ app.use(express.json({limit: "12mb"}));
 // LiveBridge Contacts Demo Cloud — in-memory demo signaling.
 const liveBridgeUsers = new Map();
 const liveBridgeCalls = new Map();
-const normalizeLiveBridgePhone = value => String(value || "").replace(/[^0-9]/g, "").slice(0, 18);
+const normalizeLiveBridgePhone = value =>
+  String(value || "").replace(/[^0-9]/g, "").slice(0, 18);
+
+function liveBridgePhoneKeys(value, suppliedKeys = []) {
+  const digits = normalizeLiveBridgePhone(value);
+  const keys = new Set(
+    Array.isArray(suppliedKeys)
+      ? suppliedKeys
+          .map(item => normalizeLiveBridgePhone(item))
+          .filter(item => item.length >= 8)
+      : [],
+  );
+
+  if (!digits) return Array.from(keys);
+
+  keys.add(digits);
+
+  const noInternationalPrefix = digits.startsWith("00")
+    ? digits.slice(2)
+    : digits;
+  if (noInternationalPrefix) keys.add(noInternationalPrefix);
+
+  const noLeadingZero = digits.replace(/^0+/, "");
+  if (noLeadingZero) keys.add(noLeadingZero);
+
+  for (const size of [10, 9, 8]) {
+    if (digits.length >= size) keys.add(digits.slice(-size));
+    if (noInternationalPrefix.length >= size) {
+      keys.add(noInternationalPrefix.slice(-size));
+    }
+  }
+
+  return Array.from(keys).filter(key => key.length >= 8);
+}
+
+function findLiveBridgeUserByPhone(value, suppliedKeys = []) {
+  const requestedKeys = new Set(liveBridgePhoneKeys(value, suppliedKeys));
+
+  for (const user of liveBridgeUsers.values()) {
+    const userKeys = liveBridgePhoneKeys(user.phone, user.phoneKeys || []);
+    if (userKeys.some(key => requestedKeys.has(key))) {
+      return user;
+    }
+  }
+
+  return null;
+}
 const liveBridgeNow = () => Date.now();
 const liveBridgeUserOnline = user => Boolean(user && liveBridgeNow() - Number(user.lastSeen || 0) < 45000);
 function cleanExpiredLiveBridgeCalls() {
@@ -37,7 +83,14 @@ app.post("/livebridge/profile/register",(req,res)=>{
   const name=String(req.body?.name||"").trim().slice(0,80);
   const language=String(req.body?.language||"").trim().slice(0,80);
   if(phone.length<7||!name) return res.status(400).json({error:"Telefon ve isim gerekli."});
-  const user={...(liveBridgeUsers.get(phone)||{}),phone,name,language,lastSeen:liveBridgeNow()};
+  const user={
+    ...(liveBridgeUsers.get(phone)||{}),
+    phone,
+    phoneKeys: liveBridgePhoneKeys(phone, req.body?.phoneKeys),
+    name,
+    language,
+    lastSeen:liveBridgeNow()
+  };
   liveBridgeUsers.set(phone,user);
   res.json({ok:true,user:{...user,online:true}});
 });
@@ -45,8 +98,14 @@ app.post("/livebridge/presence",(req,res)=>{
   const phone=normalizeLiveBridgePhone(req.body?.phone);
   if(phone.length<7) return res.status(400).json({error:"Telefon gerekli."});
   const old=liveBridgeUsers.get(phone)||{};
-  const user={...old,phone,name:String(req.body?.name||old.name||"LiveBridge Kullanıcısı").slice(0,80),
-    language:String(req.body?.language||old.language||"").slice(0,80),lastSeen:liveBridgeNow()};
+  const user={
+    ...old,
+    phone,
+    phoneKeys: liveBridgePhoneKeys(phone, req.body?.phoneKeys || old.phoneKeys),
+    name:String(req.body?.name||old.name||"LiveBridge Kullanıcısı").slice(0,80),
+    language:String(req.body?.language||old.language||"").slice(0,80),
+    lastSeen:liveBridgeNow()
+  };
   liveBridgeUsers.set(phone,user); res.json({ok:true,lastSeen:user.lastSeen});
 });
 app.post("/livebridge/contacts/match",(req,res)=>{
@@ -56,8 +115,11 @@ app.post("/livebridge/contacts/match",(req,res)=>{
   for(const c of contacts){
     const phone=normalizeLiveBridgePhone(c?.phone);
     if(!phone||phone===ownerPhone||seen.has(phone)) continue;
-    const r=liveBridgeUsers.get(phone); if(!r) continue; seen.add(phone);
-    users.push({phone,name:String(c?.name||r.name||"LiveBridge Kullanıcısı").slice(0,100),
+    const r=findLiveBridgeUserByPhone(phone,c?.keys); if(!r) continue;
+    const matchedIdentity = normalizeLiveBridgePhone(r.phone);
+    if (seen.has(matchedIdentity)) continue;
+    seen.add(matchedIdentity);
+    users.push({phone:r.phone,name:String(c?.name||r.name||"LiveBridge Kullanıcısı").slice(0,100),
       language:r.language||"",online:liveBridgeUserOnline(r),lastSeen:r.lastSeen||0});
   }
   users.sort((a,b)=>a.online===b.online?String(a.name).localeCompare(String(b.name),"tr"):(a.online?-1:1));
@@ -68,11 +130,13 @@ app.post("/livebridge/call/start",(req,res)=>{
   const callerPhone=normalizeLiveBridgePhone(req.body?.callerPhone);
   const calleePhone=normalizeLiveBridgePhone(req.body?.calleePhone);
   if(callerPhone.length<7||calleePhone.length<7||callerPhone===calleePhone) return res.status(400).json({error:"Geçersiz arama bilgisi."});
-  if(!liveBridgeUsers.has(calleePhone)) return res.status(404).json({error:"Kişi LiveBridge'de bulunamadı."});
+  const calleeUser = findLiveBridgeUserByPhone(calleePhone);
+  if(!calleeUser) return res.status(404).json({error:"Kişi LiveBridge'de bulunamadı."});
+  const resolvedCalleePhone = calleeUser.phone;
   const id=`LBC-${Math.random().toString(36).slice(2,10).toUpperCase()}`;
   const roomName=`LB-${Math.random().toString(36).slice(2,10).toUpperCase()}`;
   const call={id,roomName,callerPhone,callerName:String(req.body?.callerName||"LiveBridge Kullanıcısı").slice(0,80),
-    calleePhone,mode:req.body?.mode==="audio"?"audio":"video",status:"ringing",createdAt:liveBridgeNow(),updatedAt:liveBridgeNow()};
+    calleePhone:resolvedCalleePhone,mode:req.body?.mode==="audio"?"audio":"video",status:"ringing",createdAt:liveBridgeNow(),updatedAt:liveBridgeNow()};
   liveBridgeCalls.set(id,call); res.json({ok:true,call});
 });
 app.get("/livebridge/call/incoming",(req,res)=>{
@@ -191,7 +255,7 @@ app.post("/livekit/token", async (req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ok: true, service: "LiveBridge", version: "7.2-contacts-demo"});
+  res.json({ok: true, service: "LiveBridge", version: "7.2.1-contact-match"});
 });
 
 app.get("/livebridge/voice/capabilities", (_req, res) => {
