@@ -19,6 +19,79 @@ app.disable("x-powered-by");
 app.use(cors());
 app.use(express.json({limit: "12mb"}));
 
+// LiveBridge Contacts Demo Cloud — in-memory demo signaling.
+const liveBridgeUsers = new Map();
+const liveBridgeCalls = new Map();
+const normalizeLiveBridgePhone = value => String(value || "").replace(/[^0-9]/g, "").slice(0, 18);
+const liveBridgeNow = () => Date.now();
+const liveBridgeUserOnline = user => Boolean(user && liveBridgeNow() - Number(user.lastSeen || 0) < 45000);
+function cleanExpiredLiveBridgeCalls() {
+  const now = liveBridgeNow();
+  for (const [id, call] of liveBridgeCalls.entries()) {
+    if (call.status === "ringing" && now - call.createdAt > 60000) liveBridgeCalls.set(id,{...call,status:"expired",updatedAt:now});
+    if (now - call.createdAt > 600000) liveBridgeCalls.delete(id);
+  }
+}
+app.post("/livebridge/profile/register",(req,res)=>{
+  const phone=normalizeLiveBridgePhone(req.body?.phone);
+  const name=String(req.body?.name||"").trim().slice(0,80);
+  const language=String(req.body?.language||"").trim().slice(0,80);
+  if(phone.length<7||!name) return res.status(400).json({error:"Telefon ve isim gerekli."});
+  const user={...(liveBridgeUsers.get(phone)||{}),phone,name,language,lastSeen:liveBridgeNow()};
+  liveBridgeUsers.set(phone,user);
+  res.json({ok:true,user:{...user,online:true}});
+});
+app.post("/livebridge/presence",(req,res)=>{
+  const phone=normalizeLiveBridgePhone(req.body?.phone);
+  if(phone.length<7) return res.status(400).json({error:"Telefon gerekli."});
+  const old=liveBridgeUsers.get(phone)||{};
+  const user={...old,phone,name:String(req.body?.name||old.name||"LiveBridge Kullanıcısı").slice(0,80),
+    language:String(req.body?.language||old.language||"").slice(0,80),lastSeen:liveBridgeNow()};
+  liveBridgeUsers.set(phone,user); res.json({ok:true,lastSeen:user.lastSeen});
+});
+app.post("/livebridge/contacts/match",(req,res)=>{
+  const ownerPhone=normalizeLiveBridgePhone(req.body?.ownerPhone);
+  const contacts=Array.isArray(req.body?.contacts)?req.body.contacts.slice(0,3000):[];
+  const users=[]; const seen=new Set();
+  for(const c of contacts){
+    const phone=normalizeLiveBridgePhone(c?.phone);
+    if(!phone||phone===ownerPhone||seen.has(phone)) continue;
+    const r=liveBridgeUsers.get(phone); if(!r) continue; seen.add(phone);
+    users.push({phone,name:String(c?.name||r.name||"LiveBridge Kullanıcısı").slice(0,100),
+      language:r.language||"",online:liveBridgeUserOnline(r),lastSeen:r.lastSeen||0});
+  }
+  users.sort((a,b)=>a.online===b.online?String(a.name).localeCompare(String(b.name),"tr"):(a.online?-1:1));
+  res.json({ok:true,users});
+});
+app.post("/livebridge/call/start",(req,res)=>{
+  cleanExpiredLiveBridgeCalls();
+  const callerPhone=normalizeLiveBridgePhone(req.body?.callerPhone);
+  const calleePhone=normalizeLiveBridgePhone(req.body?.calleePhone);
+  if(callerPhone.length<7||calleePhone.length<7||callerPhone===calleePhone) return res.status(400).json({error:"Geçersiz arama bilgisi."});
+  if(!liveBridgeUsers.has(calleePhone)) return res.status(404).json({error:"Kişi LiveBridge'de bulunamadı."});
+  const id=`LBC-${Math.random().toString(36).slice(2,10).toUpperCase()}`;
+  const roomName=`LB-${Math.random().toString(36).slice(2,10).toUpperCase()}`;
+  const call={id,roomName,callerPhone,callerName:String(req.body?.callerName||"LiveBridge Kullanıcısı").slice(0,80),
+    calleePhone,mode:req.body?.mode==="audio"?"audio":"video",status:"ringing",createdAt:liveBridgeNow(),updatedAt:liveBridgeNow()};
+  liveBridgeCalls.set(id,call); res.json({ok:true,call});
+});
+app.get("/livebridge/call/incoming",(req,res)=>{
+  cleanExpiredLiveBridgeCalls(); const phone=normalizeLiveBridgePhone(req.query?.phone);
+  const call=Array.from(liveBridgeCalls.values()).filter(c=>c.calleePhone===phone&&c.status==="ringing").sort((a,b)=>b.createdAt-a.createdAt)[0];
+  res.json({ok:true,call:call||null});
+});
+app.post("/livebridge/call/respond",(req,res)=>{
+  cleanExpiredLiveBridgeCalls(); const id=String(req.body?.callId||""); const phone=normalizeLiveBridgePhone(req.body?.calleePhone);
+  const call=liveBridgeCalls.get(id); if(!call||call.calleePhone!==phone) return res.status(404).json({error:"Arama bulunamadı."});
+  const updated={...call,status:req.body?.accepted?"accepted":"rejected",updatedAt:liveBridgeNow()}; liveBridgeCalls.set(id,updated);
+  res.json({ok:true,call:updated});
+});
+app.get("/livebridge/call/status/:id",(req,res)=>{
+  cleanExpiredLiveBridgeCalls(); const call=liveBridgeCalls.get(String(req.params?.id||""));
+  if(!call) return res.status(404).json({error:"Arama bulunamadı."}); res.json({ok:true,call});
+});
+
+
 function prepareStreamResponse(res) {
   res.status(200);
   res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
@@ -118,7 +191,7 @@ app.post("/livekit/token", async (req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ok: true, service: "LiveBridge", version: "7.1-demo"});
+  res.json({ok: true, service: "LiveBridge", version: "7.2-contacts-demo"});
 });
 
 app.get("/livebridge/voice/capabilities", (_req, res) => {
