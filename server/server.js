@@ -118,7 +118,7 @@ app.post("/livekit/token", async (req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ok: true, service: "LiveBridge", version: "7.0-demo"});
+  res.json({ok: true, service: "LiveBridge", version: "7.1-demo"});
 });
 
 app.get("/livebridge/voice/capabilities", (_req, res) => {
@@ -147,8 +147,9 @@ app.post("/call/translate", async (req, res) => {
     const to = String(req.body?.to || "English").trim();
     const rawContext = Array.isArray(req.body?.context) ? req.body.context : [];
     const context = rawContext
-      .slice(-5)
+      .slice(-8)
       .map(item => ({
+        role: String(item?.role || "speaker").trim().slice(0, 20),
         source: String(item?.source || "").trim().slice(0, 1200),
         translation: String(item?.translation || "").trim().slice(0, 1200),
       }))
@@ -165,7 +166,7 @@ app.post("/call/translate", async (req, res) => {
     const contextText = context.length
       ? context
           .map((item, index) =>
-            `${index + 1}. SOURCE: ${item.source}\nTRANSLATION: ${item.translation}`,
+            `${index + 1}. ROLE: ${item.role}\nSOURCE: ${item.source}\nTRANSLATION: ${item.translation}`,
           )
           .join("\n\n")
       : "No previous context.";
@@ -175,13 +176,15 @@ app.post("/call/translate", async (req, res) => {
       store: false,
       max_output_tokens: Math.min(1200, Math.max(80, Math.ceil(message.length * 1.6))),
       instructions:
-        "You are AyTalk's professional live interpreter. " +
-        `Translate the CURRENT utterance from ${from} to ${to}. ` +
-        "Use previous context only to resolve pronouns, names, terminology and meaning. " +
-        "Never add facts, explanations, summaries, politeness, completions, or guesses. " +
-        "Never answer the speaker. Never continue an unfinished thought. " +
-        "Preserve names, numbers, medical/legal/technical terms, tone, negation and question form. " +
-        "If the utterance is a fragment, translate it as a fragment. " +
+        "You are LiveBridge, a professional real-time human interpreter. " +
+        `Translate ONLY the CURRENT utterance from ${from} to ${to}. ` +
+        "The dialogue history may contain both speakers. Use it only to resolve pronouns, references, names, terminology, register and implied subjects. " +
+        "Do not translate previous turns again. Do not answer either speaker. " +
+        "Never add facts, explanations, summaries, politeness, completions, diagnoses, advice or guesses. " +
+        "Preserve names, numbers, units, dates, negation, uncertainty, question form and professional terminology exactly in meaning. " +
+        "For medical, legal or technical terms, prefer the standard target-language term and do not simplify unless the speaker simplified it. " +
+        "If CURRENT_UTTERANCE is incomplete, translate it as an incomplete fragment rather than inventing the ending. " +
+        "Keep the speaker's tone and level of formality. " +
         "Return ONLY the translation of CURRENT_UTTERANCE.",
       input:
         `PREVIOUS_CONTEXT:\n${contextText}\n\n` +
