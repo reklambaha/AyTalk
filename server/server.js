@@ -82,8 +82,6 @@ app.post("/livebridge/profile/register",(req,res)=>{
   const phone=normalizeLiveBridgePhone(req.body?.phone);
   const name=String(req.body?.name||"").trim().slice(0,80);
   const language=String(req.body?.language||"").trim().slice(0,80);
-  const voiceStyle=["male","female","neutral"].includes(req.body?.voiceStyle)
-    ? req.body.voiceStyle : "neutral";
   if(phone.length<7||!name) return res.status(400).json({error:"Telefon ve isim gerekli."});
   const user={
     ...(liveBridgeUsers.get(phone)||{}),
@@ -91,7 +89,6 @@ app.post("/livebridge/profile/register",(req,res)=>{
     phoneKeys: liveBridgePhoneKeys(phone, req.body?.phoneKeys),
     name,
     language,
-    voiceStyle,
     lastSeen:liveBridgeNow()
   };
   liveBridgeUsers.set(phone,user);
@@ -107,8 +104,6 @@ app.post("/livebridge/presence",(req,res)=>{
     phoneKeys: liveBridgePhoneKeys(phone, req.body?.phoneKeys || old.phoneKeys),
     name:String(req.body?.name||old.name||"LiveBridge Kullanıcısı").slice(0,80),
     language:String(req.body?.language||old.language||"").slice(0,80),
-    voiceStyle:["male","female","neutral"].includes(req.body?.voiceStyle)
-      ? req.body.voiceStyle : old.voiceStyle||"neutral",
     lastSeen:liveBridgeNow()
   };
   liveBridgeUsers.set(phone,user); res.json({ok:true,lastSeen:user.lastSeen});
@@ -125,7 +120,7 @@ app.post("/livebridge/contacts/match",(req,res)=>{
     if (seen.has(matchedIdentity)) continue;
     seen.add(matchedIdentity);
     users.push({phone:r.phone,name:String(c?.name||r.name||"LiveBridge Kullanıcısı").slice(0,100),
-      language:r.language||"",voiceStyle:r.voiceStyle||"neutral",online:liveBridgeUserOnline(r),lastSeen:r.lastSeen||0});
+      language:r.language||"",online:liveBridgeUserOnline(r),lastSeen:r.lastSeen||0});
   }
   users.sort((a,b)=>a.online===b.online?String(a.name).localeCompare(String(b.name),"tr"):(a.online?-1:1));
   res.json({ok:true,users});
@@ -259,40 +254,8 @@ app.post("/livekit/token", async (req, res) => {
   }
 });
 
-
-app.post("/livebridge/tts", async (req, res) => {
-  try {
-    const text=String(req.body?.text||"").trim().slice(0,4096);
-    const locale=String(req.body?.locale||"").trim().slice(0,40);
-    const voiceStyle=["male","female","neutral"].includes(req.body?.voiceStyle)
-      ? req.body.voiceStyle : "neutral";
-    if(!text) return res.status(400).json({error:"Seslendirilecek metin boş."});
-
-    const instruction =
-      voiceStyle==="male"
-        ? "Speak with a natural adult male voice. Keep it conversational, clear, warm and realistic."
-        : voiceStyle==="female"
-          ? "Speak with a natural adult female voice. Keep it conversational, clear, warm and realistic."
-          : "Speak with a natural neutral adult voice. Keep it conversational, clear and realistic.";
-
-    const speech=await openai.audio.speech.create({
-      model:"gpt-4o-mini-tts",
-      voice:voiceStyle==="male"?"onyx":voiceStyle==="female"?"nova":"cedar",
-      input:text,
-      instructions:`${instruction} Pronounce naturally for locale ${locale||"the target language"}. Read ordinary words as words, not as letter-by-letter acronyms unless clearly intended.`,
-      response_format:"mp3",
-    });
-
-    const buffer=Buffer.from(await speech.arrayBuffer());
-    res.json({ok:true,audioBase64:buffer.toString("base64"),format:"mp3",voiceStyle});
-  } catch(error) {
-    console.error("LiveBridge TTS error:",error);
-    res.status(500).json({error:error instanceof Error?error.message:"LiveBridge ses üretimi başarısız."});
-  }
-});
-
 app.get("/health", (_req, res) => {
-  res.json({ok: true, service: "LiveBridge", version: "7.9-release-audio-language"});
+  res.json({ok: true, service: "LiveBridge", version: "7.5-language-engine"});
 });
 
 app.get("/livebridge/voice/capabilities", (_req, res) => {
@@ -359,11 +322,8 @@ app.post("/call/translate", async (req, res) => {
         "For medical, legal or technical terms, prefer the standard target-language term and do not simplify unless the speaker simplified it. " +
         "If CURRENT_UTTERANCE is incomplete, translate it as an incomplete fragment rather than inventing the ending. " +
         "Keep the speaker's tone and level of formality. " +
-        "Use SOFT LANGUAGE MODE for profanity and obscene insults: do not reproduce explicit profanity word-for-word. Replace it with a natural non-obscene target-language expression that preserves frustration or anger, similar to TV or film dubbing. " +
-        "Do not soften or hide threats, emergency information, coercion, abuse reports, medical or legal facts, or other safety-critical intent; preserve those meanings clearly while removing only gratuitous profanity. " +
         "Translate culturally meaningful kinship terms, honorifics, forms of address, idioms and discourse markers by their FUNCTION and meaning in the current context, not by superficial spelling. " +
         "A normal spoken word that happens to look like a Latin-letter abbreviation must remain a word; do not reinterpret it as an acronym unless context clearly shows an acronym, company name or initialism. " +
-        "Example: in Uzbek conversation, aka is a kinship/address word meaning older brother or respectful brother-like address; translate it by meaning and never spell it as A-K-A unless the context is genuinely the acronym AKA. " +
         "When an address term has a natural target-language equivalent, use that equivalent while preserving relationship, respect and register. " +
         "Do not transliterate ordinary vocabulary when an established target-language translation exists. Preserve proper names and genuine acronyms. " +
         "Return ONLY the translation of CURRENT_UTTERANCE.",
