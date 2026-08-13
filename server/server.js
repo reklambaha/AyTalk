@@ -255,7 +255,7 @@ app.post("/livekit/token", async (req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ok: true, service: "LiveBridge", version: "7.5-language-engine"});
+  res.json({ok: true, service: "LiveBridge", version: "7.5.3-uzbek-aka-fix"});
 });
 
 app.get("/livebridge/voice/capabilities", (_req, res) => {
@@ -324,6 +324,7 @@ app.post("/call/translate", async (req, res) => {
         "Keep the speaker's tone and level of formality. " +
         "Translate culturally meaningful kinship terms, honorifics, forms of address, idioms and discourse markers by their FUNCTION and meaning in the current context, not by superficial spelling. " +
         "A normal spoken word that happens to look like a Latin-letter abbreviation must remain a word; do not reinterpret it as an acronym unless context clearly shows an acronym, company name or initialism. " +
+        "Example: in Uzbek conversation, aka is a kinship/address word meaning older brother or respectful brother-like address; translate it by meaning and never spell it as A-K-A unless the context is genuinely the acronym AKA. " +
         "When an address term has a natural target-language equivalent, use that equivalent while preserving relationship, respect and register. " +
         "Do not transliterate ordinary vocabulary when an established target-language translation exists. Preserve proper names and genuine acronyms. " +
         "Return ONLY the translation of CURRENT_UTTERANCE.",
