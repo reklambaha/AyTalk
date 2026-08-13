@@ -255,7 +255,7 @@ app.post("/livekit/token", async (req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ok: true, service: "LiveBridge", version: "7.5-language-engine"});
+  res.json({ok: true, service: "LiveBridge", version: "10.0-all-fixes"});
 });
 
 app.get("/livebridge/voice/capabilities", (_req, res) => {
@@ -379,8 +379,11 @@ app.post("/chat", async (req, res) => {
       // Kısa ve doğrudan talimat daha hızlıdır.
       instructions:
         `Translate from ${from} to ${to}. ` +
-        "Return only the translation. Preserve meaning, names, numbers, " +
-        "punctuation, paragraphs, tone, and question form.",
+        "Return only the translation. Preserve meaning exactly. Never answer the speaker and never add information. " +
+        "Translate kinship terms, honorifics, forms of address, idioms and discourse markers by their function in context. " +
+        "A normal word must never be reinterpreted as an acronym only because its Latin spelling resembles one. " +
+        "Preserve genuine acronyms, brands, proper names, numbers, punctuation, paragraphs, tone and question form. " +
+        "Use the natural target-language equivalent for ordinary vocabulary and address terms.",
 
       input: message,
     });
@@ -453,8 +456,11 @@ app.post("/chat-stream", async (req, res) => {
       ),
       instructions:
         `Translate from ${from} to ${to}. ` +
-        "Return only the translation. Preserve meaning, names, numbers, " +
-        "punctuation, paragraphs, tone, and question form.",
+        "Return only the translation. Preserve meaning exactly. Never answer the speaker and never add information. " +
+        "Translate kinship terms, honorifics, forms of address, idioms and discourse markers by their function in context. " +
+        "A normal word must never be reinterpreted as an acronym only because its Latin spelling resembles one. " +
+        "Preserve genuine acronyms, brands, proper names, numbers, punctuation, paragraphs, tone and question form. " +
+        "Use the natural target-language equivalent for ordinary vocabulary and address terms.",
       input: message,
     });
 
@@ -793,8 +799,8 @@ app.post("/tts", async (req, res) => {
       input: text,
       response_format: "mp3",
       instructions: language
-        ? `Speak naturally and clearly in ${language}.`
-        : "Speak naturally and clearly.",
+        ? `Speak naturally and clearly in ${language}. Pronounce ordinary words as words, not as letter-by-letter acronyms, unless clearly intended as an acronym.`
+        : "Speak naturally and clearly. Pronounce ordinary words as words.",
     });
 
     const buffer = Buffer.from(await speech.arrayBuffer());
