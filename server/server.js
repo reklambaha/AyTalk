@@ -4,7 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const OpenAI = require("openai");
 const {toFile} = require("openai");
-const {AccessToken} = require("livekit-server-sdk");
+const {AccessToken, AgentDispatchClient} = require("livekit-server-sdk");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,6 +15,17 @@ const openai = new OpenAI({
   timeout: 20000,
   maxRetries: 1,
 });
+
+const translatorDispatchClient =
+  process.env.LIVEKIT_URL &&
+  process.env.LIVEKIT_API_KEY &&
+  process.env.LIVEKIT_API_SECRET
+    ? new AgentDispatchClient(
+        process.env.LIVEKIT_URL.replace(/^wss:/, "https:"),
+        process.env.LIVEKIT_API_KEY,
+        process.env.LIVEKIT_API_SECRET,
+      )
+    : null;
 
 app.disable("x-powered-by");
 app.use(cors());
@@ -268,6 +279,99 @@ app.post("/audio/transcribe", async (req, res) => {
 });
 
 
+
+function parseTranslatorMetadata(dispatch) {
+  try {
+    return JSON.parse(dispatch?.metadata || "{}");
+  } catch {
+    return {};
+  }
+}
+
+async function deleteTranslatorDispatches(roomName, sourceIdentity) {
+  if (!translatorDispatchClient) return;
+  const list = await translatorDispatchClient.listDispatch(roomName);
+
+  for (const dispatch of list) {
+    if (dispatch.agentName !== "aytalk-translator") continue;
+    const metadata = parseTranslatorMetadata(dispatch);
+    if (metadata.sourceIdentity === sourceIdentity) {
+      await translatorDispatchClient.deleteDispatch(
+        dispatch.id,
+        roomName,
+      );
+    }
+  }
+}
+
+app.post("/livebridge/translator/sync", async (req, res) => {
+  try {
+    if (!translatorDispatchClient) {
+      return res.status(503).json({
+        error: "LiveKit translator worker ayarlı değil.",
+      });
+    }
+
+    const roomName = String(req.body?.roomName || "").trim();
+    const sourceIdentity = String(req.body?.sourceIdentity || "").trim();
+    const sourceLanguage = String(req.body?.sourceLanguage || "").trim();
+    const sourceLocale = String(req.body?.sourceLocale || "").trim();
+    const targetLanguage = String(req.body?.targetLanguage || "").trim();
+    const targetLocale = String(req.body?.targetLocale || "").trim();
+    const voiceId = String(req.body?.voiceId || "").trim();
+
+    if (!roomName || !sourceIdentity || !sourceLanguage || !targetLanguage) {
+      return res.status(400).json({
+        error: "Oda, katılımcı ve dil bilgileri gerekli.",
+      });
+    }
+
+    await deleteTranslatorDispatches(roomName, sourceIdentity);
+
+    const metadata = JSON.stringify({
+      sourceIdentity,
+      sourceLanguage,
+      sourceLocale,
+      targetLanguage,
+      targetLocale,
+      voiceId,
+    });
+
+    const created = await translatorDispatchClient.createDispatch(
+      roomName,
+      "aytalk-translator",
+      {metadata},
+    );
+
+    return res.json({
+      ok: true,
+      dispatchId: created.id,
+      mode: "continuous",
+    });
+  } catch (error) {
+    console.error("translator sync:", error);
+    return res.status(500).json({
+      error: error?.message || "Canlı çeviri ajanı başlatılamadı.",
+    });
+  }
+});
+
+app.post("/livebridge/translator/stop", async (req, res) => {
+  try {
+    const roomName = String(req.body?.roomName || "").trim();
+    const sourceIdentity = String(req.body?.sourceIdentity || "").trim();
+    if (roomName && sourceIdentity) {
+      await deleteTranslatorDispatches(roomName, sourceIdentity);
+    }
+    return res.json({ok: true});
+  } catch (error) {
+    return res.status(500).json({
+      error: error?.message || "Çeviri ajanı durdurulamadı.",
+    });
+  }
+});
+
+
 // LIVEKIT UZAK GÖRÜŞME TOKEN ENDPOINT
 app.post("/livekit/token", async (req, res) => {
   try {
@@ -342,7 +446,7 @@ app.post("/livekit/token", async (req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ok: true, service: "LiveBridge", version: "10.1-native-stt"});
+  res.json({ok: true, service: "LiveBridge", version: "11.0-realtime-bridge"});
 });
 
 app.get("/livebridge/voice/capabilities", (_req, res) => {
