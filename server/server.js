@@ -255,7 +255,7 @@ app.post("/livekit/token", async (req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ok: true, service: "LiveBridge", version: "7.4-chat-files"});
+  res.json({ok: true, service: "LiveBridge", version: "7.5-language-engine"});
 });
 
 app.get("/livebridge/voice/capabilities", (_req, res) => {
@@ -322,6 +322,10 @@ app.post("/call/translate", async (req, res) => {
         "For medical, legal or technical terms, prefer the standard target-language term and do not simplify unless the speaker simplified it. " +
         "If CURRENT_UTTERANCE is incomplete, translate it as an incomplete fragment rather than inventing the ending. " +
         "Keep the speaker's tone and level of formality. " +
+        "Translate culturally meaningful kinship terms, honorifics, forms of address, idioms and discourse markers by their FUNCTION and meaning in the current context, not by superficial spelling. " +
+        "A normal spoken word that happens to look like a Latin-letter abbreviation must remain a word; do not reinterpret it as an acronym unless context clearly shows an acronym, company name or initialism. " +
+        "When an address term has a natural target-language equivalent, use that equivalent while preserving relationship, respect and register. " +
+        "Do not transliterate ordinary vocabulary when an established target-language translation exists. Preserve proper names and genuine acronyms. " +
         "Return ONLY the translation of CURRENT_UTTERANCE.",
       input:
         `PREVIOUS_CONTEXT:\n${contextText}\n\n` +
