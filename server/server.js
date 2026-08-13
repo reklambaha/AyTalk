@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const OpenAI = require("openai");
+const {toFile} = require("openai");
 const {AccessToken} = require("livekit-server-sdk");
 
 const app = express();
@@ -181,6 +182,92 @@ app.get("/", (_req, res) => {
 });
 
 
+
+// AYTalk native audio -> OpenAI transcription.
+// Android SpeechRecognizer / Google Speech is not used.
+app.post("/audio/transcribe", async (req, res) => {
+  try {
+    const audioBase64 = String(
+      req.body?.audioBase64 || "",
+    ).trim();
+
+    const requestedLanguage = String(
+      req.body?.language || "",
+    )
+      .trim()
+      .toLowerCase();
+
+    if (!audioBase64) {
+      return res.status(400).json({
+        error: "Ses verisi gerekli.",
+      });
+    }
+
+    // 16 kHz mono WAV from the native AyTalk recorder.
+    const audioBuffer = Buffer.from(
+      audioBase64,
+      "base64",
+    );
+
+    if (
+      audioBuffer.length < 1000 ||
+      audioBuffer.length > 3 * 1024 * 1024
+    ) {
+      return res.status(400).json({
+        error: "Geçersiz ses kaydı.",
+      });
+    }
+
+    // OpenAI language guidance expects ISO-639-1.
+    const language =
+      /^[a-z]{2}$/.test(requestedLanguage)
+        ? requestedLanguage
+        : undefined;
+
+    const transcription =
+      await openai.audio.transcriptions.create({
+        file: await toFile(
+          audioBuffer,
+          "aytalk-livebridge.wav",
+          {type: "audio/wav"},
+        ),
+        model: "gpt-4o-mini-transcribe",
+        ...(language ? {language} : {}),
+        prompt:
+          "Transcribe the speaker exactly. Preserve names, numbers, " +
+          "kinship terms, honorifics and ordinary words as spoken. " +
+          "Do not reinterpret normal words as acronyms.",
+      });
+
+    const text = String(
+      transcription?.text || "",
+    ).trim();
+
+    if (!text) {
+      return res.status(422).json({
+        error: "Konuşma algılanmadı.",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      text,
+    });
+  } catch (error) {
+    console.error(
+      "AyTalk transcription error:",
+      error,
+    );
+
+    return res.status(500).json({
+      error:
+        error?.message ||
+        "Ses yazıya çevrilemedi.",
+    });
+  }
+});
+
+
 // LIVEKIT UZAK GÖRÜŞME TOKEN ENDPOINT
 app.post("/livekit/token", async (req, res) => {
   try {
@@ -255,7 +342,7 @@ app.post("/livekit/token", async (req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ok: true, service: "LiveBridge", version: "10.0-all-fixes"});
+  res.json({ok: true, service: "LiveBridge", version: "10.1-native-stt"});
 });
 
 app.get("/livebridge/voice/capabilities", (_req, res) => {
