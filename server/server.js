@@ -2,12 +2,109 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const {Pool} = require("pg");
 const OpenAI = require("openai");
 const {toFile} = require("openai");
-const {AccessToken} = require("livekit-server-sdk");
+const {AccessToken, AgentDispatchClient} = require("livekit-server-sdk");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Kalıcı veritabanı (Postgres, örn. Supabase/Neon ücretsiz katman).
+// DATABASE_URL tanımlı değilse sunucu yine çalışır ama LiveBridge verisi
+// yeniden başlatmada silinir (sadece geliştirme/test için uygundur).
+const dbPool = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: {rejectUnauthorized: false},
+    })
+  : null;
+
+if (!dbPool) {
+  console.warn(
+    "UYARI: DATABASE_URL tanımlı değil. LiveBridge verisi kalıcı olmayacak (RAM'de tutulacak).",
+  );
+}
+
+async function initDb() {
+  if (!dbPool) return;
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS livebridge_users (
+      phone TEXT PRIMARY KEY,
+      phone_keys TEXT[] NOT NULL DEFAULT '{}',
+      name TEXT NOT NULL,
+      language TEXT DEFAULT '',
+      last_seen BIGINT NOT NULL
+    );
+  `);
+  await dbPool.query(`
+    CREATE INDEX IF NOT EXISTS idx_livebridge_users_phone_keys
+      ON livebridge_users USING GIN (phone_keys);
+  `);
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS livebridge_calls (
+      id TEXT PRIMARY KEY,
+      room_name TEXT NOT NULL,
+      caller_phone TEXT NOT NULL,
+      caller_name TEXT NOT NULL,
+      callee_phone TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      status TEXT NOT NULL,
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL
+    );
+  `);
+  console.log("Veritabanı tabloları hazır.");
+}
+
+// Uygulama içi çağrıları tanımlamak için paylaşımlı anahtar.
+// NOT: Mobil uygulamaya gömülen her sabit çıkarılabilir; bu tam bir
+// kullanıcı kimlik doğrulaması değil, sadece rastgele bot/scraper
+// trafiğini engelleyen bir ilk savunma katmanıdır.
+const APP_SHARED_KEY = process.env.APP_SHARED_KEY || "";
+if (!APP_SHARED_KEY) {
+  console.warn(
+    "UYARI: APP_SHARED_KEY tanımlı değil. Uç noktalar korumasız çalışıyor.",
+  );
+}
+
+function requireAppKey(req, res, next) {
+  if (!APP_SHARED_KEY) return next(); // env tanımlı değilse geliştirme modunda izin ver
+  const provided = req.get("x-app-key");
+  if (provided !== APP_SHARED_KEY) {
+    return res.status(401).json({error: "Yetkisiz istek."});
+  }
+  next();
+}
+
+// İzin verilen origin'ler (virgülle ayrılmış env değişkeni).
+// Örn: ALLOWED_ORIGINS="https://aytalk.app,https://admin.aytalk.app"
+// Mobil uygulamalar (RN fetch) tarayıcı origin'i göndermez, bu yüzden
+// origin'siz istekler (native app) her zaman kabul edilir; sadece
+// tarayıcıdan gelen bilinmeyen origin'ler engellenir.
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map(o => o.trim())
+  .filter(Boolean);
+
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error("CORS: izin verilmeyen origin."));
+  },
+};
+
+const generalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60, // dakikada IP başına 60 istek
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {error: "Çok fazla istek gönderildi. Lütfen biraz bekleyin."},
+});
 
 // Uzun süre beklemeyi ve gereksiz tekrarları azaltır.
 const openai = new OpenAI({
@@ -16,13 +113,32 @@ const openai = new OpenAI({
   maxRetries: 1,
 });
 
-app.disable("x-powered-by");
-app.use(cors());
-app.use(express.json({limit: "12mb"}));
+const translatorDispatchClient =
+  process.env.LIVEKIT_URL &&
+  process.env.LIVEKIT_API_KEY &&
+  process.env.LIVEKIT_API_SECRET
+    ? new AgentDispatchClient(
+        process.env.LIVEKIT_URL.replace(/^wss:/, "https:"),
+        process.env.LIVEKIT_API_KEY,
+        process.env.LIVEKIT_API_SECRET,
+      )
+    : null;
 
-// LiveBridge Contacts Demo Cloud — in-memory demo signaling.
-const liveBridgeUsers = new Map();
-const liveBridgeCalls = new Map();
+app.disable("x-powered-by");
+app.use(helmet());
+app.use(cors(corsOptions));
+app.use(express.json({limit: "12mb"}));
+app.use(generalLimiter);
+
+// Sağlık kontrolü hariç tüm uçlar paylaşımlı anahtar ister.
+app.use((req, res, next) => {
+  if (req.path === "/" || req.path === "/health") return next();
+  return requireAppKey(req, res, next);
+});
+
+// LiveBridge Contacts Cloud — DATABASE_URL varsa Postgres, yoksa RAM (yedek).
+const liveBridgeUsersMem = new Map();
+const liveBridgeCallsMem = new Map();
 const normalizeLiveBridgePhone = value =>
   String(value || "").replace(/[^0-9]/g, "").slice(0, 18);
 
@@ -58,102 +174,292 @@ function liveBridgePhoneKeys(value, suppliedKeys = []) {
   return Array.from(keys).filter(key => key.length >= 8);
 }
 
-function findLiveBridgeUserByPhone(value, suppliedKeys = []) {
-  const requestedKeys = new Set(liveBridgePhoneKeys(value, suppliedKeys));
+function rowToUser(row) {
+  if (!row) return null;
+  return {
+    phone: row.phone,
+    phoneKeys: row.phone_keys || [],
+    name: row.name,
+    language: row.language || "",
+    lastSeen: Number(row.last_seen || 0),
+  };
+}
 
-  for (const user of liveBridgeUsers.values()) {
-    const userKeys = liveBridgePhoneKeys(user.phone, user.phoneKeys || []);
-    if (userKeys.some(key => requestedKeys.has(key))) {
+function rowToCall(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    roomName: row.room_name,
+    callerPhone: row.caller_phone,
+    callerName: row.caller_name,
+    calleePhone: row.callee_phone,
+    mode: row.mode,
+    status: row.status,
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+  };
+}
+
+const liveBridgeStore = {
+  async getUser(phone) {
+    if (dbPool) {
+      const {rows} = await dbPool.query(
+        "SELECT * FROM livebridge_users WHERE phone = $1",
+        [phone],
+      );
+      return rowToUser(rows[0]);
+    }
+    return liveBridgeUsersMem.get(phone) || null;
+  },
+
+  async saveUser(user) {
+    if (dbPool) {
+      await dbPool.query(
+        `INSERT INTO livebridge_users (phone, phone_keys, name, language, last_seen)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (phone) DO UPDATE SET
+           phone_keys = EXCLUDED.phone_keys,
+           name = EXCLUDED.name,
+           language = EXCLUDED.language,
+           last_seen = EXCLUDED.last_seen`,
+        [user.phone, user.phoneKeys, user.name, user.language, user.lastSeen],
+      );
       return user;
     }
-  }
+    liveBridgeUsersMem.set(user.phone, user);
+    return user;
+  },
 
-  return null;
-}
+  async findUserByPhoneKeys(requestedKeys) {
+    if (dbPool) {
+      const {rows} = await dbPool.query(
+        "SELECT * FROM livebridge_users WHERE phone_keys && $1::text[] LIMIT 1",
+        [requestedKeys],
+      );
+      return rowToUser(rows[0]);
+    }
+    for (const user of liveBridgeUsersMem.values()) {
+      const userKeys = liveBridgePhoneKeys(user.phone, user.phoneKeys || []);
+      if (userKeys.some(key => requestedKeys.includes(key))) return user;
+    }
+    return null;
+  },
+
+  async saveCall(call) {
+    if (dbPool) {
+      await dbPool.query(
+        `INSERT INTO livebridge_calls
+           (id, room_name, caller_phone, caller_name, callee_phone, mode, status, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT (id) DO UPDATE SET
+           status = EXCLUDED.status,
+           updated_at = EXCLUDED.updated_at`,
+        [
+          call.id, call.roomName, call.callerPhone, call.callerName,
+          call.calleePhone, call.mode, call.status, call.createdAt, call.updatedAt,
+        ],
+      );
+      return call;
+    }
+    liveBridgeCallsMem.set(call.id, call);
+    return call;
+  },
+
+  async getCall(id) {
+    if (dbPool) {
+      const {rows} = await dbPool.query(
+        "SELECT * FROM livebridge_calls WHERE id = $1",
+        [id],
+      );
+      return rowToCall(rows[0]);
+    }
+    return liveBridgeCallsMem.get(id) || null;
+  },
+
+  async getRingingCallForCallee(phone) {
+    if (dbPool) {
+      const {rows} = await dbPool.query(
+        `SELECT * FROM livebridge_calls
+         WHERE callee_phone = $1 AND status = 'ringing'
+         ORDER BY created_at DESC LIMIT 1`,
+        [phone],
+      );
+      return rowToCall(rows[0]);
+    }
+    return (
+      Array.from(liveBridgeCallsMem.values())
+        .filter(c => c.calleePhone === phone && c.status === "ringing")
+        .sort((a, b) => b.createdAt - a.createdAt)[0] || null
+    );
+  },
+
+  async cleanExpiredCalls() {
+    const now = Date.now();
+    if (dbPool) {
+      await dbPool.query(
+        `UPDATE livebridge_calls SET status = 'expired', updated_at = $1
+         WHERE status = 'ringing' AND $1 - created_at > 60000`,
+        [now],
+      );
+      await dbPool.query(
+        `DELETE FROM livebridge_calls WHERE $1 - created_at > 600000`,
+        [now],
+      );
+      return;
+    }
+    for (const [id, call] of liveBridgeCallsMem.entries()) {
+      if (call.status === "ringing" && now - call.createdAt > 60000) {
+        liveBridgeCallsMem.set(id, {...call, status: "expired", updatedAt: now});
+      }
+      if (now - call.createdAt > 600000) liveBridgeCallsMem.delete(id);
+    }
+  },
+};
+
 const liveBridgeNow = () => Date.now();
-const liveBridgeUserOnline = user => Boolean(user && liveBridgeNow() - Number(user.lastSeen || 0) < 45000);
-function cleanExpiredLiveBridgeCalls() {
-  const now = liveBridgeNow();
-  for (const [id, call] of liveBridgeCalls.entries()) {
-    if (call.status === "ringing" && now - call.createdAt > 60000) liveBridgeCalls.set(id,{...call,status:"expired",updatedAt:now});
-    if (now - call.createdAt > 600000) liveBridgeCalls.delete(id);
+const liveBridgeUserOnline = user =>
+  Boolean(user && liveBridgeNow() - Number(user.lastSeen || 0) < 45000);
+app.post("/livebridge/profile/register", async (req, res) => {
+  try {
+    const phone = normalizeLiveBridgePhone(req.body?.phone);
+    const name = String(req.body?.name || "").trim().slice(0, 80);
+    const language = String(req.body?.language || "").trim().slice(0, 80);
+    if (phone.length < 7 || !name) return res.status(400).json({error: "Telefon ve isim gerekli."});
+    const existing = await liveBridgeStore.getUser(phone);
+    const user = {
+      ...(existing || {}),
+      phone,
+      phoneKeys: liveBridgePhoneKeys(phone, req.body?.phoneKeys),
+      name,
+      language,
+      lastSeen: liveBridgeNow(),
+    };
+    await liveBridgeStore.saveUser(user);
+    res.json({ok: true, user: {...user, online: true}});
+  } catch (error) {
+    console.error("profile/register hatası:", error);
+    res.status(500).json({error: "Profil kaydedilemedi."});
   }
-}
-app.post("/livebridge/profile/register",(req,res)=>{
-  const phone=normalizeLiveBridgePhone(req.body?.phone);
-  const name=String(req.body?.name||"").trim().slice(0,80);
-  const language=String(req.body?.language||"").trim().slice(0,80);
-  if(phone.length<7||!name) return res.status(400).json({error:"Telefon ve isim gerekli."});
-  const user={
-    ...(liveBridgeUsers.get(phone)||{}),
-    phone,
-    phoneKeys: liveBridgePhoneKeys(phone, req.body?.phoneKeys),
-    name,
-    language,
-    lastSeen:liveBridgeNow()
-  };
-  liveBridgeUsers.set(phone,user);
-  res.json({ok:true,user:{...user,online:true}});
 });
-app.post("/livebridge/presence",(req,res)=>{
-  const phone=normalizeLiveBridgePhone(req.body?.phone);
-  if(phone.length<7) return res.status(400).json({error:"Telefon gerekli."});
-  const old=liveBridgeUsers.get(phone)||{};
-  const user={
-    ...old,
-    phone,
-    phoneKeys: liveBridgePhoneKeys(phone, req.body?.phoneKeys || old.phoneKeys),
-    name:String(req.body?.name||old.name||"LiveBridge Kullanıcısı").slice(0,80),
-    language:String(req.body?.language||old.language||"").slice(0,80),
-    lastSeen:liveBridgeNow()
-  };
-  liveBridgeUsers.set(phone,user); res.json({ok:true,lastSeen:user.lastSeen});
-});
-app.post("/livebridge/contacts/match",(req,res)=>{
-  const ownerPhone=normalizeLiveBridgePhone(req.body?.ownerPhone);
-  const contacts=Array.isArray(req.body?.contacts)?req.body.contacts.slice(0,3000):[];
-  const users=[]; const seen=new Set();
-  for(const c of contacts){
-    const phone=normalizeLiveBridgePhone(c?.phone);
-    if(!phone||phone===ownerPhone||seen.has(phone)) continue;
-    const r=findLiveBridgeUserByPhone(phone,c?.keys); if(!r) continue;
-    const matchedIdentity = normalizeLiveBridgePhone(r.phone);
-    if (seen.has(matchedIdentity)) continue;
-    seen.add(matchedIdentity);
-    users.push({phone:r.phone,name:String(c?.name||r.name||"LiveBridge Kullanıcısı").slice(0,100),
-      language:r.language||"",online:liveBridgeUserOnline(r),lastSeen:r.lastSeen||0});
+
+app.post("/livebridge/presence", async (req, res) => {
+  try {
+    const phone = normalizeLiveBridgePhone(req.body?.phone);
+    if (phone.length < 7) return res.status(400).json({error: "Telefon gerekli."});
+    const old = (await liveBridgeStore.getUser(phone)) || {};
+    const user = {
+      ...old,
+      phone,
+      phoneKeys: liveBridgePhoneKeys(phone, req.body?.phoneKeys || old.phoneKeys),
+      name: String(req.body?.name || old.name || "LiveBridge Kullanıcısı").slice(0, 80),
+      language: String(req.body?.language || old.language || "").slice(0, 80),
+      lastSeen: liveBridgeNow(),
+    };
+    await liveBridgeStore.saveUser(user);
+    res.json({ok: true, lastSeen: user.lastSeen});
+  } catch (error) {
+    console.error("presence hatası:", error);
+    res.status(500).json({error: "Durum güncellenemedi."});
   }
-  users.sort((a,b)=>a.online===b.online?String(a.name).localeCompare(String(b.name),"tr"):(a.online?-1:1));
-  res.json({ok:true,users});
 });
-app.post("/livebridge/call/start",(req,res)=>{
-  cleanExpiredLiveBridgeCalls();
-  const callerPhone=normalizeLiveBridgePhone(req.body?.callerPhone);
-  const calleePhone=normalizeLiveBridgePhone(req.body?.calleePhone);
-  if(callerPhone.length<7||calleePhone.length<7||callerPhone===calleePhone) return res.status(400).json({error:"Geçersiz arama bilgisi."});
-  const calleeUser = findLiveBridgeUserByPhone(calleePhone);
-  if(!calleeUser) return res.status(404).json({error:"Kişi LiveBridge'de bulunamadı."});
-  const resolvedCalleePhone = calleeUser.phone;
-  const id=`LBC-${Math.random().toString(36).slice(2,10).toUpperCase()}`;
-  const roomName=`LB-${Math.random().toString(36).slice(2,10).toUpperCase()}`;
-  const call={id,roomName,callerPhone,callerName:String(req.body?.callerName||"LiveBridge Kullanıcısı").slice(0,80),
-    calleePhone:resolvedCalleePhone,mode:req.body?.mode==="chat"?"chat":req.body?.mode==="audio"?"audio":"video",status:"ringing",createdAt:liveBridgeNow(),updatedAt:liveBridgeNow()};
-  liveBridgeCalls.set(id,call); res.json({ok:true,call});
+
+app.post("/livebridge/contacts/match", async (req, res) => {
+  try {
+    const ownerPhone = normalizeLiveBridgePhone(req.body?.ownerPhone);
+    const contacts = Array.isArray(req.body?.contacts) ? req.body.contacts.slice(0, 3000) : [];
+    const users = [];
+    const seen = new Set();
+    for (const c of contacts) {
+      const phone = normalizeLiveBridgePhone(c?.phone);
+      if (!phone || phone === ownerPhone || seen.has(phone)) continue;
+      const requestedKeys = liveBridgePhoneKeys(phone, c?.keys);
+      const r = await liveBridgeStore.findUserByPhoneKeys(requestedKeys);
+      if (!r) continue;
+      const matchedIdentity = normalizeLiveBridgePhone(r.phone);
+      if (seen.has(matchedIdentity)) continue;
+      seen.add(matchedIdentity);
+      users.push({
+        phone: r.phone,
+        name: String(c?.name || r.name || "LiveBridge Kullanıcısı").slice(0, 100),
+        language: r.language || "",
+        online: liveBridgeUserOnline(r),
+        lastSeen: r.lastSeen || 0,
+      });
+    }
+    users.sort((a, b) => a.online === b.online ? String(a.name).localeCompare(String(b.name), "tr") : (a.online ? -1 : 1));
+    res.json({ok: true, users});
+  } catch (error) {
+    console.error("contacts/match hatası:", error);
+    res.status(500).json({error: "Kişiler eşleştirilemedi."});
+  }
 });
-app.get("/livebridge/call/incoming",(req,res)=>{
-  cleanExpiredLiveBridgeCalls(); const phone=normalizeLiveBridgePhone(req.query?.phone);
-  const call=Array.from(liveBridgeCalls.values()).filter(c=>c.calleePhone===phone&&c.status==="ringing").sort((a,b)=>b.createdAt-a.createdAt)[0];
-  res.json({ok:true,call:call||null});
+
+app.post("/livebridge/call/start", async (req, res) => {
+  try {
+    await liveBridgeStore.cleanExpiredCalls();
+    const callerPhone = normalizeLiveBridgePhone(req.body?.callerPhone);
+    const calleePhone = normalizeLiveBridgePhone(req.body?.calleePhone);
+    if (callerPhone.length < 7 || calleePhone.length < 7 || callerPhone === calleePhone) {
+      return res.status(400).json({error: "Geçersiz arama bilgisi."});
+    }
+    const calleeUser = await liveBridgeStore.findUserByPhoneKeys(liveBridgePhoneKeys(calleePhone));
+    if (!calleeUser) return res.status(404).json({error: "Kişi LiveBridge'de bulunamadı."});
+    const resolvedCalleePhone = calleeUser.phone;
+    const id = `LBC-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+    const roomName = `LB-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+    const call = {
+      id, roomName, callerPhone,
+      callerName: String(req.body?.callerName || "LiveBridge Kullanıcısı").slice(0, 80),
+      calleePhone: resolvedCalleePhone,
+      mode: req.body?.mode === "chat" ? "chat" : req.body?.mode === "audio" ? "audio" : "video",
+      status: "ringing", createdAt: liveBridgeNow(), updatedAt: liveBridgeNow(),
+    };
+    await liveBridgeStore.saveCall(call);
+    res.json({ok: true, call});
+  } catch (error) {
+    console.error("call/start hatası:", error);
+    res.status(500).json({error: "Arama başlatılamadı."});
+  }
 });
-app.post("/livebridge/call/respond",(req,res)=>{
-  cleanExpiredLiveBridgeCalls(); const id=String(req.body?.callId||""); const phone=normalizeLiveBridgePhone(req.body?.calleePhone);
-  const call=liveBridgeCalls.get(id); if(!call||call.calleePhone!==phone) return res.status(404).json({error:"Arama bulunamadı."});
-  const updated={...call,status:req.body?.accepted?"accepted":"rejected",updatedAt:liveBridgeNow()}; liveBridgeCalls.set(id,updated);
-  res.json({ok:true,call:updated});
+
+app.get("/livebridge/call/incoming", async (req, res) => {
+  try {
+    await liveBridgeStore.cleanExpiredCalls();
+    const phone = normalizeLiveBridgePhone(req.query?.phone);
+    const call = await liveBridgeStore.getRingingCallForCallee(phone);
+    res.json({ok: true, call: call || null});
+  } catch (error) {
+    console.error("call/incoming hatası:", error);
+    res.status(500).json({error: "Gelen arama sorgulanamadı."});
+  }
 });
-app.get("/livebridge/call/status/:id",(req,res)=>{
-  cleanExpiredLiveBridgeCalls(); const call=liveBridgeCalls.get(String(req.params?.id||""));
-  if(!call) return res.status(404).json({error:"Arama bulunamadı."}); res.json({ok:true,call});
+
+app.post("/livebridge/call/respond", async (req, res) => {
+  try {
+    await liveBridgeStore.cleanExpiredCalls();
+    const id = String(req.body?.callId || "");
+    const phone = normalizeLiveBridgePhone(req.body?.calleePhone);
+    const call = await liveBridgeStore.getCall(id);
+    if (!call || call.calleePhone !== phone) return res.status(404).json({error: "Arama bulunamadı."});
+    const updated = {...call, status: req.body?.accepted ? "accepted" : "rejected", updatedAt: liveBridgeNow()};
+    await liveBridgeStore.saveCall(updated);
+    res.json({ok: true, call: updated});
+  } catch (error) {
+    console.error("call/respond hatası:", error);
+    res.status(500).json({error: "Arama yanıtlanamadı."});
+  }
+});
+
+app.get("/livebridge/call/status/:id", async (req, res) => {
+  try {
+    await liveBridgeStore.cleanExpiredCalls();
+    const call = await liveBridgeStore.getCall(String(req.params?.id || ""));
+    if (!call) return res.status(404).json({error: "Arama bulunamadı."});
+    res.json({ok: true, call});
+  } catch (error) {
+    console.error("call/status hatası:", error);
+    res.status(500).json({error: "Arama durumu sorgulanamadı."});
+  }
 });
 
 
@@ -268,6 +574,99 @@ app.post("/audio/transcribe", async (req, res) => {
 });
 
 
+
+function parseTranslatorMetadata(dispatch) {
+  try {
+    return JSON.parse(dispatch?.metadata || "{}");
+  } catch {
+    return {};
+  }
+}
+
+async function deleteTranslatorDispatches(roomName, sourceIdentity) {
+  if (!translatorDispatchClient) return;
+  const list = await translatorDispatchClient.listDispatch(roomName);
+
+  for (const dispatch of list) {
+    if (dispatch.agentName !== "aytalk-translator") continue;
+    const metadata = parseTranslatorMetadata(dispatch);
+    if (metadata.sourceIdentity === sourceIdentity) {
+      await translatorDispatchClient.deleteDispatch(
+        dispatch.id,
+        roomName,
+      );
+    }
+  }
+}
+
+app.post("/livebridge/translator/sync", async (req, res) => {
+  try {
+    if (!translatorDispatchClient) {
+      return res.status(503).json({
+        error: "LiveKit translator worker ayarlı değil.",
+      });
+    }
+
+    const roomName = String(req.body?.roomName || "").trim();
+    const sourceIdentity = String(req.body?.sourceIdentity || "").trim();
+    const sourceLanguage = String(req.body?.sourceLanguage || "").trim();
+    const sourceLocale = String(req.body?.sourceLocale || "").trim();
+    const targetLanguage = String(req.body?.targetLanguage || "").trim();
+    const targetLocale = String(req.body?.targetLocale || "").trim();
+    const voiceId = String(req.body?.voiceId || "").trim();
+
+    if (!roomName || !sourceIdentity || !sourceLanguage || !targetLanguage) {
+      return res.status(400).json({
+        error: "Oda, katılımcı ve dil bilgileri gerekli.",
+      });
+    }
+
+    await deleteTranslatorDispatches(roomName, sourceIdentity);
+
+    const metadata = JSON.stringify({
+      sourceIdentity,
+      sourceLanguage,
+      sourceLocale,
+      targetLanguage,
+      targetLocale,
+      voiceId,
+    });
+
+    const created = await translatorDispatchClient.createDispatch(
+      roomName,
+      "aytalk-translator",
+      {metadata},
+    );
+
+    return res.json({
+      ok: true,
+      dispatchId: created.id,
+      mode: "continuous",
+    });
+  } catch (error) {
+    console.error("translator sync:", error);
+    return res.status(500).json({
+      error: error?.message || "Canlı çeviri ajanı başlatılamadı.",
+    });
+  }
+});
+
+app.post("/livebridge/translator/stop", async (req, res) => {
+  try {
+    const roomName = String(req.body?.roomName || "").trim();
+    const sourceIdentity = String(req.body?.sourceIdentity || "").trim();
+    if (roomName && sourceIdentity) {
+      await deleteTranslatorDispatches(roomName, sourceIdentity);
+    }
+    return res.json({ok: true});
+  } catch (error) {
+    return res.status(500).json({
+      error: error?.message || "Çeviri ajanı durdurulamadı.",
+    });
+  }
+});
+
+
 // LIVEKIT UZAK GÖRÜŞME TOKEN ENDPOINT
 app.post("/livekit/token", async (req, res) => {
   try {
@@ -342,7 +741,7 @@ app.post("/livekit/token", async (req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ok: true, service: "LiveBridge", version: "10.2-call-ui-language-moderation"});
+  res.json({ok: true, service: "LiveBridge", version: "11.0-realtime-bridge"});
 });
 
 app.get("/livebridge/voice/capabilities", (_req, res) => {
@@ -369,26 +768,6 @@ app.post("/call/translate", async (req, res) => {
     const message = String(req.body?.message || "").trim();
     const from = String(req.body?.from || "Auto").trim();
     const to = String(req.body?.to || "English").trim();
-
-    const requestedProfanityMode = String(
-      req.body?.profanityMode || "soften",
-    )
-      .trim()
-      .toLowerCase();
-
-    const profanityMode = ["direct", "soften", "hide"].includes(
-      requestedProfanityMode,
-    )
-      ? requestedProfanityMode
-      : "soften";
-
-    const profanityInstruction =
-      profanityMode === "direct"
-        ? "If the speaker uses profanity, insults or vulgar slang, preserve its real meaning and intensity naturally in the target language. Do not censor it."
-        : profanityMode === "hide"
-          ? "If the speaker uses profanity, insults or vulgar slang, preserve the sentence meaning but replace only the explicit offensive word or phrase with [...]. Do not invent a different insult."
-          : "If the speaker uses profanity, insults or vulgar slang, preserve the speaker's emotion and intent but translate the offensive wording into the nearest natural non-vulgar equivalent in the target language. Do not make the sentence more aggressive than the source.";
-
     const rawContext = Array.isArray(req.body?.context) ? req.body.context : [];
     const context = rawContext
       .slice(-8)
@@ -433,8 +812,6 @@ app.post("/call/translate", async (req, res) => {
         "A normal spoken word that happens to look like a Latin-letter abbreviation must remain a word; do not reinterpret it as an acronym unless context clearly shows an acronym, company name or initialism. " +
         "When an address term has a natural target-language equivalent, use that equivalent while preserving relationship, respect and register. " +
         "Do not transliterate ordinary vocabulary when an established target-language translation exists. Preserve proper names and genuine acronyms. " +
-        profanityInstruction + " " +
-        "Apply the selected profanity rule regardless of the source or target language. " +
         "Return ONLY the translation of CURRENT_UTTERANCE.",
       input:
         `PREVIOUS_CONTEXT:\n${contextText}\n\n` +
@@ -929,10 +1306,43 @@ app.post("/tts", async (req, res) => {
   }
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("================================");
-  console.log("AyTalk Fast Server Başladı");
-  console.log(`Port: ${PORT}`);
-  console.log("Model: gpt-4.1-nano (translation)");
-  console.log("================================");
+// Tanımsız uç noktalar için 404.
+app.use((req, res) => {
+  res.status(404).json({error: "Uç nokta bulunamadı."});
 });
+
+// Express hata yakalayıcı (4 parametreli imza şart).
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  console.error("Beklenmeyen sunucu hatası:", err);
+  if (res.headersSent) return;
+  res.status(err.message?.startsWith("CORS") ? 403 : 500).json({
+    error: err.message?.startsWith("CORS")
+      ? "İzin verilmeyen kaynak."
+      : "Sunucu hatası.",
+  });
+});
+
+// Beklenmeyen hatalarda sunucunun sessizce çökmesini önler, en azından loglar.
+process.on("uncaughtException", err => {
+  console.error("YAKALANMAMIŞ İSTİSNA:", err);
+});
+
+process.on("unhandledRejection", reason => {
+  console.error("İŞLENMEMİŞ PROMISE REDDİ:", reason);
+});
+
+initDb()
+  .catch(err => {
+    console.error("Veritabanı başlatma hatası:", err);
+  })
+  .finally(() => {
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log("================================");
+      console.log("AyTalk Fast Server Başladı");
+      console.log(`Port: ${PORT}`);
+      console.log(`Veritabanı: ${dbPool ? "Postgres (kalıcı)" : "RAM (kalıcı DEĞİL)"}`);
+      console.log("Model: gpt-4.1-nano (translation)");
+      console.log("================================");
+    });
+  });
