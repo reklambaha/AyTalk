@@ -4,7 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const OpenAI = require("openai");
 const {toFile} = require("openai");
-const {AccessToken, AgentDispatchClient} = require("livekit-server-sdk");
+const {AccessToken} = require("livekit-server-sdk");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,17 +15,6 @@ const openai = new OpenAI({
   timeout: 20000,
   maxRetries: 1,
 });
-
-const translatorDispatchClient =
-  process.env.LIVEKIT_URL &&
-  process.env.LIVEKIT_API_KEY &&
-  process.env.LIVEKIT_API_SECRET
-    ? new AgentDispatchClient(
-        process.env.LIVEKIT_URL.replace(/^wss:/, "https:"),
-        process.env.LIVEKIT_API_KEY,
-        process.env.LIVEKIT_API_SECRET,
-      )
-    : null;
 
 app.disable("x-powered-by");
 app.use(cors());
@@ -279,99 +268,6 @@ app.post("/audio/transcribe", async (req, res) => {
 });
 
 
-
-function parseTranslatorMetadata(dispatch) {
-  try {
-    return JSON.parse(dispatch?.metadata || "{}");
-  } catch {
-    return {};
-  }
-}
-
-async function deleteTranslatorDispatches(roomName, sourceIdentity) {
-  if (!translatorDispatchClient) return;
-  const list = await translatorDispatchClient.listDispatch(roomName);
-
-  for (const dispatch of list) {
-    if (dispatch.agentName !== "aytalk-translator") continue;
-    const metadata = parseTranslatorMetadata(dispatch);
-    if (metadata.sourceIdentity === sourceIdentity) {
-      await translatorDispatchClient.deleteDispatch(
-        dispatch.id,
-        roomName,
-      );
-    }
-  }
-}
-
-app.post("/livebridge/translator/sync", async (req, res) => {
-  try {
-    if (!translatorDispatchClient) {
-      return res.status(503).json({
-        error: "LiveKit translator worker ayarlı değil.",
-      });
-    }
-
-    const roomName = String(req.body?.roomName || "").trim();
-    const sourceIdentity = String(req.body?.sourceIdentity || "").trim();
-    const sourceLanguage = String(req.body?.sourceLanguage || "").trim();
-    const sourceLocale = String(req.body?.sourceLocale || "").trim();
-    const targetLanguage = String(req.body?.targetLanguage || "").trim();
-    const targetLocale = String(req.body?.targetLocale || "").trim();
-    const voiceId = String(req.body?.voiceId || "").trim();
-
-    if (!roomName || !sourceIdentity || !sourceLanguage || !targetLanguage) {
-      return res.status(400).json({
-        error: "Oda, katılımcı ve dil bilgileri gerekli.",
-      });
-    }
-
-    await deleteTranslatorDispatches(roomName, sourceIdentity);
-
-    const metadata = JSON.stringify({
-      sourceIdentity,
-      sourceLanguage,
-      sourceLocale,
-      targetLanguage,
-      targetLocale,
-      voiceId,
-    });
-
-    const created = await translatorDispatchClient.createDispatch(
-      roomName,
-      "aytalk-translator",
-      {metadata},
-    );
-
-    return res.json({
-      ok: true,
-      dispatchId: created.id,
-      mode: "continuous",
-    });
-  } catch (error) {
-    console.error("translator sync:", error);
-    return res.status(500).json({
-      error: error?.message || "Canlı çeviri ajanı başlatılamadı.",
-    });
-  }
-});
-
-app.post("/livebridge/translator/stop", async (req, res) => {
-  try {
-    const roomName = String(req.body?.roomName || "").trim();
-    const sourceIdentity = String(req.body?.sourceIdentity || "").trim();
-    if (roomName && sourceIdentity) {
-      await deleteTranslatorDispatches(roomName, sourceIdentity);
-    }
-    return res.json({ok: true});
-  } catch (error) {
-    return res.status(500).json({
-      error: error?.message || "Çeviri ajanı durdurulamadı.",
-    });
-  }
-});
-
-
 // LIVEKIT UZAK GÖRÜŞME TOKEN ENDPOINT
 app.post("/livekit/token", async (req, res) => {
   try {
@@ -446,7 +342,7 @@ app.post("/livekit/token", async (req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ok: true, service: "LiveBridge", version: "11.0-realtime-bridge"});
+  res.json({ok: true, service: "LiveBridge", version: "10.2-call-ui-language-moderation"});
 });
 
 app.get("/livebridge/voice/capabilities", (_req, res) => {
@@ -473,6 +369,26 @@ app.post("/call/translate", async (req, res) => {
     const message = String(req.body?.message || "").trim();
     const from = String(req.body?.from || "Auto").trim();
     const to = String(req.body?.to || "English").trim();
+
+    const requestedProfanityMode = String(
+      req.body?.profanityMode || "soften",
+    )
+      .trim()
+      .toLowerCase();
+
+    const profanityMode = ["direct", "soften", "hide"].includes(
+      requestedProfanityMode,
+    )
+      ? requestedProfanityMode
+      : "soften";
+
+    const profanityInstruction =
+      profanityMode === "direct"
+        ? "If the speaker uses profanity, insults or vulgar slang, preserve its real meaning and intensity naturally in the target language. Do not censor it."
+        : profanityMode === "hide"
+          ? "If the speaker uses profanity, insults or vulgar slang, preserve the sentence meaning but replace only the explicit offensive word or phrase with [...]. Do not invent a different insult."
+          : "If the speaker uses profanity, insults or vulgar slang, preserve the speaker's emotion and intent but translate the offensive wording into the nearest natural non-vulgar equivalent in the target language. Do not make the sentence more aggressive than the source.";
+
     const rawContext = Array.isArray(req.body?.context) ? req.body.context : [];
     const context = rawContext
       .slice(-8)
@@ -517,6 +433,8 @@ app.post("/call/translate", async (req, res) => {
         "A normal spoken word that happens to look like a Latin-letter abbreviation must remain a word; do not reinterpret it as an acronym unless context clearly shows an acronym, company name or initialism. " +
         "When an address term has a natural target-language equivalent, use that equivalent while preserving relationship, respect and register. " +
         "Do not transliterate ordinary vocabulary when an established target-language translation exists. Preserve proper names and genuine acronyms. " +
+        profanityInstruction + " " +
+        "Apply the selected profanity rule regardless of the source or target language. " +
         "Return ONLY the translation of CURRENT_UTTERANCE.",
       input:
         `PREVIOUS_CONTEXT:\n${contextText}\n\n` +
