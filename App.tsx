@@ -133,6 +133,7 @@ function AyTalkMainApp() {
   const [targetPickerOpen, setTargetPickerOpen] = useState(false);
   const [conversationMode, setConversationMode] = useState(true);
   const [followVoiceTone, setFollowVoiceTone] = useState(true);
+  const [voiceGender, setVoiceGender] = useState<"male" | "female">("female");
   const [conferenceParticipants, setConferenceParticipants] = useState<ConferenceParticipant[]>([
     {id: "p1", name: "Kişi 1", language: DEFAULT_SOURCE_LANGUAGE},
     {id: "p2", name: "Kişi 2", language: DEFAULT_TARGET_LANGUAGE},
@@ -1395,6 +1396,7 @@ function AyTalkMainApp() {
       language: language.name,
       followVoiceTone,
       voicePace,
+      gender: voiceGender,
     });
 
     const filePath = `${RNFS.CachesDirectoryPath}/aytalk-${Date.now()}-${Math.random()
@@ -2110,6 +2112,9 @@ function AyTalkMainApp() {
         if (["slow", "normal", "fast"].includes(parsed?.voicePace)) {
           setVoicePace(parsed.voicePace as VoicePace);
         }
+        if (parsed?.voiceGender === "male" || parsed?.voiceGender === "female") {
+          setVoiceGender(parsed.voiceGender);
+        }
       })
       .catch(() => undefined);
   }, []);
@@ -2117,9 +2122,9 @@ function AyTalkMainApp() {
   useEffect(() => {
     AsyncStorage.setItem(
       "aytalk_voice_style_settings",
-      JSON.stringify({followVoiceTone, voicePace}),
+      JSON.stringify({followVoiceTone, voicePace, voiceGender}),
     ).catch(() => undefined);
-  }, [followVoiceTone, voicePace]);
+  }, [followVoiceTone, voicePace, voiceGender]);
 
   useEffect(() => {
     let mounted = true;
@@ -2711,6 +2716,37 @@ function AyTalkMainApp() {
                 </Text>
               </View>
               <Switch value={followVoiceTone} onValueChange={setFollowVoiceTone} />
+            </View>
+          ) : null}
+
+          {appMode !== "image" && appMode !== "conference" ? (
+            <View style={[styles.voiceStyleRow, {marginTop: 10}]}>
+              <View style={styles.voiceStyleTextWrap}>
+                <Text style={styles.voiceStyleTitle}>Ses cinsiyeti</Text>
+                <Text style={styles.voiceStyleDescription}>
+                  AI seslendirirken hangi sesi kullansın?
+                </Text>
+              </View>
+              <View style={{flexDirection: "row", gap: 8}}>
+                <TouchableOpacity
+                  onPress={() => setVoiceGender("female")}
+                  style={{
+                    paddingHorizontal: 14, paddingVertical: 8, borderRadius: 10,
+                    backgroundColor: voiceGender === "female" ? "#3D7DFF" : "rgba(255,255,255,0.06)",
+                    borderWidth: 1, borderColor: voiceGender === "female" ? "#3D7DFF" : "rgba(255,255,255,0.12)",
+                  }}>
+                  <Text style={{color: "#FFFFFF", fontWeight: "600"}}>👩</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={() => setVoiceGender("male")}
+                  style={{
+                    paddingHorizontal: 14, paddingVertical: 8, borderRadius: 10,
+                    backgroundColor: voiceGender === "male" ? "#3D7DFF" : "rgba(255,255,255,0.06)",
+                    borderWidth: 1, borderColor: voiceGender === "male" ? "#3D7DFF" : "rgba(255,255,255,0.12)",
+                  }}>
+                  <Text style={{color: "#FFFFFF", fontWeight: "600"}}>👨</Text>
+                </TouchableOpacity>
+              </View>
             </View>
           ) : null}
 

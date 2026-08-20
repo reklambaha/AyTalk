@@ -7,6 +7,7 @@ type RequestTtsOptions = {
   language: string;
   followVoiceTone: boolean;
   voicePace: VoicePace;
+  gender: "male" | "female";
 };
 
 type TtsResponse = {
@@ -19,6 +20,7 @@ export async function requestTtsAudioBase64({
   language,
   followVoiceTone,
   voicePace,
+  gender,
 }: RequestTtsOptions): Promise<string> {
   const data = await fetchJson<TtsResponse>(
     "/tts",
@@ -28,18 +30,17 @@ export async function requestTtsAudioBase64({
       body: JSON.stringify({
         text: text.slice(0, 4096),
         language,
+        gender,
         voiceStyle: followVoiceTone
           ? {
               followSpeaker: true,
               pace: voicePace,
               tone: "warm-natural",
-              voice: "male",
             }
           : {
               followSpeaker: false,
               pace: "normal",
               tone: "clear-neutral",
-              voice: "female",
             },
       }),
     },

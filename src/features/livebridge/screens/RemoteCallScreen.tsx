@@ -82,6 +82,7 @@ type LiveBridgeIncomingCall = {
   roomName: string;
   callerPhone: string;
   callerName: string;
+  callerGender?: "male" | "female";
   calleePhone: string;
   mode: LiveBridgeCallMode;
   status: "ringing" | "accepted" | "rejected" | "expired";
@@ -92,6 +93,7 @@ type LiveBridgeOutgoingCall = {
   roomName: string;
   calleePhone: string;
   calleeName: string;
+  calleeGender?: "male" | "female";
   mode: LiveBridgeCallMode;
   status: "ringing" | "accepted" | "rejected" | "expired";
 };
@@ -598,10 +600,10 @@ function RoomView({
     };
   }, []);
 
-  const playCloudTranslation = async (text: string, languageName: string) => {
+  const playCloudTranslation = async (text: string, languageName: string, gender: "male" | "female") => {
     const response = await fetch(`${SERVER_URL}/tts`, {
       method: "POST", headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
-      body: JSON.stringify({text, language: languageName}),
+      body: JSON.stringify({text, language: languageName, gender}),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data?.error || "Bulut seslendirme başarısız.");
@@ -625,12 +627,14 @@ function RoomView({
   const speakTranslation = async (translated: string, locale: string) => {
     if (!voiceTranslationEnabled || !translated.trim()) return;
     const languageName = CALL_LANGUAGES.find(item => item.locale === locale)?.name || locale;
+    const remoteGender: "male" | "female" =
+      outgoingCall?.calleeGender || incomingCall?.callerGender || "female";
     try {
       await Tts.stop();
       const voices = await Tts.voices();
       const prepared = prepareSpeech({text: translated, locale, voices});
       if (!prepared.hasCompatibleLocalVoice) {
-        await playCloudTranslation(prepared.speechText, languageName);
+        await playCloudTranslation(prepared.speechText, languageName, remoteGender);
         return;
       }
       if (prepared.selectedVoiceId) await Tts.setDefaultVoice(prepared.selectedVoiceId);
@@ -642,7 +646,7 @@ function RoomView({
     } catch {
       try {
         const prepared = prepareSpeech({text: translated, locale, voices: []});
-        await playCloudTranslation(prepared.speechText, languageName);
+        await playCloudTranslation(prepared.speechText, languageName, remoteGender);
       } catch {}
     }
   };
@@ -2188,6 +2192,7 @@ export default function RemoteCallScreen({
   onClose,
 }: RemoteCallScreenProps) {
   const [name, setName] = useState(defaultName || "AyTalk Kullanıcısı");
+  const [voiceGender, setVoiceGender] = useState<"male" | "female">("female");
   const [roomCode, setRoomCode] = useState("");
   const [credentials, setCredentials] =
     useState<LiveKitCredentials | null>(null);
@@ -2322,13 +2327,14 @@ export default function RemoteCallScreen({
           phoneKeys: liveBridgePhoneKeys(cleanPhone),
           name: name.trim() || "LiveBridge Kullanıcısı",
           language: sourceCallLanguage.name,
+          gender: voiceGender,
         }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data?.error || "LiveBridge kaydı yapılamadı.");
       setDirectoryPhone(cleanPhone);
       setDirectoryProfileReady(true);
-      await AsyncStorage.setItem(LIVEBRIDGE_PROFILE_KEY, JSON.stringify({phone: cleanPhone}));
+      await AsyncStorage.setItem(LIVEBRIDGE_PROFILE_KEY, JSON.stringify({phone: cleanPhone, gender: voiceGender}));
       return true;
     } catch (error) {
       Alert.alert("LiveBridge kayıt hatası", error instanceof Error ? error.message : "Profil kaydedilemedi.");
@@ -2390,8 +2396,9 @@ export default function RemoteCallScreen({
       try {
         const saved = await AsyncStorage.getItem(LIVEBRIDGE_PROFILE_KEY);
         if (!saved || cancelled) return;
-        const parsed = JSON.parse(saved) as {phone?: string};
+        const parsed = JSON.parse(saved) as {phone?: string; gender?: "male" | "female"};
         const phone = normalizeLiveBridgePhone(parsed.phone || "");
+        if (parsed.gender === "male" || parsed.gender === "female") setVoiceGender(parsed.gender);
         if (phone.length >= 7) {
           setDirectoryPhone(phone);
           setDirectoryProfileReady(true);
@@ -2685,6 +2692,7 @@ export default function RemoteCallScreen({
         roomName: data.call.roomName,
         calleePhone: user.phone,
         calleeName: user.name,
+        calleeGender: data.call.calleeGender === "male" ? "male" : "female",
         mode,
         status: "ringing",
       });
@@ -3010,6 +3018,28 @@ export default function RemoteCallScreen({
               placeholderTextColor="#7F9AB9"
               maxLength={40}
             />
+
+            <Text style={styles.label}>Ses cinsiyeti (AI seslendirirken)</Text>
+            <View style={{flexDirection: "row", gap: 10}}>
+              <TouchableOpacity
+                onPress={() => setVoiceGender("female")}
+                style={{
+                  flex: 1, paddingVertical: 12, borderRadius: 12, alignItems: "center",
+                  backgroundColor: voiceGender === "female" ? "#3D7DFF" : "rgba(255,255,255,0.06)",
+                  borderWidth: 1, borderColor: voiceGender === "female" ? "#3D7DFF" : "rgba(255,255,255,0.12)",
+                }}>
+                <Text style={{color: "#FFFFFF", fontWeight: "600"}}>👩 Kadın</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => setVoiceGender("male")}
+                style={{
+                  flex: 1, paddingVertical: 12, borderRadius: 12, alignItems: "center",
+                  backgroundColor: voiceGender === "male" ? "#3D7DFF" : "rgba(255,255,255,0.06)",
+                  borderWidth: 1, borderColor: voiceGender === "male" ? "#3D7DFF" : "rgba(255,255,255,0.12)",
+                }}>
+                <Text style={{color: "#FFFFFF", fontWeight: "600"}}>👨 Erkek</Text>
+              </TouchableOpacity>
+            </View>
 
             <Text style={styles.label}>Oda kodu</Text>
             <TextInput
