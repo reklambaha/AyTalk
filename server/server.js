@@ -36,8 +36,12 @@ async function initDb() {
       phone_keys TEXT[] NOT NULL DEFAULT '{}',
       name TEXT NOT NULL,
       language TEXT DEFAULT '',
+      gender TEXT NOT NULL DEFAULT 'female',
       last_seen BIGINT NOT NULL
     );
+  `);
+  await dbPool.query(`
+    ALTER TABLE livebridge_users ADD COLUMN IF NOT EXISTS gender TEXT NOT NULL DEFAULT 'female';
   `);
   await dbPool.query(`
     CREATE INDEX IF NOT EXISTS idx_livebridge_users_phone_keys
@@ -49,12 +53,20 @@ async function initDb() {
       room_name TEXT NOT NULL,
       caller_phone TEXT NOT NULL,
       caller_name TEXT NOT NULL,
+      caller_gender TEXT NOT NULL DEFAULT 'female',
       callee_phone TEXT NOT NULL,
+      callee_gender TEXT NOT NULL DEFAULT 'female',
       mode TEXT NOT NULL,
       status TEXT NOT NULL,
       created_at BIGINT NOT NULL,
       updated_at BIGINT NOT NULL
     );
+  `);
+  await dbPool.query(`
+    ALTER TABLE livebridge_calls ADD COLUMN IF NOT EXISTS caller_gender TEXT NOT NULL DEFAULT 'female';
+  `);
+  await dbPool.query(`
+    ALTER TABLE livebridge_calls ADD COLUMN IF NOT EXISTS callee_gender TEXT NOT NULL DEFAULT 'female';
   `);
   console.log("Veritabanı tabloları hazır.");
 }
@@ -181,6 +193,7 @@ function rowToUser(row) {
     phoneKeys: row.phone_keys || [],
     name: row.name,
     language: row.language || "",
+    gender: row.gender === "male" ? "male" : "female",
     lastSeen: Number(row.last_seen || 0),
   };
 }
@@ -192,7 +205,9 @@ function rowToCall(row) {
     roomName: row.room_name,
     callerPhone: row.caller_phone,
     callerName: row.caller_name,
+    callerGender: row.caller_gender === "male" ? "male" : "female",
     calleePhone: row.callee_phone,
+    calleeGender: row.callee_gender === "male" ? "male" : "female",
     mode: row.mode,
     status: row.status,
     createdAt: Number(row.created_at),
@@ -215,14 +230,15 @@ const liveBridgeStore = {
   async saveUser(user) {
     if (dbPool) {
       await dbPool.query(
-        `INSERT INTO livebridge_users (phone, phone_keys, name, language, last_seen)
-         VALUES ($1, $2, $3, $4, $5)
+        `INSERT INTO livebridge_users (phone, phone_keys, name, language, gender, last_seen)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (phone) DO UPDATE SET
            phone_keys = EXCLUDED.phone_keys,
            name = EXCLUDED.name,
            language = EXCLUDED.language,
+           gender = EXCLUDED.gender,
            last_seen = EXCLUDED.last_seen`,
-        [user.phone, user.phoneKeys, user.name, user.language, user.lastSeen],
+        [user.phone, user.phoneKeys, user.name, user.language, user.gender === "male" ? "male" : "female", user.lastSeen],
       );
       return user;
     }
@@ -249,14 +265,17 @@ const liveBridgeStore = {
     if (dbPool) {
       await dbPool.query(
         `INSERT INTO livebridge_calls
-           (id, room_name, caller_phone, caller_name, callee_phone, mode, status, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+           (id, room_name, caller_phone, caller_name, caller_gender, callee_phone, callee_gender, mode, status, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
          ON CONFLICT (id) DO UPDATE SET
            status = EXCLUDED.status,
            updated_at = EXCLUDED.updated_at`,
         [
           call.id, call.roomName, call.callerPhone, call.callerName,
-          call.calleePhone, call.mode, call.status, call.createdAt, call.updatedAt,
+          call.callerGender === "male" ? "male" : "female",
+          call.calleePhone,
+          call.calleeGender === "male" ? "male" : "female",
+          call.mode, call.status, call.createdAt, call.updatedAt,
         ],
       );
       return call;
@@ -324,6 +343,7 @@ app.post("/livebridge/profile/register", async (req, res) => {
     const phone = normalizeLiveBridgePhone(req.body?.phone);
     const name = String(req.body?.name || "").trim().slice(0, 80);
     const language = String(req.body?.language || "").trim().slice(0, 80);
+    const gender = req.body?.gender === "male" ? "male" : "female";
     if (phone.length < 7 || !name) return res.status(400).json({error: "Telefon ve isim gerekli."});
     const existing = await liveBridgeStore.getUser(phone);
     const user = {
@@ -332,6 +352,7 @@ app.post("/livebridge/profile/register", async (req, res) => {
       phoneKeys: liveBridgePhoneKeys(phone, req.body?.phoneKeys),
       name,
       language,
+      gender,
       lastSeen: liveBridgeNow(),
     };
     await liveBridgeStore.saveUser(user);
@@ -353,6 +374,7 @@ app.post("/livebridge/presence", async (req, res) => {
       phoneKeys: liveBridgePhoneKeys(phone, req.body?.phoneKeys || old.phoneKeys),
       name: String(req.body?.name || old.name || "LiveBridge Kullanıcısı").slice(0, 80),
       language: String(req.body?.language || old.language || "").slice(0, 80),
+      gender: req.body?.gender === "male" || req.body?.gender === "female" ? req.body.gender : (old.gender || "female"),
       lastSeen: liveBridgeNow(),
     };
     await liveBridgeStore.saveUser(user);
@@ -382,6 +404,7 @@ app.post("/livebridge/contacts/match", async (req, res) => {
         phone: r.phone,
         name: String(c?.name || r.name || "LiveBridge Kullanıcısı").slice(0, 100),
         language: r.language || "",
+        gender: r.gender === "male" ? "male" : "female",
         online: liveBridgeUserOnline(r),
         lastSeen: r.lastSeen || 0,
       });
@@ -405,12 +428,15 @@ app.post("/livebridge/call/start", async (req, res) => {
     const calleeUser = await liveBridgeStore.findUserByPhoneKeys(liveBridgePhoneKeys(calleePhone));
     if (!calleeUser) return res.status(404).json({error: "Kişi LiveBridge'de bulunamadı."});
     const resolvedCalleePhone = calleeUser.phone;
+    const callerUser = await liveBridgeStore.getUser(callerPhone);
     const id = `LBC-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
     const roomName = `LB-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
     const call = {
       id, roomName, callerPhone,
       callerName: String(req.body?.callerName || "LiveBridge Kullanıcısı").slice(0, 80),
+      callerGender: callerUser?.gender === "male" ? "male" : "female",
       calleePhone: resolvedCalleePhone,
+      calleeGender: calleeUser.gender === "male" ? "male" : "female",
       mode: req.body?.mode === "chat" ? "chat" : req.body?.mode === "audio" ? "audio" : "video",
       status: "ringing", createdAt: liveBridgeNow(), updatedAt: liveBridgeNow(),
     };
@@ -812,6 +838,10 @@ app.post("/call/translate", async (req, res) => {
         "A normal spoken word that happens to look like a Latin-letter abbreviation must remain a word; do not reinterpret it as an acronym unless context clearly shows an acronym, company name or initialism. " +
         "When an address term has a natural target-language equivalent, use that equivalent while preserving relationship, respect and register. " +
         "Do not transliterate ordinary vocabulary when an established target-language translation exists. Preserve proper names and genuine acronyms. " +
+        "CRITICAL — register matching: the speaker may use informal, rural, regional, dialectal, or uneducated everyday speech, " +
+        "non-standard grammar, slang, or spoken-language shortcuts. Render this in equally informal, everyday spoken language " +
+        "in the target language — the kind an ordinary villager or non-literate speaker would actually use in daily life. " +
+        "NEVER upgrade informal speech into formal, literary, official, or textbook-correct language. Match the register down, not up. " +
         "Return ONLY the translation of CURRENT_UTTERANCE.",
       input:
         `PREVIOUS_CONTEXT:\n${contextText}\n\n` +
@@ -852,8 +882,9 @@ app.post("/chat", async (req, res) => {
     }
 
     const response = await openai.responses.create({
-      // Çeviri için mini yerine daha hızlı nano model.
-      model: "gpt-4.1-nano",
+      // Kalite için mini model (nano yerine) — konuşma dili/lehçe çevirisinde
+      // gözle görülür fark yaratıyor.
+      model: "gpt-4.1-mini",
       store: false,
 
       // Gereksiz uzun yanıt üretimini engeller.
@@ -869,7 +900,13 @@ app.post("/chat", async (req, res) => {
         "Translate kinship terms, honorifics, forms of address, idioms and discourse markers by their function in context. " +
         "A normal word must never be reinterpreted as an acronym only because its Latin spelling resembles one. " +
         "Preserve genuine acronyms, brands, proper names, numbers, punctuation, paragraphs, tone and question form. " +
-        "Use the natural target-language equivalent for ordinary vocabulary and address terms.",
+        "Use the natural target-language equivalent for ordinary vocabulary and address terms. " +
+        "CRITICAL — register matching: the speaker may use informal, rural, regional, dialectal, or uneducated everyday speech, " +
+        "non-standard grammar, slang, or spoken-language shortcuts. Render this in equally informal, everyday spoken language " +
+        "in the target language — the kind an ordinary villager or non-literate speaker would actually use in daily life. " +
+        "NEVER upgrade informal speech into formal, literary, official, or textbook-correct language. Match the register down, " +
+        "not up. If the input is broken or ungrammatical because that is how the speaker naturally talks, the translation should " +
+        "sound just as plain and natural — not more polished than the original.",
 
       input: message,
     });
@@ -933,7 +970,7 @@ app.post("/chat-stream", async (req, res) => {
     writeStreamEvent(res, {type: "start"});
 
     const stream = await openai.responses.create({
-      model: "gpt-4.1-nano",
+      model: "gpt-4.1-mini",
       store: false,
       stream: true,
       max_output_tokens: Math.min(
@@ -946,7 +983,12 @@ app.post("/chat-stream", async (req, res) => {
         "Translate kinship terms, honorifics, forms of address, idioms and discourse markers by their function in context. " +
         "A normal word must never be reinterpreted as an acronym only because its Latin spelling resembles one. " +
         "Preserve genuine acronyms, brands, proper names, numbers, punctuation, paragraphs, tone and question form. " +
-        "Use the natural target-language equivalent for ordinary vocabulary and address terms.",
+        "Use the natural target-language equivalent for ordinary vocabulary and address terms. " +
+        "CRITICAL — register matching: the speaker may use informal, rural, regional, dialectal, or uneducated everyday speech, " +
+        "non-standard grammar, slang, or spoken-language shortcuts. Render this in equally informal, everyday spoken language " +
+        "in the target language — the kind an ordinary villager or non-literate speaker would actually use in daily life. " +
+        "NEVER upgrade informal speech into formal, literary, official, or textbook-correct language. Match the register down, " +
+        "not up.",
       input: message,
     });
 
@@ -1279,9 +1321,17 @@ app.post("/tts", async (req, res) => {
       });
     }
 
+    // Cinsiyete göre OpenAI ses modeli seçimi.
+    // "male": onyx (derin/erkeksi) — "female": coral (varsayılan, kadınsı)
+    const requestedGender =
+      String(req.body?.gender || req.body?.voiceStyle?.voice || "")
+        .trim()
+        .toLowerCase();
+    const voice = requestedGender === "male" ? "onyx" : "coral";
+
     const speech = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
-      voice: "coral",
+      voice,
       input: text,
       response_format: "mp3",
       instructions: language
