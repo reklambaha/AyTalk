@@ -21,7 +21,8 @@ export type HomeSection =
   | "image"
   | "conference"
   | "history"
-  | "profile";
+  | "profile"
+  | "emergency";
 
 export default function HomeDashboard({
   onOpen,
@@ -123,6 +124,20 @@ export default function HomeDashboard({
         <View style={styles.arrowCircle}>
           <Text style={styles.arrow}>›</Text>
         </View>
+      </TouchableOpacity>
+
+      <TouchableOpacity
+        activeOpacity={0.9}
+        style={[styles.emergencyCard, {marginBottom: gap}]}
+        onPress={() => onOpen("emergency")}>
+        <View style={styles.emergencyIconWrap}>
+          <Text style={styles.emergencyIcon}>🆘</Text>
+        </View>
+        <View style={styles.emergencyTextWrap}>
+          <Text style={styles.emergencyTitle}>Acil Durum</Text>
+          <Text style={styles.emergencySubtitle}>Offline Emergency Phrases</Text>
+        </View>
+        <Text style={styles.emergencyArrow}>›</Text>
       </TouchableOpacity>
 
       <View style={[styles.grid, {gap}]}>
@@ -309,6 +324,29 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#030817",
   },
+  emergencyCard: {
+    minHeight: 64,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: "rgba(255,112,112,0.52)",
+    backgroundColor: "#241222",
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 14,
+  },
+  emergencyIconWrap: {
+    width: 44,
+    height: 44,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(255,255,255,0.06)",
+  },
+  emergencyIcon: {fontSize: 25},
+  emergencyTextWrap: {flex: 1, marginLeft: 12},
+  emergencyTitle: {color: "#FFFFFF", fontSize: 16, fontWeight: "900"},
+  emergencySubtitle: {color: "#E8A9B1", fontSize: 11, marginTop: 2},
+  emergencyArrow: {color: "#FFFFFF", fontSize: 30, fontWeight: "300"},
   glassCard: {
     borderWidth: 1,
     borderColor: "rgba(94,183,255,0.40)",

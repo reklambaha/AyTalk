@@ -51,6 +51,8 @@ import {
   LANGUAGES,
 } from "./src/constants/languages";
 import AppIntro from "./src/components/AppIntro";
+import FirstRunOnboarding from "./src/components/FirstRunOnboarding";
+import EmergencyMode from "./src/features/emergency/EmergencyMode";
 import {RemoteCallScreen} from "./src/features/livebridge";
 import VoiceWaveform from "./src/components/VoiceWaveform";
 import VoiceRing from "./src/components/VoiceRing";
@@ -164,11 +166,21 @@ function AyTalkMainApp() {
   const [voicePace, setVoicePace] = useState<VoicePace>("normal");
   const [text, setText] = useState("");
   const [translation, setTranslation] = useState("Çeviri burada görünecek.");
+  const [cultureNote, setCultureNote] = useState("");
+  const [cultureNoteLoading, setCultureNoteLoading] = useState(false);
+  const [translationFeedback, setTranslationFeedback] = useState<"good" | "bad" | "">("");
+  const [lastTranslationContext, setLastTranslationContext] = useState<{
+    sourceText: string;
+    translatedText: string;
+    from: string;
+    to: string;
+  } | null>(null);
   const [resultLanguage, setResultLanguage] = useState<Language>(LANGUAGES[2]);
   const [assistantMessages, setAssistantMessages] = useState<ChatMessage[]>([]);
   const [translationHistory, setTranslationHistory] = useState<TranslationHistoryItem[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
+  const [emergencyOpen, setEmergencyOpen] = useState(false);
   const [remoteCallOpen, setRemoteCallOpen] = useState(false);
   const [remoteCallRoomCode, setRemoteCallRoomCode] = useState("");
   const [remoteCallDefaultName, setRemoteCallDefaultName] =
@@ -1557,6 +1569,63 @@ function AyTalkMainApp() {
     }
   };
 
+  const rememberTranslationContext = (
+    sourceTextValue: string,
+    translatedTextValue: string,
+    source: Language,
+    target: Language,
+  ) => {
+    setLastTranslationContext({
+      sourceText: sourceTextValue,
+      translatedText: translatedTextValue,
+      from: source.name,
+      to: target.name,
+    });
+    setCultureNote("");
+    setTranslationFeedback("");
+  };
+
+  const requestCultureNote = async () => {
+    if (!lastTranslationContext || cultureNoteLoading) return;
+    try {
+      setCultureNoteLoading(true);
+      const response = await fetch(`${SERVER_URL}/culture-note`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
+        body: JSON.stringify(lastTranslationContext),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data?.error || "Kültürel not alınamadı.");
+      setCultureNote(String(data?.note || "Bu ifade için belirgin bir kültürel uyarı bulunmadı."));
+    } catch (error) {
+      setCultureNote(
+        error instanceof Error ? error.message : "Kültürel not alınamadı.",
+      );
+    } finally {
+      setCultureNoteLoading(false);
+    }
+  };
+
+  const submitTranslationFeedback = async (rating: "good" | "bad") => {
+    if (!lastTranslationContext) return;
+    setTranslationFeedback(rating);
+    const payload = {...lastTranslationContext, rating, createdAt: new Date().toISOString()};
+    try {
+      const existing = await AsyncStorage.getItem("aytalk_translation_feedback");
+      const parsed = existing ? JSON.parse(existing) : [];
+      const next = [payload, ...(Array.isArray(parsed) ? parsed : [])].slice(0, 200);
+      await AsyncStorage.setItem("aytalk_translation_feedback", JSON.stringify(next));
+    } catch {}
+
+    try {
+      await fetch(`${SERVER_URL}/translation-feedback`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
+        body: JSON.stringify(payload),
+      });
+    } catch {}
+  };
+
   const translateText = async (value?: string) => {
     const cleanText = String(value ?? text).trim();
 
@@ -1574,6 +1643,7 @@ function AyTalkMainApp() {
     if (cachedReply) {
       setResultLanguage(targetAtRequest);
       setTranslation(cachedReply);
+      rememberTranslationContext(cleanText, cachedReply, sourceAtRequest, targetAtRequest);
       addTranslationToHistory(
         cleanText,
         cachedReply,
@@ -1638,6 +1708,7 @@ function AyTalkMainApp() {
         setTranslation(reply);
       }
       saveTranslationToCache(cacheKey, reply);
+      rememberTranslationContext(cleanText, reply, sourceAtRequest, targetAtRequest);
       addTranslationToHistory(
         cleanText,
         reply,
@@ -1701,6 +1772,7 @@ function AyTalkMainApp() {
         setTranslation(reply);
         setResultLanguage(targetAtRequest);
         saveTranslationToCache(cacheKey, reply);
+        rememberTranslationContext(cleanText, reply, sourceAtRequest, targetAtRequest);
         addTranslationToHistory(
           cleanText,
           reply,
@@ -2355,6 +2427,11 @@ function AyTalkMainApp() {
   };
 
   const openHomeSection = (section: HomeSection) => {
+    if (section === "emergency") {
+      setEmergencyOpen(true);
+      return;
+    }
+
     if (section === "livebridge") {
       setRemoteCallRoomCode("");
       setRemoteCallDefaultName("AyTalk Kullanıcısı");
@@ -2516,6 +2593,7 @@ function AyTalkMainApp() {
     return (
       <>
         <HomeDashboard onOpen={openHomeSection} />
+        <EmergencyMode visible={emergencyOpen} onClose={() => setEmergencyOpen(false)} />
 
         <RemoteCallScreen
           visible={remoteCallOpen}
@@ -3453,10 +3531,40 @@ function AyTalkMainApp() {
                   {translation || (isLoading ? "▍" : "Çeviri burada görünecek.")}
                 </Text>
               </ScrollView>
+
+              {lastTranslationContext && !isLoading ? (
+                <View style={styles.translationInsightPanel}>
+                  <View style={styles.translationFeedbackRow}>
+                    <Text style={styles.translationFeedbackLabel}>Bu çeviri doğal mı?</Text>
+                    <TouchableOpacity
+                      style={[styles.feedbackButton, translationFeedback === "good" && styles.feedbackButtonActive]}
+                      onPress={() => void submitTranslationFeedback("good")}>
+                      <Text style={styles.feedbackButtonText}>👍 İyi</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[styles.feedbackButton, translationFeedback === "bad" && styles.feedbackButtonActive]}
+                      onPress={() => void submitTranslationFeedback("bad")}>
+                      <Text style={styles.feedbackButtonText}>👎 Düzelt</Text>
+                    </TouchableOpacity>
+                  </View>
+
+                  <TouchableOpacity
+                    style={styles.cultureButton}
+                    onPress={() => void requestCultureNote()}
+                    disabled={cultureNoteLoading}>
+                    <Text style={styles.cultureButtonText}>
+                      {cultureNoteLoading ? "🌍 Kültürel not kontrol ediliyor..." : "🌍 Kültürel kullanım notunu göster"}
+                    </Text>
+                  </TouchableOpacity>
+                  {cultureNote ? <Text style={styles.cultureNoteText}>{cultureNote}</Text> : null}
+                </View>
+              ) : null}
             </Animated.View>
           ) : null}
         </ScrollView>
       </KeyboardAvoidingView>
+
+      <EmergencyMode visible={emergencyOpen} onClose={() => setEmergencyOpen(false)} />
 
       <RemoteCallScreen
         visible={remoteCallOpen}
@@ -5559,6 +5667,52 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "800",
   },
+  translationInsightPanel: {
+    borderTopWidth: 1,
+    borderTopColor: "rgba(96,165,250,0.24)",
+    marginTop: 10,
+    paddingTop: 12,
+  },
+  translationFeedbackRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  translationFeedbackLabel: {
+    color: "#AFC7E6",
+    fontSize: 12,
+    fontWeight: "700",
+    marginRight: 2,
+  },
+  feedbackButton: {
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#28496B",
+    backgroundColor: "#0B1B31",
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  feedbackButtonActive: {
+    borderColor: "#2BC8F4",
+    backgroundColor: "#103A50",
+  },
+  feedbackButtonText: {color: "#D9ECFF", fontSize: 12, fontWeight: "800"},
+  cultureButton: {
+    marginTop: 10,
+    borderRadius: 12,
+    backgroundColor: "#122A46",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  cultureButtonText: {color: "#7DDCFF", fontSize: 12, fontWeight: "900"},
+  cultureNoteText: {
+    color: "#D5E7F7",
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 10,
+    paddingHorizontal: 2,
+  },
   modalHeader: {
     flexDirection: "row",
     alignItems: "center",
@@ -5619,11 +5773,40 @@ const styles = StyleSheet.create({
 
 export default function App() {
   const [introVisible, setIntroVisible] = useState(true);
+  const [onboardingReady, setOnboardingReady] = useState(false);
+  const [onboardingVisible, setOnboardingVisible] = useState(false);
+
+  useEffect(() => {
+    let mounted = true;
+    AsyncStorage.getItem("aytalk_onboarding_v1_done")
+      .then(value => {
+        if (!mounted) return;
+        setOnboardingVisible(value !== "1");
+        setOnboardingReady(true);
+      })
+      .catch(() => {
+        if (!mounted) return;
+        setOnboardingVisible(true);
+        setOnboardingReady(true);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const finishOnboarding = async () => {
+    try {
+      await AsyncStorage.setItem("aytalk_onboarding_v1_done", "1");
+    } catch {}
+    setOnboardingVisible(false);
+  };
 
   return (
     <SafeAreaProvider>
       {introVisible ? (
         <AppIntro onFinish={() => setIntroVisible(false)} />
+      ) : !onboardingReady ? null : onboardingVisible ? (
+        <FirstRunOnboarding onFinish={() => void finishOnboarding()} />
       ) : (
         <AyTalkMainApp />
       )}

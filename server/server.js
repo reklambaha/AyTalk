@@ -68,6 +68,21 @@ async function initDb() {
   await dbPool.query(`
     ALTER TABLE livebridge_calls ADD COLUMN IF NOT EXISTS callee_gender TEXT NOT NULL DEFAULT 'female';
   `);
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS translation_feedback (
+      id TEXT PRIMARY KEY,
+      source_text TEXT NOT NULL,
+      translated_text TEXT NOT NULL,
+      source_language TEXT NOT NULL,
+      target_language TEXT NOT NULL,
+      rating TEXT NOT NULL,
+      created_at BIGINT NOT NULL
+    );
+  `);
+  await dbPool.query(`
+    CREATE INDEX IF NOT EXISTS idx_translation_feedback_languages
+      ON translation_feedback (source_language, target_language, created_at DESC);
+  `);
   console.log("Veritabanı tabloları hazır.");
 }
 
@@ -151,6 +166,7 @@ app.use((req, res, next) => {
 // LiveBridge Contacts Cloud — DATABASE_URL varsa Postgres, yoksa RAM (yedek).
 const liveBridgeUsersMem = new Map();
 const liveBridgeCallsMem = new Map();
+const translationFeedbackMem = [];
 const normalizeLiveBridgePhone = value =>
   String(value || "").replace(/[^0-9]/g, "").slice(0, 18);
 
@@ -859,6 +875,86 @@ app.post("/call/translate", async (req, res) => {
     return res.status(500).json({
       error: error instanceof Error ? error.message : "Görüşme çevirisi başarısız.",
     });
+  }
+});
+
+// KÜLTÜREL KULLANIM NOTU — ana çeviriden ayrı ve isteğe bağlıdır.
+// Böylece normal çeviri hızını ve cevabını bozmaz.
+app.post("/culture-note", async (req, res) => {
+  try {
+    const sourceText = String(req.body?.sourceText || "").trim();
+    const translatedText = String(req.body?.translatedText || "").trim();
+    const from = String(req.body?.from || "").trim();
+    const to = String(req.body?.to || "").trim();
+
+    if (!sourceText || !translatedText || !from || !to) {
+      return res.status(400).json({error: "Kültürel not için çeviri bilgileri eksik."});
+    }
+
+    const response = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      store: false,
+      max_output_tokens: 180,
+      instructions:
+        "You are AyTalk's cultural usage assistant. Assess only practical, real-world communication risk. " +
+        "Do not stereotype countries, religions, ethnicities, genders, or regions. Do not invent rules. " +
+        "If there is no meaningful cultural/register warning, say so briefly. " +
+        "If there is a possible issue, explain it cautiously using words like 'may', 'can', or 'depending on context'. " +
+        "Focus on politeness, formality, forms of address, gestures only if explicitly mentioned, and likely misunderstandings. " +
+        "Reply in Turkish in at most 2 short sentences. Never change the translation itself.",
+      input:
+        `Source language: ${from}\nTarget language: ${to}\n` +
+        `Original: ${sourceText}\nTranslation: ${translatedText}`,
+    });
+
+    const note = String(response.output_text || "").trim();
+    return res.json({note: note || "Bu ifade için belirgin bir kültürel uyarı bulunmadı."});
+  } catch (error) {
+    console.error("Culture note error:", error);
+    return res.status(500).json({error: "Kültürel kullanım notu şu anda alınamadı."});
+  }
+});
+
+// TOPLULUK SÖZLÜĞÜNÜN İLK VERİ KATMANI — iyi/kötü çeviri geri bildirimi.
+// DATABASE_URL varsa kalıcı Postgres'e, yoksa sınırlı RAM yedeğine yazılır.
+app.post("/translation-feedback", async (req, res) => {
+  try {
+    const sourceText = String(req.body?.sourceText || "").trim().slice(0, 12000);
+    const translatedText = String(req.body?.translatedText || "").trim().slice(0, 12000);
+    const from = String(req.body?.from || "").trim().slice(0, 80);
+    const to = String(req.body?.to || "").trim().slice(0, 80);
+    const rating = String(req.body?.rating || "").trim();
+
+    if (!sourceText || !translatedText || !from || !to || !["good", "bad"].includes(rating)) {
+      return res.status(400).json({error: "Geçersiz çeviri geri bildirimi."});
+    }
+
+    const item = {
+      id: `feedback-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+      sourceText,
+      translatedText,
+      from,
+      to,
+      rating,
+      createdAt: Date.now(),
+    };
+
+    if (dbPool) {
+      await dbPool.query(
+        `INSERT INTO translation_feedback
+          (id, source_text, translated_text, source_language, target_language, rating, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [item.id, sourceText, translatedText, from, to, rating, item.createdAt],
+      );
+    } else {
+      translationFeedbackMem.unshift(item);
+      if (translationFeedbackMem.length > 1000) translationFeedbackMem.length = 1000;
+    }
+
+    return res.json({ok: true});
+  } catch (error) {
+    console.error("Translation feedback error:", error);
+    return res.status(500).json({error: "Geri bildirim kaydedilemedi."});
   }
 });
 
