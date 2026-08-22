@@ -134,6 +134,10 @@ function AyTalkMainApp() {
   const [conversationMode, setConversationMode] = useState(true);
   const [followVoiceTone, setFollowVoiceTone] = useState(true);
   const [voiceGender, setVoiceGender] = useState<"male" | "female">("female");
+  const voiceGenderRef = useRef(voiceGender);
+  useEffect(() => {
+    voiceGenderRef.current = voiceGender;
+  }, [voiceGender]);
   const [conferenceParticipants, setConferenceParticipants] = useState<ConferenceParticipant[]>([
     {id: "p1", name: "Kişi 1", language: DEFAULT_SOURCE_LANGUAGE},
     {id: "p2", name: "Kişi 2", language: DEFAULT_TARGET_LANGUAGE},
@@ -345,13 +349,17 @@ function AyTalkMainApp() {
 
       await new Promise<void>(resolve => setTimeout(resolve, 450));
 
-      clearSilenceTimer();
-      finishingRef.current = false;
-      accumulatedTextRef.current = "";
-      latestPartialRef.current = "";
       listeningStartedAtRef.current = Date.now();
       setIsListening(true);
-      AySpeech.startContinuous(nextSpeaker.language.speech);
+
+      const recognizedText = await captureAndTranscribeSpeech(nextSpeaker.language);
+      setIsListening(false);
+      listeningStartedAtRef.current = 0;
+
+      if (recognizedText) {
+        setText(recognizedText);
+        await submitCurrentText(recognizedText);
+      }
     } catch (error) {
       setIsListening(false);
       Alert.alert(
@@ -1396,7 +1404,7 @@ function AyTalkMainApp() {
       language: language.name,
       followVoiceTone,
       voicePace,
-      gender: voiceGender,
+      gender: voiceGenderRef.current,
     });
 
     const filePath = `${RNFS.CachesDirectoryPath}/aytalk-${Date.now()}-${Math.random()
@@ -1918,32 +1926,9 @@ function AyTalkMainApp() {
   };
 
   const finishListeningAndSubmit = async () => {
-    if (finishingRef.current) return;
-    finishingRef.current = true;
-    clearSilenceTimer();
     try {
-      AySpeech?.stopContinuous?.();
+      AySpeech?.cancel?.();
     } catch {}
-    setIsListening(false);
-
-    const finalText = combineSpeech(accumulatedTextRef.current, latestPartialRef.current);
-    if (finalText) {
-      if (followVoiceTone && listeningStartedAtRef.current > 0) {
-        const durationSeconds = Math.max(0.8, (Date.now() - listeningStartedAtRef.current) / 1000);
-        const charactersPerSecond = finalText.length / durationSeconds;
-        const detectedPace: VoicePace =
-          charactersPerSecond >= 15
-            ? "fast"
-            : charactersPerSecond <= 8
-              ? "slow"
-              : "normal";
-        setVoicePace(detectedPace);
-      }
-      listeningStartedAtRef.current = 0;
-      setText(finalText);
-      await submitCurrentText(finalText);
-    }
-    finishingRef.current = false;
   };
 
   const scheduleAutomaticStop = () => {
@@ -2393,6 +2378,27 @@ function AyTalkMainApp() {
     });
   };
 
+  const captureAndTranscribeSpeech = async (language: Language): Promise<string> => {
+    if (!AySpeech) throw new Error("Mikrofon modülü bulunamadı.");
+
+    const result = await AySpeech.capture(12000);
+    const audioBase64 = String(result?.audioBase64 || "");
+    if (!audioBase64) throw new Error("Ses kaydı alınamadı.");
+
+    const languageCode = language.speech.split("-")[0].toLowerCase();
+    const transcribeResponse = await fetchJson<{text?: string; error?: string}>(
+      "/audio/transcribe",
+      {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({audioBase64, language: languageCode}),
+      },
+      30000,
+    );
+
+    return String(transcribeResponse?.text || "").trim();
+  };
+
   const requestMicrophonePermission = async () => {
     if (Platform.OS !== "android") return true;
     const result = await PermissionsAndroid.request(
@@ -2421,20 +2427,41 @@ function AyTalkMainApp() {
     }
 
     try {
-      clearSilenceTimer();
-      finishingRef.current = false;
-      accumulatedTextRef.current = "";
-      latestPartialRef.current = "";
       setText("");
-      listeningStartedAtRef.current = Date.now();
       setIsListening(true);
-      AySpeech.startContinuous(sourceLanguage.speech);
+      listeningStartedAtRef.current = Date.now();
+
+      const recognizedText = await captureAndTranscribeSpeech(sourceLanguage);
+      setIsListening(false);
+
+      if (!recognizedText) {
+        Alert.alert("Konuşma algılanamadı", "Lütfen tekrar dene.");
+        return;
+      }
+
+      if (followVoiceTone && listeningStartedAtRef.current > 0) {
+        const durationSeconds = Math.max(0.8, (Date.now() - listeningStartedAtRef.current) / 1000);
+        const charactersPerSecond = recognizedText.length / durationSeconds;
+        const detectedPace: VoicePace =
+          charactersPerSecond >= 15
+            ? "fast"
+            : charactersPerSecond <= 8
+              ? "slow"
+              : "normal";
+        setVoicePace(detectedPace);
+      }
+      listeningStartedAtRef.current = 0;
+
+      setText(recognizedText);
+      await submitCurrentText(recognizedText);
     } catch (error) {
       setIsListening(false);
-      Alert.alert(
-        "Mikrofon başlatılamadı",
-        error instanceof Error ? error.message : "Bilinmeyen hata.",
-      );
+      const message = error instanceof Error ? error.message : "Bilinmeyen hata.";
+      if (message.includes("algılanmadı")) {
+        Alert.alert("Konuşma algılanamadı", "Lütfen mikrofona daha yakın ve net konuş.");
+      } else {
+        Alert.alert("Mikrofon başlatılamadı", message);
+      }
     }
   };
 

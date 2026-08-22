@@ -1335,8 +1335,11 @@ app.post("/tts", async (req, res) => {
       input: text,
       response_format: "mp3",
       instructions: language
-        ? `Speak naturally and clearly in ${language}. Pronounce ordinary words as words, not as letter-by-letter acronyms, unless clearly intended as an acronym.`
-        : "Speak naturally and clearly. Pronounce ordinary words as words.",
+        ? `You are a native ${language} speaker recording a warm, natural voice message for a friend. ` +
+          `Speak with the authentic accent, rhythm, and intonation a real native speaker of ${language} would use — not a flat or robotic reading. ` +
+          "Use natural pacing with brief, human-like pauses at commas and sentence breaks. Vary pitch naturally as a person would in casual conversation. " +
+          "Pronounce ordinary words as words, not as letter-by-letter acronyms, unless clearly intended as an acronym."
+        : "Speak naturally and clearly, like a real person in casual conversation, with natural rhythm and pauses. Pronounce ordinary words as words.",
     });
 
     const buffer = Buffer.from(await speech.arrayBuffer());

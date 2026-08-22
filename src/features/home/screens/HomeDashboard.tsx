@@ -1,5 +1,6 @@
 import React from "react";
 import {
+  ScrollView,
   StatusBar,
   StyleSheet,
   Text,
@@ -54,6 +55,11 @@ export default function HomeDashboard({
         },
       ]}>
       <StatusBar barStyle="light-content" backgroundColor="#030817" />
+
+      <ScrollView
+        style={{flex: 1}}
+        contentContainerStyle={{flexGrow: 1}}
+        showsVerticalScrollIndicator={false}>
 
       <View style={[styles.quickTop, {height: profileHeight + 4}]}>
         <View style={styles.liveBrandMini}>
@@ -205,6 +211,7 @@ export default function HomeDashboard({
           {!tiny ? <Text style={styles.bottomText}>Profil</Text> : null}
         </TouchableOpacity>
       </View>
+      </ScrollView>
     </SafeAreaView>
   );
 }
@@ -380,15 +387,15 @@ const styles = StyleSheet.create({
     marginTop: -3,
   },
   grid: {
-    flex: 1,
     flexDirection: "row",
     flexWrap: "wrap",
+    justifyContent: "space-between",
     marginTop: 6,
-    alignContent: "stretch",
   },
   featureCard: {
     width: "49%",
-    height: "49%",
+    aspectRatio: 1.05,
+    marginBottom: 10,
     borderRadius: 17,
     padding: 8,
     backgroundColor: "#0B1730",

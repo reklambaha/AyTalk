@@ -1833,6 +1833,20 @@ function RoomView({
             />
             <Text style={styles.railControlLabel}>Hoparlör</Text>
           </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.railControlButton}
+            onPress={() => setAttachmentMenuVisible(true)}>
+            <CallControlIcon name="more" size={25} />
+            <Text style={styles.railControlLabel}>Dosya</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.railControlButton}
+            onPress={() => void exportConversationPdf()}>
+            <CallControlIcon name="message" size={25} />
+            <Text style={styles.railControlLabel}>PDF</Text>
+          </TouchableOpacity>
         </View>
         ) : null}
 
