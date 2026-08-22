@@ -1,41 +1,61 @@
-import {SERVER_URL, APP_SHARED_KEY} from "./api";
+import {
+  SERVER_URL,
+  assertApiConfiguration,
+  getApiJsonHeaders,
+} from "./api";
 
 export type LiveKitCredentials = {
   serverUrl: string;
   participantToken: string;
 };
 
-export async function getLiveKitCredentials(params: {
+type LiveKitCredentialRequest = {
   roomName: string;
   participantIdentity: string;
   participantName: string;
-}): Promise<LiveKitCredentials> {
-  const response = await fetch(`${SERVER_URL}/livekit/token`, {
-    method: "POST",
-    headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
-    body: JSON.stringify({
-      roomName: params.roomName,
-      participantIdentity: params.participantIdentity,
-      participantName: params.participantName,
-    }),
-  });
+};
 
-  const data = (await response.json()) as {
-    serverUrl?: string;
-    participantToken?: string;
-    error?: string;
-  };
+export async function getLiveKitCredentials(
+  input: LiveKitCredentialRequest,
+): Promise<LiveKitCredentials> {
+  assertApiConfiguration();
 
-  if (!response.ok) {
-    throw new Error(data.error || `Token sunucusu hatası (${response.status}).`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20000);
+
+  try {
+    const response = await fetch(`${SERVER_URL}/livekit/token`, {
+      method: "POST",
+      headers: getApiJsonHeaders(),
+      body: JSON.stringify(input),
+      signal: controller.signal,
+    });
+
+    let data: any = {};
+    try {
+      data = await response.json();
+    } catch {}
+
+    if (!response.ok) {
+      throw new Error(
+        String(data?.error || `LiveKit token alınamadı (${response.status}).`),
+      );
+    }
+
+    const serverUrl = String(data?.serverUrl || "").trim();
+    const participantToken = String(data?.participantToken || "").trim();
+
+    if (!serverUrl || !participantToken) {
+      throw new Error("LiveKit sunucusu eksik bağlantı bilgisi döndürdü.");
+    }
+
+    return {serverUrl, participantToken};
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error("LiveKit token isteği zaman aşımına uğradı.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  if (!data.serverUrl || !data.participantToken) {
-    throw new Error("LiveKit bağlantı bilgileri eksik.");
-  }
-
-  return {
-    serverUrl: data.serverUrl,
-    participantToken: data.participantToken,
-  };
 }

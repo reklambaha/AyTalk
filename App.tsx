@@ -43,7 +43,7 @@ const SILENCE_DELAY_MS = 850;
 const Tts: any = TtsImport as any;
 const {AySpeech} = NativeModules;
 
-import {SERVER_URL, APP_SHARED_KEY} from "./src/services/api";
+import {SERVER_URL, APP_SHARED_KEY, getApiJsonHeaders} from "./src/services/api";
 import {requestTtsAudioBase64} from "./src/services/tts";
 import {
   DEFAULT_SOURCE_LANGUAGE,
@@ -841,7 +841,7 @@ function AyTalkMainApp() {
     try {
       const response = await fetch(`${SERVER_URL}/vision-ocr`, {
         method: "POST",
-        headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
+        headers: getApiJsonHeaders(),
         body: JSON.stringify({
           imageBase64,
           mimeType,
@@ -1591,7 +1591,7 @@ function AyTalkMainApp() {
       setCultureNoteLoading(true);
       const response = await fetch(`${SERVER_URL}/culture-note`, {
         method: "POST",
-        headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
+        headers: getApiJsonHeaders(),
         body: JSON.stringify(lastTranslationContext),
       });
       const data = await response.json();
@@ -1620,7 +1620,7 @@ function AyTalkMainApp() {
     try {
       await fetch(`${SERVER_URL}/translation-feedback`, {
         method: "POST",
-        headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
+        headers: getApiJsonHeaders(),
         body: JSON.stringify(payload),
       });
     } catch {}
@@ -1747,7 +1747,7 @@ function AyTalkMainApp() {
 
         const response = await fetch(`${SERVER_URL}/chat`, {
           method: "POST",
-          headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
+          headers: getApiJsonHeaders(),
           body: JSON.stringify({
             message: cleanText,
             from: sourceAtRequest.name,
@@ -1910,7 +1910,7 @@ function AyTalkMainApp() {
 
         const response = await fetch(`${SERVER_URL}/assistant`, {
           method: "POST",
-          headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
+          headers: getApiJsonHeaders(),
           body: JSON.stringify({
             message: cleanText,
             language: languageAtRequest.name,
@@ -2471,10 +2471,7 @@ function AyTalkMainApp() {
     try {
       const response = await fetch(`${SERVER_URL}/audio/transcribe`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-app-key": APP_SHARED_KEY,
-        },
+        headers: getApiJsonHeaders(),
         body: JSON.stringify({audioBase64, language: languageCode}),
         signal: controller.signal,
       });

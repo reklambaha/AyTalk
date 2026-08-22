@@ -60,12 +60,27 @@ jobs:
       - name: Make Gradle wrapper executable
         run: chmod +x android/gradlew
 
+      - name: Verify AyTalk app secret
+        shell: bash
+        env:
+          APP_SHARED_KEY: ${{ secrets.APP_SHARED_KEY }}
+        run: |
+          if [ -z "$APP_SHARED_KEY" ]; then
+            echo "ERROR: GitHub Actions secret APP_SHARED_KEY is missing."
+            exit 1
+          fi
+          echo "APP_SHARED_KEY is configured for this build."
+
       - name: Clean old Android outputs
         working-directory: android
+        env:
+          APP_SHARED_KEY: ${{ secrets.APP_SHARED_KEY }}
         run: ./gradlew clean --no-daemon
 
       - name: Build Android release APK
         working-directory: android
+        env:
+          APP_SHARED_KEY: ${{ secrets.APP_SHARED_KEY }}
         run: ./gradlew assembleRelease --no-daemon --stacktrace
 
       - name: Verify APK contains current JS bundle

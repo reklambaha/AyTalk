@@ -113,7 +113,7 @@ async function initDb() {
 // NOT: Mobil uygulamaya gömülen her sabit çıkarılabilir; bu tam bir
 // kullanıcı kimlik doğrulaması değil, sadece rastgele bot/scraper
 // trafiğini engelleyen bir ilk savunma katmanıdır.
-const APP_SHARED_KEY = process.env.APP_SHARED_KEY || "";
+const APP_SHARED_KEY = String(process.env.APP_SHARED_KEY || "").trim();
 if (!APP_SHARED_KEY) {
   console.warn(
     "UYARI: APP_SHARED_KEY tanımlı değil. Uç noktalar korumasız çalışıyor.",
@@ -129,7 +129,7 @@ function safeSecretEqual(provided, expected) {
 
 function requireAppKey(req, res, next) {
   if (!APP_SHARED_KEY) return next(); // Geçiş dönemi: Render anahtarı eklenene kadar uygulamayı kırma.
-  const provided = req.get("x-app-key");
+  const provided = String(req.get("x-app-key") || "").trim();
   if (!safeSecretEqual(provided, APP_SHARED_KEY)) {
     return res.status(401).json({error: "Yetkisiz istek."});
   }
@@ -910,7 +910,7 @@ app.post("/livekit/token", async (req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ok: true, service: "LiveBridge", version: "11.0-realtime-bridge"});
+  res.json({ok: true, service: "LiveBridge", version: "11.1-auth-fix", authConfigured: Boolean(APP_SHARED_KEY)});
 });
 
 app.get("/livebridge/voice/capabilities", (_req, res) => {

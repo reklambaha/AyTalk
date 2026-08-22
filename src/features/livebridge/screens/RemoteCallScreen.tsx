@@ -59,7 +59,7 @@ import {
   getLiveKitCredentials,
   LiveKitCredentials,
 } from "../../../services/livekitApi";
-import {SERVER_URL, APP_SHARED_KEY} from "../../../services/api";
+import {SERVER_URL, getApiAuthHeaders, getApiJsonHeaders} from "../../../services/api";
 import CallControlIcon from "../components/CallControlIcon";
 import {prepareSpeech} from "../../language-engine";
 
@@ -629,7 +629,7 @@ function RoomView({
   ) => {
     const response = await fetch(`${SERVER_URL}/tts`, {
       method: "POST",
-      headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
+      headers: getApiJsonHeaders(),
       body: JSON.stringify({text, language: languageName, gender}),
     });
     const data = await response.json();
@@ -896,7 +896,7 @@ function RoomView({
 
       const response = await fetch(`${SERVER_URL}/call/translate`, {
         method: "POST",
-        headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
+        headers: getApiJsonHeaders(),
         body: JSON.stringify({
           message: cleanText,
           from: sourceLanguage.name,
@@ -1024,7 +1024,7 @@ function RoomView({
         `${SERVER_URL}/audio/transcribe`,
         {
           method: "POST",
-          headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
+          headers: getApiJsonHeaders(),
           body: JSON.stringify({
             audioBase64,
             language: sourceLanguage.locale
@@ -2442,7 +2442,7 @@ export default function RemoteCallScreen({
     try {
       const response = await fetch(`${SERVER_URL}/livebridge/profile/register`, {
         method: "POST",
-        headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
+        headers: getApiJsonHeaders(),
         body: JSON.stringify({
           phone: cleanPhone,
           phoneKeys: liveBridgePhoneKeys(cleanPhone),
@@ -2498,7 +2498,7 @@ export default function RemoteCallScreen({
       ).values());
       const response = await fetch(`${SERVER_URL}/livebridge/contacts/match`, {
         method: "POST",
-        headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
+        headers: getApiJsonHeaders(),
         body: JSON.stringify({ownerPhone: directoryPhone, contacts: deduped.slice(0, 3000)}),
       });
       const data = await response.json();
@@ -2555,7 +2555,7 @@ export default function RemoteCallScreen({
       try {
         await fetch(`${SERVER_URL}/livebridge/presence`, {
           method: "POST",
-          headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
+          headers: getApiJsonHeaders(),
           body: JSON.stringify({
             phone: directoryPhone,
             phoneKeys: liveBridgePhoneKeys(directoryPhone),
@@ -2577,7 +2577,7 @@ export default function RemoteCallScreen({
     let cancelled = false;
     const poll = async () => {
       try {
-        const response = await fetch(`${SERVER_URL}/livebridge/call/incoming?phone=${encodeURIComponent(directoryPhone)}`, {headers: {"x-app-key": APP_SHARED_KEY}});
+        const response = await fetch(`${SERVER_URL}/livebridge/call/incoming?phone=${encodeURIComponent(directoryPhone)}`, {headers: getApiAuthHeaders()});
         const data = await response.json();
         if (!cancelled && response.ok) setIncomingCall(data?.call || null);
       } catch {}
@@ -2801,7 +2801,7 @@ export default function RemoteCallScreen({
     try {
       const response = await fetch(`${SERVER_URL}/livebridge/call/start`, {
         method: "POST",
-        headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
+        headers: getApiJsonHeaders(),
         body: JSON.stringify({
           callerPhone: directoryPhone,
           callerName: name.trim() || "LiveBridge Kullanıcısı",
@@ -2832,7 +2832,7 @@ export default function RemoteCallScreen({
     try {
       const response = await fetch(`${SERVER_URL}/livebridge/call/respond`, {
         method: "POST",
-        headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
+        headers: getApiJsonHeaders(),
         body: JSON.stringify({callId: current.id, calleePhone: directoryPhone, accepted}),
       });
       const data = await response.json();
@@ -2849,7 +2849,7 @@ export default function RemoteCallScreen({
     let cancelled = false;
     const poll = async () => {
       try {
-        const response = await fetch(`${SERVER_URL}/livebridge/call/status/${encodeURIComponent(outgoingCall.id)}`, {headers: {"x-app-key": APP_SHARED_KEY}});
+        const response = await fetch(`${SERVER_URL}/livebridge/call/status/${encodeURIComponent(outgoingCall.id)}`, {headers: getApiAuthHeaders()});
         const data = await response.json();
         if (!response.ok || cancelled) return;
         const status = data?.call?.status;
