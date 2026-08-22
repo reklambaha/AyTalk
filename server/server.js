@@ -4,6 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
+const crypto = require("crypto");
 const {Pool} = require("pg");
 const OpenAI = require("openai");
 const {toFile} = require("openai");
@@ -11,6 +12,10 @@ const {AccessToken, AgentDispatchClient} = require("livekit-server-sdk");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Render/Cloudflare gibi ters proxy arkasında gerçek istemci IP adresinin
+// rate-limit tarafından doğru görülmesini sağlar.
+app.set("trust proxy", 1);
 
 // Kalıcı veritabanı (Postgres, örn. Supabase/Neon ücretsiz katman).
 // DATABASE_URL tanımlı değilse sunucu yine çalışır ama LiveBridge verisi
@@ -97,10 +102,17 @@ if (!APP_SHARED_KEY) {
   );
 }
 
+function safeSecretEqual(provided, expected) {
+  const a = Buffer.from(String(provided || ""), "utf8");
+  const b = Buffer.from(String(expected || ""), "utf8");
+  if (a.length !== b.length || a.length === 0) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
 function requireAppKey(req, res, next) {
-  if (!APP_SHARED_KEY) return next(); // env tanımlı değilse geliştirme modunda izin ver
+  if (!APP_SHARED_KEY) return next(); // Geçiş dönemi: Render anahtarı eklenene kadar uygulamayı kırma.
   const provided = req.get("x-app-key");
-  if (provided !== APP_SHARED_KEY) {
+  if (!safeSecretEqual(provided, APP_SHARED_KEY)) {
     return res.status(401).json({error: "Yetkisiz istek."});
   }
   next();
@@ -127,10 +139,28 @@ const corsOptions = {
 
 const generalLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 60, // dakikada IP başına 60 istek
+  max: 120,
   standardHeaders: true,
   legacyHeaders: false,
   message: {error: "Çok fazla istek gönderildi. Lütfen biraz bekleyin."},
+});
+
+// Maliyetli ve hassas uçları ayrıca sınırla. Gerçek zamanlı görüşmeyi
+// boğmayacak kadar geniş, bot/anahtar kötüye kullanımını azaltacak kadar sıkı.
+const aiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 75,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {error: "Çeviri isteği limiti aşıldı. Kısa süre sonra tekrar deneyin."},
+});
+
+const livekitTokenLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {error: "Çok fazla görüşme oturumu isteği gönderildi."},
 });
 
 // Uzun süre beklemeyi ve gereksiz tekrarları azaltır.
@@ -152,10 +182,33 @@ const translatorDispatchClient =
     : null;
 
 app.disable("x-powered-by");
-app.use(helmet());
+app.use(helmet({
+  crossOriginResourcePolicy: {policy: "cross-origin"},
+}));
 app.use(cors(corsOptions));
-app.use(express.json({limit: "12mb"}));
+app.use(express.json({limit: "12mb", strict: true}));
+app.use((req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("X-Request-ID", crypto.randomUUID());
+  next();
+});
 app.use(generalLimiter);
+
+app.use("/livekit/token", livekitTokenLimiter);
+for (const path of [
+  "/chat",
+  "/chat-stream",
+  "/call/translate",
+  "/audio/transcribe",
+  "/tts",
+  "/vision-ocr",
+  "/assistant",
+  "/assistant-stream",
+  "/culture-note",
+]) {
+  app.use(path, aiLimiter);
+}
 
 // Sağlık kontrolü hariç tüm uçlar paylaşımlı anahtar ister.
 app.use((req, res, next) => {
@@ -753,7 +806,7 @@ app.post("/livekit/token", async (req, res) => {
     const accessToken = new AccessToken(apiKey, apiSecret, {
       identity: participantIdentity,
       name: participantName,
-      ttl: "2h",
+      ttl: "1h",
     });
 
     accessToken.addGrant({
@@ -802,6 +855,27 @@ app.get("/livebridge/voice/capabilities", (_req, res) => {
   });
 });
 
+function buildTranslationInstructions(from, to, {live = false} = {}) {
+  const livePrefix = live
+    ? "You are LiveBridge, a professional real-time human interpreter. Translate ONLY the CURRENT utterance. "
+    : "You are AyTalk, a high-fidelity real-world translator. ";
+
+  return (
+    livePrefix +
+    `Translate from ${from} to ${to}. ` +
+    "Return only the translation; never answer the speaker, explain, summarize, censor, moralize, or add information. " +
+    "Preserve meaning, ambiguity, uncertainty, negation, names, numbers, dates, units, punctuation, questions, repetitions, hesitations, fillers, profanity and emotional intensity. " +
+    "Do not silently correct factual mistakes made by the speaker. " +
+    "Resolve pronouns and omitted subjects from context only when the context clearly supports it; otherwise preserve the ambiguity. " +
+    "Translate idioms, kinship terms, honorifics and forms of address by their social function, not literal spelling. " +
+    "Never reinterpret an ordinary spoken word as an acronym just because its Latin spelling resembles one. Preserve genuine acronyms, brands and proper names. " +
+    "CRITICAL REGISTER MATCHING: informal, rural, regional, dialectal, slang, broken, non-standard or low-literacy speech must remain equally natural and informal in the target language. " +
+    "Never upgrade everyday speech into formal, literary, bureaucratic or textbook language. Never make the speaker sound more educated, more polite or more precise than they were. " +
+    "For medical, legal and technical vocabulary, use the established target-language term while preserving the speaker's original level of certainty and detail. " +
+    "If the input is incomplete, translate it as incomplete; do not invent the ending."
+  );
+}
+
 // GÖRÜŞME İÇİN BAĞLAMLI VE SIKI ÇEVİRİ
 app.post("/call/translate", async (req, res) => {
   const startedAt = Date.now();
@@ -840,25 +914,7 @@ app.post("/call/translate", async (req, res) => {
       model: "gpt-4.1-mini",
       store: false,
       max_output_tokens: Math.min(1200, Math.max(80, Math.ceil(message.length * 1.6))),
-      instructions:
-        "You are LiveBridge, a professional real-time human interpreter. " +
-        `Translate ONLY the CURRENT utterance from ${from} to ${to}. ` +
-        "The dialogue history may contain both speakers. Use it only to resolve pronouns, references, names, terminology, register and implied subjects. " +
-        "Do not translate previous turns again. Do not answer either speaker. " +
-        "Never add facts, explanations, summaries, politeness, completions, diagnoses, advice or guesses. " +
-        "Preserve names, numbers, units, dates, negation, uncertainty, question form and professional terminology exactly in meaning. " +
-        "For medical, legal or technical terms, prefer the standard target-language term and do not simplify unless the speaker simplified it. " +
-        "If CURRENT_UTTERANCE is incomplete, translate it as an incomplete fragment rather than inventing the ending. " +
-        "Keep the speaker's tone and level of formality. " +
-        "Translate culturally meaningful kinship terms, honorifics, forms of address, idioms and discourse markers by their FUNCTION and meaning in the current context, not by superficial spelling. " +
-        "A normal spoken word that happens to look like a Latin-letter abbreviation must remain a word; do not reinterpret it as an acronym unless context clearly shows an acronym, company name or initialism. " +
-        "When an address term has a natural target-language equivalent, use that equivalent while preserving relationship, respect and register. " +
-        "Do not transliterate ordinary vocabulary when an established target-language translation exists. Preserve proper names and genuine acronyms. " +
-        "CRITICAL — register matching: the speaker may use informal, rural, regional, dialectal, or uneducated everyday speech, " +
-        "non-standard grammar, slang, or spoken-language shortcuts. Render this in equally informal, everyday spoken language " +
-        "in the target language — the kind an ordinary villager or non-literate speaker would actually use in daily life. " +
-        "NEVER upgrade informal speech into formal, literary, official, or textbook-correct language. Match the register down, not up. " +
-        "Return ONLY the translation of CURRENT_UTTERANCE.",
+      instructions: buildTranslationInstructions(from, to, {live: true}),
       input:
         `PREVIOUS_CONTEXT:\n${contextText}\n\n` +
         `CURRENT_UTTERANCE:\n${message}`,
@@ -989,20 +1045,8 @@ app.post("/chat", async (req, res) => {
         Math.max(120, Math.ceil(message.length * 1.35))
       ),
 
-      // Kısa ve doğrudan talimat daha hızlıdır.
-      instructions:
-        `Translate from ${from} to ${to}. ` +
-        "Return only the translation. Preserve meaning exactly. Never answer the speaker and never add information. " +
-        "Translate kinship terms, honorifics, forms of address, idioms and discourse markers by their function in context. " +
-        "A normal word must never be reinterpreted as an acronym only because its Latin spelling resembles one. " +
-        "Preserve genuine acronyms, brands, proper names, numbers, punctuation, paragraphs, tone and question form. " +
-        "Use the natural target-language equivalent for ordinary vocabulary and address terms. " +
-        "CRITICAL — register matching: the speaker may use informal, rural, regional, dialectal, or uneducated everyday speech, " +
-        "non-standard grammar, slang, or spoken-language shortcuts. Render this in equally informal, everyday spoken language " +
-        "in the target language — the kind an ordinary villager or non-literate speaker would actually use in daily life. " +
-        "NEVER upgrade informal speech into formal, literary, official, or textbook-correct language. Match the register down, " +
-        "not up. If the input is broken or ungrammatical because that is how the speaker naturally talks, the translation should " +
-        "sound just as plain and natural — not more polished than the original.",
+      // Tek merkezden yönetilen kalite talimatı; chat ve görüşme aynı anlam koruma kurallarını kullanır.
+      instructions: buildTranslationInstructions(from, to),
 
       input: message,
     });
@@ -1073,18 +1117,7 @@ app.post("/chat-stream", async (req, res) => {
         3000,
         Math.max(120, Math.ceil(message.length * 1.35))
       ),
-      instructions:
-        `Translate from ${from} to ${to}. ` +
-        "Return only the translation. Preserve meaning exactly. Never answer the speaker and never add information. " +
-        "Translate kinship terms, honorifics, forms of address, idioms and discourse markers by their function in context. " +
-        "A normal word must never be reinterpreted as an acronym only because its Latin spelling resembles one. " +
-        "Preserve genuine acronyms, brands, proper names, numbers, punctuation, paragraphs, tone and question form. " +
-        "Use the natural target-language equivalent for ordinary vocabulary and address terms. " +
-        "CRITICAL — register matching: the speaker may use informal, rural, regional, dialectal, or uneducated everyday speech, " +
-        "non-standard grammar, slang, or spoken-language shortcuts. Render this in equally informal, everyday spoken language " +
-        "in the target language — the kind an ordinary villager or non-literate speaker would actually use in daily life. " +
-        "NEVER upgrade informal speech into formal, literary, official, or textbook-correct language. Match the register down, " +
-        "not up.",
+      instructions: buildTranslationInstructions(from, to),
       input: message,
     });
 

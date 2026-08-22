@@ -660,6 +660,8 @@ function RoomView({
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
+          channelCount: 1,
+          sampleRate: 48000,
         });
         if (callMode === "video") {
           await localParticipant.setCameraEnabled(true);
@@ -754,6 +756,8 @@ function RoomView({
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
+          channelCount: 1,
+          sampleRate: 48000,
         });
         setMicrophoneEnabled(true);
       }
@@ -893,9 +897,12 @@ function RoomView({
       const microphoneTrack = microphonePublication?.track;
 
       if (microphoneTrack && microphoneWasEnabledRef.current) {
+        // Çeviri kaydı sırasında LiveKit odasını kapatma.
+        // Track'i odadan geçici çıkar ama nesneyi destroy etme;
+        // çeviri bittiğinde mikrofon güvenli biçimde yeniden yayınlanabilir.
         await localParticipant.unpublishTrack(
           microphoneTrack,
-          true,
+          false,
         );
         setMicrophoneEnabled(false);
       }
@@ -992,6 +999,8 @@ function RoomView({
               echoCancellation: true,
               noiseSuppression: true,
               autoGainControl: true,
+              channelCount: 1,
+              sampleRate: 48000,
             }
           : undefined,
       );
@@ -2790,9 +2799,12 @@ export default function RemoteCallScreen({
               echoCancellation: true,
               noiseSuppression: true,
               autoGainControl: true,
+              channelCount: 1,
+              sampleRate: 48000,
             },
             publishDefaults: {
-              audioPreset: AudioPresets.musicHighQuality,
+              // Konuşma için müzik preset'i yerine speech preset'i kullan.
+              audioPreset: AudioPresets.speech,
               dtx: true,
               red: true,
               forceStereo: false,
@@ -2808,11 +2820,10 @@ export default function RemoteCallScreen({
               roomError instanceof Error
                 ? roomError.message
                 : "LiveKit bağlantı hatası.";
+            // Geçici mikrofon/medya hatasında görüşme ekranını zorla kapatma.
+            // Gerçek bağlantı kopması onDisconnected tarafından yönetilir.
             setError(message);
-            setConnectionStatus("idle");
-            setCredentials(null);
-            void AudioSession.stopAudioSession();
-            Alert.alert("Görüşme bağlantı hatası", message);
+            Alert.alert("Görüşme bağlantı uyarısı", message);
           }}
           onMediaDeviceFailure={failure => {
             const message = `Medya aygıtı hatası: ${String(
