@@ -67,3 +67,5 @@ yarn-error.log*
 # iOS
 # =========================
 /ios
+# Local archive files
+*.7z

@@ -19,6 +19,48 @@ def enableProguardInReleaseBuilds = false
 
 def jscFlavor = 'io.github.react-native-community:jsc-android:2026004.+'
 
+
+def readAyTalkEnvValue = { String key ->
+    def fromEnvironment = System.getenv(key)
+    if (fromEnvironment != null && !fromEnvironment.trim().isEmpty()) {
+        return fromEnvironment.trim()
+    }
+
+    // android/ klasorunun bir ustundeki, GitHub'a girmeyen proje .env dosyasi.
+    def envFile = rootProject.file("../.env")
+    if (!envFile.exists()) {
+        return ""
+    }
+
+    def prefix = key + "="
+    def line = envFile.readLines("UTF-8").find { raw ->
+        def clean = raw.trim()
+        !clean.startsWith("#") && clean.startsWith(prefix)
+    }
+
+    if (line == null) {
+        return ""
+    }
+
+    def value = line.trim().substring(prefix.length()).trim()
+    if ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.substring(1, value.length() - 1)
+    }
+    return value
+}
+
+def escapeBuildConfigString = { String value ->
+    return value
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+}
+
+def ayTalkAppSharedKey = readAyTalkEnvValue("APP_SHARED_KEY")
+if (ayTalkAppSharedKey.isEmpty()) {
+    logger.warn("AyTalk: APP_SHARED_KEY bulunamadi. Render'da APP_SHARED_KEY aktifse API istekleri 401 alir.")
+}
+
 android {
     ndkVersion rootProject.ext.ndkVersion
     buildToolsVersion rootProject.ext.buildToolsVersion
@@ -32,6 +74,7 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 2
         versionName "1.1-ci"
+        buildConfigField "String", "APP_SHARED_KEY", "\"${escapeBuildConfigString(ayTalkAppSharedKey)}\""
     }
 
     signingConfigs {

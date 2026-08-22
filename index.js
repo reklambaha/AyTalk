@@ -46,7 +46,7 @@ const setupIncomingCallPush = async () => {
         await notifee.displayNotification({
           id: String(data.callId || "livebridge-call"),
           title: `${data.callerName || "AyTalk kullanıcısı"} arıyor`,
-          body: data.video === "true" ? "LiveBridge görüntülü arama" : "LiveBridge sesli arama",
+          body: data.mode === "video" ? "LiveBridge görüntülü arama" : data.mode === "chat" ? "LiveBridge mesaj araması" : "LiveBridge sesli arama",
           data,
           android: {
             channelId,

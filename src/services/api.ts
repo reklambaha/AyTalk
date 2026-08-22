@@ -1,37 +1,16 @@
+import {NativeModules} from "react-native";
+
+// AyTalk production backend. API secrets stay on Render; the mobile app only
+// receives the app-level request key at Android build time.
 export const SERVER_URL = "https://aytalk.onrender.com";
 
-// NOT: Bu anahtar uygulama paketinin içine gömülür, isteyen biri APK'yı
-// açıp çıkarabilir. Bu yüzden gerçek kullanıcı kimlik doğrulaması yerine
-// geçmez — amacı sadece rastgele bot/scraper trafiğini süzmektir.
-// Render'daki APP_SHARED_KEY environment variable'ı ile AYNI değer olmalı.
-export const APP_SHARED_KEY = "BURAYA_RENDER_DAKI_ILE_AYNI_DEGERI_YAZ";
+const nativeAppSharedKey = NativeModules?.AySpeech?.appSharedKey;
 
-export async function fetchJson<T>(
-  path: string,
-  options: RequestInit,
-  timeoutMs: number,
-): Promise<T> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+export const APP_SHARED_KEY =
+  typeof nativeAppSharedKey === "string" ? nativeAppSharedKey.trim() : "";
 
-  try {
-    const response = await fetch(`${SERVER_URL}${path}`, {
-      ...options,
-      headers: {
-        ...(options.headers || {}),
-        "x-app-key": APP_SHARED_KEY,
-      },
-      signal: controller.signal,
-    });
-
-    const data = (await response.json()) as T & {error?: string};
-
-    if (!response.ok) {
-      throw new Error(data?.error || `Sunucu hatası (${response.status}).`);
-    }
-
-    return data;
-  } finally {
-    clearTimeout(timeout);
-  }
+if (__DEV__ && !APP_SHARED_KEY) {
+  console.warn(
+    "AyTalk: APP_SHARED_KEY APK'ya eklenmedi. Proje kokundeki .env dosyasina APP_SHARED_KEY ekleyip APK'yi yeniden derle.",
+  );
 }

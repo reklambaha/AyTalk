@@ -401,7 +401,9 @@ function RoomView({
 }) {
   useKeepAwake();
 
-  const tracks = useTracks([Track.Source.Camera]);
+  const tracks = useTracks([
+    {source: Track.Source.Camera, withPlaceholder: true},
+  ]);
   const {localParticipant} = useLocalParticipant();
   const room = useRoomContext();
   const {height, width} = useWindowDimensions();
@@ -817,6 +819,22 @@ function RoomView({
     };
   }, [room, voiceTranslationEnabled, targetLanguage.locale]);
 
+  useEffect(() => {
+    const handleRemoteAudioTrack = () => {
+      if (AyAudioRoute && speakerEnabled) {
+        void AyAudioRoute.setSpeakerEnabled(true).catch(() => undefined);
+      }
+    };
+
+    room.on(RoomEvent.TrackSubscribed, handleRemoteAudioTrack);
+    room.on(RoomEvent.ParticipantConnected, handleRemoteAudioTrack);
+
+    return () => {
+      room.off(RoomEvent.TrackSubscribed, handleRemoteAudioTrack);
+      room.off(RoomEvent.ParticipantConnected, handleRemoteAudioTrack);
+    };
+  }, [room, speakerEnabled]);
+
   const restoreCallMicrophone = async () => {
     try {
       if (microphoneWasEnabledRef.current) {
@@ -974,7 +992,7 @@ function RoomView({
         // çeviri bittiğinde mikrofon güvenli biçimde yeniden yayınlanabilir.
         await localParticipant.unpublishTrack(
           microphoneTrack,
-          false,
+          true,
         );
         setMicrophoneEnabled(false);
       }
@@ -2444,7 +2462,7 @@ export default function RemoteCallScreen({
       Alert.alert("LiveBridge kayıt hatası", error instanceof Error ? error.message : "Profil kaydedilemedi. İnternet bağlantısını kontrol edip tekrar dene.");
       return false;
     }
-  }, [directoryPhone, name, sourceCallLanguage.name]);
+  }, [directoryPhone, name, sourceCallLanguage.name, voiceGender]);
 
   const syncLiveBridgeContacts = useCallback(async () => {
     if (!directoryProfileReady || !directoryPhone) return;
@@ -2543,6 +2561,8 @@ export default function RemoteCallScreen({
             phoneKeys: liveBridgePhoneKeys(directoryPhone),
             name: name.trim() || "LiveBridge Kullanıcısı",
             language: sourceCallLanguage.name,
+            gender: voiceGender,
+            fcmToken: await getSafeFcmToken(),
           }),
         });
       } catch {}
@@ -2889,7 +2909,7 @@ export default function RemoteCallScreen({
               dtx: true,
               red: true,
               forceStereo: false,
-              stopMicTrackOnMute: false,
+              stopMicTrackOnMute: true,
             },
           }}
           onConnected={() => {

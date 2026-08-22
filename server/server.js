@@ -482,23 +482,61 @@ app.post("/livebridge/contacts/match", async (req, res) => {
     const contacts = Array.isArray(req.body?.contacts) ? req.body.contacts.slice(0, 3000) : [];
     const users = [];
     const seen = new Set();
-    for (const c of contacts) {
-      const phone = normalizeLiveBridgePhone(c?.phone);
-      if (!phone || phone === ownerPhone || seen.has(phone)) continue;
-      const requestedKeys = liveBridgePhoneKeys(phone, c?.keys);
-      const r = await liveBridgeStore.findUserByPhoneKeys(requestedKeys);
-      if (!r) continue;
-      const matchedIdentity = normalizeLiveBridgePhone(r.phone);
-      if (seen.has(matchedIdentity)) continue;
-      seen.add(matchedIdentity);
-      users.push({
-        phone: r.phone,
-        name: String(c?.name || r.name || "LiveBridge Kullanıcısı").slice(0, 100),
-        language: r.language || "",
-        gender: r.gender === "male" ? "male" : "female",
-        online: liveBridgeUserOnline(r),
-        lastSeen: r.lastSeen || 0,
-      });
+    const normalizedContacts = contacts
+      .map(c => ({
+        phone: normalizeLiveBridgePhone(c?.phone),
+        keys: liveBridgePhoneKeys(c?.phone, c?.keys),
+        name: String(c?.name || "").trim(),
+      }))
+      .filter(c => c.phone.length >= 7 && c.phone !== ownerPhone);
+
+    if (dbPool && normalizedContacts.length > 0) {
+      const allKeys = Array.from(
+        new Set(normalizedContacts.flatMap(c => c.keys)),
+      );
+      const {rows} = await dbPool.query(
+        "SELECT * FROM livebridge_users WHERE phone_keys && $1::text[]",
+        [allKeys],
+      );
+      const matchedUsers = rows.map(rowToUser);
+      const keyToUser = new Map();
+      for (const user of matchedUsers) {
+        for (const key of liveBridgePhoneKeys(user.phone, user.phoneKeys)) {
+          if (!keyToUser.has(key)) keyToUser.set(key, user);
+        }
+      }
+
+      for (const c of normalizedContacts) {
+        const r = c.keys.map(key => keyToUser.get(key)).find(Boolean);
+        if (!r) continue;
+        const matchedIdentity = normalizeLiveBridgePhone(r.phone);
+        if (seen.has(matchedIdentity) || matchedIdentity === ownerPhone) continue;
+        seen.add(matchedIdentity);
+        users.push({
+          phone: r.phone,
+          name: String(c.name || r.name || "LiveBridge Kullanıcısı").slice(0, 100),
+          language: r.language || "",
+          gender: r.gender === "male" ? "male" : "female",
+          online: liveBridgeUserOnline(r),
+          lastSeen: r.lastSeen || 0,
+        });
+      }
+    } else {
+      for (const c of normalizedContacts) {
+        const r = await liveBridgeStore.findUserByPhoneKeys(c.keys);
+        if (!r) continue;
+        const matchedIdentity = normalizeLiveBridgePhone(r.phone);
+        if (seen.has(matchedIdentity) || matchedIdentity === ownerPhone) continue;
+        seen.add(matchedIdentity);
+        users.push({
+          phone: r.phone,
+          name: String(c.name || r.name || "LiveBridge Kullanıcısı").slice(0, 100),
+          language: r.language || "",
+          gender: r.gender === "male" ? "male" : "female",
+          online: liveBridgeUserOnline(r),
+          lastSeen: r.lastSeen || 0,
+        });
+      }
     }
     users.sort((a, b) => a.online === b.online ? String(a.name).localeCompare(String(b.name), "tr") : (a.online ? -1 : 1));
     res.json({ok: true, users});

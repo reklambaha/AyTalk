@@ -30,7 +30,7 @@ class AySpeechModule(
     private const val AUDIO_FORMAT =
       AudioFormat.ENCODING_PCM_16BIT
 
-    private const val SPEECH_THRESHOLD = 650
+    private const val SPEECH_THRESHOLD = 320
     private const val SILENCE_AFTER_SPEECH_MS = 1150L
     private const val MIN_SPEECH_MS = 350L
     private const val DEFAULT_MAX_MS = 12000L
@@ -42,6 +42,12 @@ class AySpeechModule(
   private var activeRecorder: AudioRecord? = null
 
   override fun getName(): String = "AySpeech"
+
+  override fun getConstants(): MutableMap<String, Any> {
+    return hashMapOf(
+      "appSharedKey" to BuildConfig.APP_SHARED_KEY,
+    )
+  }
 
   @ReactMethod
   fun capture(
@@ -105,9 +111,22 @@ class AySpeechModule(
           bufferSize,
         )
 
-        if (
-          recorder.state != AudioRecord.STATE_INITIALIZED
-        ) {
+        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+          try {
+            recorder.release()
+          } catch (_: Exception) {
+          }
+
+          recorder = AudioRecord(
+            MediaRecorder.AudioSource.MIC,
+            SAMPLE_RATE,
+            CHANNEL_CONFIG,
+            AUDIO_FORMAT,
+            bufferSize,
+          )
+        }
+
+        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
           throw IllegalStateException(
             "Mikrofon başlatılamadı."
           )
