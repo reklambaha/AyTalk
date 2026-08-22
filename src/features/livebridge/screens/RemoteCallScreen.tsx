@@ -24,6 +24,7 @@ import {
   AudioSession,
   isTrackReference,
   LiveKitRoom,
+  RoomAudioRenderer,
   TrackReferenceOrPlaceholder,
   useLocalParticipant,
   useRoomContext,
@@ -61,6 +62,24 @@ import {
 import {SERVER_URL, APP_SHARED_KEY} from "../../../services/api";
 import CallControlIcon from "../components/CallControlIcon";
 import {prepareSpeech} from "../../language-engine";
+
+
+const getSafeFcmToken = async (): Promise<string> => {
+  if (Platform.OS !== "android") return "";
+
+  try {
+    // google-services.json / Firebase native init henüz yoksa
+    // messaging() senkron olarak hata atabilir. Profil kaydını bunun yüzünden
+    // asla engellememeliyiz; FCM token daha sonra güncellenebilir.
+    const firebaseMessaging = messaging();
+    const token = await firebaseMessaging.getToken();
+    return String(token || "").trim();
+  } catch (error) {
+    console.warn("AyTalk FCM token alınamadı; profil FCM olmadan kaydedilecek:", error);
+    return "";
+  }
+};
+
 
 type RemoteCallScreenProps = {
   visible: boolean;
@@ -601,54 +620,106 @@ function RoomView({
     };
   }, []);
 
-  const playCloudTranslation = async (text: string, languageName: string, gender: "male" | "female") => {
+  const playCloudTranslation = async (
+    text: string,
+    languageName: string,
+    gender: "male" | "female",
+  ) => {
     const response = await fetch(`${SERVER_URL}/tts`, {
-      method: "POST", headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
+      method: "POST",
+      headers: {"Content-Type": "application/json", "x-app-key": APP_SHARED_KEY},
       body: JSON.stringify({text, language: languageName, gender}),
     });
     const data = await response.json();
-    if (!response.ok) throw new Error(data?.error || "Bulut seslendirme başarısız.");
+    if (!response.ok) {
+      throw new Error(data?.error || "Bulut seslendirme başarısız.");
+    }
+
     const audioBase64 = String(data?.audioBase64 || "");
     if (!audioBase64) throw new Error("Bulut sesi boş döndü.");
-    const filePath = `${RNFS.CachesDirectoryPath}/livebridge-tts-${Date.now()}.mp3`;
+
+    const filePath =
+      `${RNFS.CachesDirectoryPath}/livebridge-tts-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 6)}.mp3`;
+
     await RNFS.writeFile(filePath, audioBase64, "base64");
-    await new Promise<void>((resolve, reject) => {
-      const sound = new Sound(filePath, "", error => {
-        if (error) return reject(error);
-        sound.setVolume(1);
-        sound.play(ok => {
-          sound.release();
-          void RNFS.unlink(filePath).catch(() => undefined);
-          ok ? resolve() : reject(new Error("Ses oynatılamadı."));
+
+    try {
+      Sound.setCategory?.("Playback");
+      if (AyAudioRoute) {
+        await AyAudioRoute.setSpeakerEnabled(true);
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        const sound = new Sound(filePath, "", error => {
+          if (error) {
+            reject(error);
+            return;
+          }
+
+          sound.setVolume(1);
+          sound.setNumberOfLoops(0);
+          sound.play(ok => {
+            try {
+              sound.release();
+            } catch {}
+            ok ? resolve() : reject(new Error("Ses oynatılamadı."));
+          });
         });
       });
-    });
+    } finally {
+      void RNFS.unlink(filePath).catch(() => undefined);
+    }
   };
 
   const speakTranslation = async (translated: string, locale: string) => {
     if (!voiceTranslationEnabled || !translated.trim()) return;
-    const languageName = CALL_LANGUAGES.find(item => item.locale === locale)?.name || locale;
+
+    const languageName =
+      CALL_LANGUAGES.find(item => item.locale === locale)?.name || locale;
     const remoteGender: "male" | "female" =
       outgoingCall?.calleeGender || incomingCall?.callerGender || "female";
+
+    const voices = await Tts.voices().catch(() => []);
+    const prepared = prepareSpeech({text: translated, locale, voices});
+
     try {
       await Tts.stop();
-      const voices = await Tts.voices();
-      const prepared = prepareSpeech({text: translated, locale, voices});
-      if (!prepared.hasCompatibleLocalVoice) {
-        await playCloudTranslation(prepared.speechText, languageName, remoteGender);
-        return;
+      await playCloudTranslation(
+        prepared.speechText,
+        languageName,
+        remoteGender,
+      );
+      return;
+    } catch (cloudError) {
+      console.log("LiveBridge cloud TTS fallback:", cloudError);
+    }
+
+    try {
+      if (prepared.selectedVoiceId) {
+        await Tts.setDefaultVoice(prepared.selectedVoiceId);
+      } else {
+        await Tts.setDefaultLanguage(prepared.selectedLocale);
       }
-      if (prepared.selectedVoiceId) await Tts.setDefaultVoice(prepared.selectedVoiceId);
-      else await Tts.setDefaultLanguage(prepared.selectedLocale);
+      await Tts.setDefaultRate(0.48);
+      await Tts.setDefaultPitch(remoteGender === "male" ? 0.92 : 1.04);
       await Tts.speak(prepared.speechText, {
-        iosVoiceId: prepared.selectedVoiceId || "", rate: 0.48,
-        androidParams: {KEY_PARAM_PAN:0, KEY_PARAM_VOLUME:1.0, KEY_PARAM_STREAM:"STREAM_MUSIC"},
+        iosVoiceId: prepared.selectedVoiceId || "",
+        rate: 0.48,
+        androidParams: {
+          KEY_PARAM_PAN: 0,
+          KEY_PARAM_VOLUME: 1.0,
+          KEY_PARAM_STREAM: "STREAM_MUSIC",
+        },
       });
-    } catch {
-      try {
-        const prepared = prepareSpeech({text: translated, locale, voices: []});
-        await playCloudTranslation(prepared.speechText, languageName, remoteGender);
-      } catch {}
+    } catch (deviceTtsError) {
+      Alert.alert(
+        "Seslendirme",
+        deviceTtsError instanceof Error
+          ? deviceTtsError.message
+          : "Çeviri sesi oynatılamadı.",
+      );
     }
   };
 
@@ -1617,6 +1688,7 @@ function RoomView({
 
   return (
     <SafeAreaViewSafe style={styles.roomContainer}>
+      <RoomAudioRenderer />
       <View style={styles.callStage}>
         {renderRemoteVideo()}
 
@@ -1882,6 +1954,13 @@ function RoomView({
               </Text>
             ) : null}
           </View>
+
+          <TouchableOpacity
+            style={styles.bottomFileButton}
+            onPress={() => setAttachmentMenuVisible(true)}>
+            <CallControlIcon name="more" size={21} />
+            <Text style={styles.bottomFileText}>Dosya</Text>
+          </TouchableOpacity>
 
           <TouchableOpacity style={styles.bottomHangupButton} onPress={onLeave}>
             <CallControlIcon name="hangup" size={31} danger />
@@ -2352,7 +2431,7 @@ export default function RemoteCallScreen({
           name: name.trim() || "LiveBridge Kullanıcısı",
           language: sourceCallLanguage.name,
           gender: voiceGender,
-          fcmToken: Platform.OS === "android" ? await messaging().getToken().catch(() => "") : "",
+          fcmToken: await getSafeFcmToken(),
         }),
       });
       const data = await response.json();
@@ -2362,7 +2441,7 @@ export default function RemoteCallScreen({
       await AsyncStorage.setItem(LIVEBRIDGE_PROFILE_KEY, JSON.stringify({phone: cleanPhone, gender: voiceGender}));
       return true;
     } catch (error) {
-      Alert.alert("LiveBridge kayıt hatası", error instanceof Error ? error.message : "Profil kaydedilemedi.");
+      Alert.alert("LiveBridge kayıt hatası", error instanceof Error ? error.message : "Profil kaydedilemedi. İnternet bağlantısını kontrol edip tekrar dene.");
       return false;
     }
   }, [directoryPhone, name, sourceCallLanguage.name]);
@@ -4770,7 +4849,24 @@ const styles = StyleSheet.create({
     borderColor: "#1C2432",
   },
   bottomStatusBlock: {
-    minWidth: 88,
+    minWidth: 76,
+  },
+  bottomFileButton: {
+    minWidth: 48,
+    height: 42,
+    borderRadius: 15,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(31,167,255,0.12)",
+    borderWidth: 1,
+    borderColor: "rgba(75,198,255,0.34)",
+    paddingHorizontal: 8,
+  },
+  bottomFileText: {
+    color: "#73CFFF",
+    fontSize: 8,
+    fontWeight: "900",
+    marginTop: 1,
   },
   bottomStatusLabel: {
     color: "#DDE5EF",

@@ -946,11 +946,28 @@ app.post("/call/translate", async (req, res) => {
           .join("\n\n")
       : "No previous context.";
 
+    const requestedProfanityMode = String(req.body?.profanityMode || "direct")
+      .trim()
+      .toLowerCase();
+    const profanityMode = ["direct", "soften", "hide"].includes(requestedProfanityMode)
+      ? requestedProfanityMode
+      : "direct";
+
+    const profanityInstruction =
+      profanityMode === "soften"
+        ? "PROFANITY MODE: SOFTEN. Preserve the speaker's anger, intention and social force, but replace explicit profanity and slurs with natural milder target-language equivalents. Do not make the whole sentence formal or emotionless. "
+        : profanityMode === "hide"
+          ? "PROFANITY MODE: HIDE. Preserve the non-profane meaning and emotional intent, but omit explicit profanity/slurs and use a concise neutral target-language paraphrase where needed. "
+          : "PROFANITY MODE: DIRECT. Translate profanity, insults, slang and emotional intensity directly and naturally. Do not censor, soften, euphemize or moralize. ";
+
     const response = await openai.responses.create({
       model: "gpt-4.1-mini",
       store: false,
       max_output_tokens: Math.min(1200, Math.max(80, Math.ceil(message.length * 1.6))),
-      instructions: buildTranslationInstructions(from, to, {live: true}),
+      instructions:
+        buildTranslationInstructions(from, to, {live: true}) +
+        " " +
+        profanityInstruction,
       input:
         `PREVIOUS_CONTEXT:\n${contextText}\n\n` +
         `CURRENT_UTTERANCE:\n${message}`,
@@ -1494,23 +1511,50 @@ app.post("/tts", async (req, res) => {
         .toLowerCase();
     const voice = requestedGender === "male" ? "onyx" : "coral";
 
-    const speech = await openai.audio.speech.create({
-      model: "gpt-4o-mini-tts",
-      voice,
-      input: text,
-      response_format: "mp3",
-      instructions: language
-        ? `You are a native ${language} speaker recording a warm, natural voice message for a friend. ` +
-          `Speak with the authentic accent, rhythm, and intonation a real native speaker of ${language} would use — not a flat or robotic reading. ` +
-          "Use natural pacing with brief, human-like pauses at commas and sentence breaks. Vary pitch naturally as a person would in casual conversation. " +
-          "Pronounce ordinary words as words, not as letter-by-letter acronyms, unless clearly intended as an acronym."
-        : "Speak naturally and clearly, like a real person in casual conversation, with natural rhythm and pauses. Pronounce ordinary words as words.",
-    });
+    const primaryInstructions = language
+      ? `You are a native ${language} speaker recording a warm, natural voice message for a friend. ` +
+        `Speak with the authentic accent, rhythm, and intonation a real native speaker of ${language} would use — not a flat or robotic reading. ` +
+        "Use natural pacing with brief, human-like pauses at commas and sentence breaks. Vary pitch naturally as a person would in casual conversation. " +
+        "Pronounce ordinary words as words, not as letter-by-letter acronyms, unless clearly intended as an acronym."
+      : "Speak naturally and clearly, like a real person in casual conversation, with natural rhythm and pauses. Pronounce ordinary words as words.";
+
+    let speech;
+    let modelUsed = "gpt-4o-mini-tts";
+
+    try {
+      speech = await openai.audio.speech.create({
+        model: "gpt-4o-mini-tts",
+        voice,
+        input: text,
+        response_format: "mp3",
+        instructions: primaryInstructions,
+      });
+    } catch (primaryError) {
+      console.warn("Primary TTS failed, falling back to tts-1:", primaryError);
+      modelUsed = "tts-1";
+      const fallbackVoice = requestedGender === "male" ? "onyx" : "nova";
+      speech = await openai.audio.speech.create({
+        model: "tts-1",
+        voice: fallbackVoice,
+        input: text,
+        response_format: "mp3",
+      });
+    }
 
     const buffer = Buffer.from(await speech.arrayBuffer());
 
+    if (!buffer.length) {
+      throw new Error("TTS servisi boş ses verisi döndürdü.");
+    }
+
     return res.json({
       audioBase64: buffer.toString("base64"),
+      mimeType: "audio/mpeg",
+      model: modelUsed,
+      voice: modelUsed === "tts-1"
+        ? (requestedGender === "male" ? "onyx" : "nova")
+        : voice,
+      bytes: buffer.length,
     });
   } catch (error) {
     console.error("TTS error:", error);
