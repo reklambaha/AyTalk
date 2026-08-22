@@ -2456,24 +2456,49 @@ function AyTalkMainApp() {
   };
 
   const captureAndTranscribeSpeech = async (language: Language): Promise<string> => {
-    if (!AySpeech) throw new Error("Mikrofon modülü bulunamadı.");
+    if (!AySpeech || typeof AySpeech.capture !== "function") {
+      throw new Error("Mikrofon modülü bulunamadı.");
+    }
 
     const result = await AySpeech.capture(12000);
     const audioBase64 = String(result?.audioBase64 || "");
     if (!audioBase64) throw new Error("Ses kaydı alınamadı.");
 
     const languageCode = language.speech.split("-")[0].toLowerCase();
-    const transcribeResponse = await fetchJson<{text?: string; error?: string}>(
-      "/audio/transcribe",
-      {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({audioBase64, language: languageCode}),
-      },
-      30000,
-    );
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
 
-    return String(transcribeResponse?.text || "").trim();
+    try {
+      const response = await fetch(`${SERVER_URL}/audio/transcribe`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-app-key": APP_SHARED_KEY,
+        },
+        body: JSON.stringify({audioBase64, language: languageCode}),
+        signal: controller.signal,
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data?.error || `Ses yazıya çevrilemedi (${response.status}).`);
+      }
+
+      const recognizedText = String(data?.text || "").trim();
+      if (!recognizedText) {
+        throw new Error("Konuşma algılanmadı.");
+      }
+
+      return recognizedText;
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new Error("Ses tanıma isteği zaman aşımına uğradı.");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
   };
 
   const requestMicrophonePermission = async () => {
