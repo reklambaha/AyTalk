@@ -9,6 +9,22 @@ const {Pool} = require("pg");
 const OpenAI = require("openai");
 const {toFile} = require("openai");
 const {AccessToken, AgentDispatchClient} = require("livekit-server-sdk");
+const admin = require("firebase-admin");
+
+let firebaseMessaging = null;
+try {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (raw) {
+    const serviceAccount = JSON.parse(raw);
+    admin.initializeApp({credential: admin.credential.cert(serviceAccount)});
+    firebaseMessaging = admin.messaging();
+    console.log("Firebase push hazır.");
+  } else {
+    console.warn("FIREBASE_SERVICE_ACCOUNT_JSON yok; kapalı uygulamaya arama push'u gönderilemez.");
+  }
+} catch (error) {
+  console.error("Firebase başlatılamadı:", error.message);
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -42,11 +58,13 @@ async function initDb() {
       name TEXT NOT NULL,
       language TEXT DEFAULT '',
       gender TEXT NOT NULL DEFAULT 'female',
+      fcm_token TEXT DEFAULT '',
       last_seen BIGINT NOT NULL
     );
   `);
   await dbPool.query(`
     ALTER TABLE livebridge_users ADD COLUMN IF NOT EXISTS gender TEXT NOT NULL DEFAULT 'female';
+    ALTER TABLE livebridge_users ADD COLUMN IF NOT EXISTS fcm_token TEXT DEFAULT '';
   `);
   await dbPool.query(`
     CREATE INDEX IF NOT EXISTS idx_livebridge_users_phone_keys
@@ -263,6 +281,7 @@ function rowToUser(row) {
     name: row.name,
     language: row.language || "",
     gender: row.gender === "male" ? "male" : "female",
+    fcmToken: row.fcm_token || "",
     lastSeen: Number(row.last_seen || 0),
   };
 }
@@ -299,15 +318,16 @@ const liveBridgeStore = {
   async saveUser(user) {
     if (dbPool) {
       await dbPool.query(
-        `INSERT INTO livebridge_users (phone, phone_keys, name, language, gender, last_seen)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        `INSERT INTO livebridge_users (phone, phone_keys, name, language, gender, fcm_token, last_seen)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (phone) DO UPDATE SET
            phone_keys = EXCLUDED.phone_keys,
            name = EXCLUDED.name,
            language = EXCLUDED.language,
            gender = EXCLUDED.gender,
+           fcm_token = EXCLUDED.fcm_token,
            last_seen = EXCLUDED.last_seen`,
-        [user.phone, user.phoneKeys, user.name, user.language, user.gender === "male" ? "male" : "female", user.lastSeen],
+        [user.phone, user.phoneKeys, user.name, user.language, user.gender === "male" ? "male" : "female", user.fcmToken || "", user.lastSeen],
       );
       return user;
     }
@@ -422,6 +442,7 @@ app.post("/livebridge/profile/register", async (req, res) => {
       name,
       language,
       gender,
+      fcmToken: String(req.body?.fcmToken || existing?.fcmToken || "").slice(0, 4096),
       lastSeen: liveBridgeNow(),
     };
     await liveBridgeStore.saveUser(user);
@@ -444,6 +465,7 @@ app.post("/livebridge/presence", async (req, res) => {
       name: String(req.body?.name || old.name || "LiveBridge Kullanıcısı").slice(0, 80),
       language: String(req.body?.language || old.language || "").slice(0, 80),
       gender: req.body?.gender === "male" || req.body?.gender === "female" ? req.body.gender : (old.gender || "female"),
+      fcmToken: String(req.body?.fcmToken || old.fcmToken || "").slice(0, 4096),
       lastSeen: liveBridgeNow(),
     };
     await liveBridgeStore.saveUser(user);
@@ -510,6 +532,20 @@ app.post("/livebridge/call/start", async (req, res) => {
       status: "ringing", createdAt: liveBridgeNow(), updatedAt: liveBridgeNow(),
     };
     await liveBridgeStore.saveCall(call);
+    if (firebaseMessaging && calleeUser.fcmToken) {
+      try {
+        await firebaseMessaging.send({
+          token: calleeUser.fcmToken,
+          data: {
+            type: "livebridge_incoming_call", callId: call.id, roomName: call.roomName,
+            callerPhone: call.callerPhone, callerName: call.callerName, mode: call.mode,
+          },
+          android: {priority: "high", ttl: 60000},
+        });
+      } catch (pushError) {
+        console.error("LiveBridge push gönderilemedi:", pushError.message);
+      }
+    }
     res.json({ok: true, call});
   } catch (error) {
     console.error("call/start hatası:", error);

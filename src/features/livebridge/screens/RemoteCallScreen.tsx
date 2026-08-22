@@ -36,6 +36,7 @@ import Tts from "react-native-tts";
 import Sound from "react-native-sound";
 import Contacts from "react-native-contacts";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import messaging from "@react-native-firebase/messaging";
 import {SafeAreaView as SafeAreaViewSafe} from "react-native-safe-area-context";
 import RNFS from "react-native-fs";
 import RNShare from "react-native-share";
@@ -2351,6 +2352,7 @@ export default function RemoteCallScreen({
           name: name.trim() || "LiveBridge Kullanıcısı",
           language: sourceCallLanguage.name,
           gender: voiceGender,
+          fcmToken: Platform.OS === "android" ? await messaging().getToken().catch(() => "") : "",
         }),
       });
       const data = await response.json();
