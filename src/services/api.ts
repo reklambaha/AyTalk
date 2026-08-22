@@ -1,6 +1,5 @@
 import {NativeModules} from "react-native";
 
-// AyTalk production backend. LiveKit/OpenAI secrets stay only on Render.
 export const SERVER_URL = "https://aytalk.onrender.com";
 
 const nativeAppSharedKey = NativeModules?.AySpeech?.appSharedKey;
@@ -17,16 +16,49 @@ export const getApiAuthHeaders = (): Record<string, string> => ({
   "x-app-key": APP_SHARED_KEY,
 });
 
-export const assertApiConfiguration = () => {
+export function assertApiConfiguration() {
   if (!APP_SHARED_KEY) {
     throw new Error(
-      "AyTalk uygulama anahtarı APK içine eklenmemiş. GitHub Actions secret APP_SHARED_KEY veya yerel .env kontrol edilmeli.",
+      "AyTalk uygulama anahtarı APK içine eklenmemiş. GitHub Actions APP_SHARED_KEY secret veya yerel .env kontrol edilmeli.",
     );
   }
-};
+}
 
-if (__DEV__ && !APP_SHARED_KEY) {
-  console.warn(
-    "AyTalk: APP_SHARED_KEY APK'ya eklenmedi. Yerel build için proje .env; GitHub build için Actions Secret gerekir.",
-  );
+export async function fetchJson<T>(
+  path: string,
+  options: RequestInit = {},
+  timeoutMs = 20000,
+): Promise<T> {
+  assertApiConfiguration();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(`${SERVER_URL}${path}`, {
+      ...options,
+      headers: {
+        ...getApiJsonHeaders(),
+        ...(options.headers || {}),
+      },
+      signal: controller.signal,
+    });
+
+    let data: any = {};
+    try {
+      data = await response.json();
+    } catch {}
+
+    if (!response.ok) {
+      throw new Error(data?.error || `Sunucu hatası (${response.status}).`);
+    }
+
+    return data as T;
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error("Sunucu isteği zaman aşımına uğradı.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }

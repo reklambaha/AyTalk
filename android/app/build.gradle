@@ -58,10 +58,14 @@ def escapeBuildConfigString = { String value ->
 
 def ayTalkAppSharedKey = readAyTalkEnvValue("APP_SHARED_KEY")
 if (ayTalkAppSharedKey.isEmpty()) {
-    logger.warn("AyTalk: APP_SHARED_KEY bulunamadi. Render'da APP_SHARED_KEY aktifse API istekleri 401 alir.")
+    throw new GradleException("AyTalk: APP_SHARED_KEY bulunamadi. Yerel .env veya GitHub Actions secret eksik.")
 }
 
 android {
+    buildFeatures {
+        buildConfig true
+    }
+
     ndkVersion rootProject.ext.ndkVersion
     buildToolsVersion rootProject.ext.buildToolsVersion
     compileSdk rootProject.ext.compileSdkVersion

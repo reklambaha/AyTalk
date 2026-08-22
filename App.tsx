@@ -43,7 +43,7 @@ const SILENCE_DELAY_MS = 850;
 const Tts: any = TtsImport as any;
 const {AySpeech} = NativeModules;
 
-import {SERVER_URL, APP_SHARED_KEY, getApiJsonHeaders} from "./src/services/api";
+import {SERVER_URL, APP_SHARED_KEY, fetchJson, getApiJsonHeaders} from "./src/services/api";
 import {requestTtsAudioBase64} from "./src/services/tts";
 import {
   DEFAULT_SOURCE_LANGUAGE,
@@ -51,8 +51,6 @@ import {
   LANGUAGES,
 } from "./src/constants/languages";
 import AppIntro from "./src/components/AppIntro";
-import FirstRunOnboarding from "./src/components/FirstRunOnboarding";
-import EmergencyMode from "./src/features/emergency/EmergencyMode";
 import {RemoteCallScreen} from "./src/features/livebridge";
 import VoiceWaveform from "./src/components/VoiceWaveform";
 import VoiceRing from "./src/components/VoiceRing";
@@ -166,21 +164,11 @@ function AyTalkMainApp() {
   const [voicePace, setVoicePace] = useState<VoicePace>("normal");
   const [text, setText] = useState("");
   const [translation, setTranslation] = useState("Çeviri burada görünecek.");
-  const [cultureNote, setCultureNote] = useState("");
-  const [cultureNoteLoading, setCultureNoteLoading] = useState(false);
-  const [translationFeedback, setTranslationFeedback] = useState<"good" | "bad" | "">("");
-  const [lastTranslationContext, setLastTranslationContext] = useState<{
-    sourceText: string;
-    translatedText: string;
-    from: string;
-    to: string;
-  } | null>(null);
   const [resultLanguage, setResultLanguage] = useState<Language>(LANGUAGES[2]);
   const [assistantMessages, setAssistantMessages] = useState<ChatMessage[]>([]);
   const [translationHistory, setTranslationHistory] = useState<TranslationHistoryItem[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
-  const [emergencyOpen, setEmergencyOpen] = useState(false);
   const [remoteCallOpen, setRemoteCallOpen] = useState(false);
   const [remoteCallRoomCode, setRemoteCallRoomCode] = useState("");
   const [remoteCallDefaultName, setRemoteCallDefaultName] =
@@ -1569,63 +1557,6 @@ function AyTalkMainApp() {
     }
   };
 
-  const rememberTranslationContext = (
-    sourceTextValue: string,
-    translatedTextValue: string,
-    source: Language,
-    target: Language,
-  ) => {
-    setLastTranslationContext({
-      sourceText: sourceTextValue,
-      translatedText: translatedTextValue,
-      from: source.name,
-      to: target.name,
-    });
-    setCultureNote("");
-    setTranslationFeedback("");
-  };
-
-  const requestCultureNote = async () => {
-    if (!lastTranslationContext || cultureNoteLoading) return;
-    try {
-      setCultureNoteLoading(true);
-      const response = await fetch(`${SERVER_URL}/culture-note`, {
-        method: "POST",
-        headers: getApiJsonHeaders(),
-        body: JSON.stringify(lastTranslationContext),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data?.error || "Kültürel not alınamadı.");
-      setCultureNote(String(data?.note || "Bu ifade için belirgin bir kültürel uyarı bulunmadı."));
-    } catch (error) {
-      setCultureNote(
-        error instanceof Error ? error.message : "Kültürel not alınamadı.",
-      );
-    } finally {
-      setCultureNoteLoading(false);
-    }
-  };
-
-  const submitTranslationFeedback = async (rating: "good" | "bad") => {
-    if (!lastTranslationContext) return;
-    setTranslationFeedback(rating);
-    const payload = {...lastTranslationContext, rating, createdAt: new Date().toISOString()};
-    try {
-      const existing = await AsyncStorage.getItem("aytalk_translation_feedback");
-      const parsed = existing ? JSON.parse(existing) : [];
-      const next = [payload, ...(Array.isArray(parsed) ? parsed : [])].slice(0, 200);
-      await AsyncStorage.setItem("aytalk_translation_feedback", JSON.stringify(next));
-    } catch {}
-
-    try {
-      await fetch(`${SERVER_URL}/translation-feedback`, {
-        method: "POST",
-        headers: getApiJsonHeaders(),
-        body: JSON.stringify(payload),
-      });
-    } catch {}
-  };
-
   const translateText = async (value?: string) => {
     const cleanText = String(value ?? text).trim();
 
@@ -1643,7 +1574,6 @@ function AyTalkMainApp() {
     if (cachedReply) {
       setResultLanguage(targetAtRequest);
       setTranslation(cachedReply);
-      rememberTranslationContext(cleanText, cachedReply, sourceAtRequest, targetAtRequest);
       addTranslationToHistory(
         cleanText,
         cachedReply,
@@ -1689,7 +1619,7 @@ function AyTalkMainApp() {
 
       const reply = await streamNdjson({
         path: "/chat-stream",
-        timeoutMs: 35000,
+        timeoutMs: 20000,
         body: {
           message: cleanText,
           from: sourceAtRequest.name,
@@ -1708,7 +1638,6 @@ function AyTalkMainApp() {
         setTranslation(reply);
       }
       saveTranslationToCache(cacheKey, reply);
-      rememberTranslationContext(cleanText, reply, sourceAtRequest, targetAtRequest);
       addTranslationToHistory(
         cleanText,
         reply,
@@ -1743,7 +1672,7 @@ function AyTalkMainApp() {
       // Streaming desteklenmezse mevcut JSON endpoint otomatik yedek olur.
       try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 30000);
+        const timeout = setTimeout(() => controller.abort(), 18000);
 
         const response = await fetch(`${SERVER_URL}/chat`, {
           method: "POST",
@@ -1772,7 +1701,6 @@ function AyTalkMainApp() {
         setTranslation(reply);
         setResultLanguage(targetAtRequest);
         saveTranslationToCache(cacheKey, reply);
-        rememberTranslationContext(cleanText, reply, sourceAtRequest, targetAtRequest);
         addTranslationToHistory(
           cleanText,
           reply,
@@ -1802,7 +1730,7 @@ function AyTalkMainApp() {
         const message =
           fallbackError instanceof Error
             ? fallbackError.name === "AbortError"
-              ? "Sunucu 30 saniye içinde cevap vermedi."
+              ? "Sunucu zamanında cevap vermedi."
               : fallbackError.message
             : streamError instanceof Error
               ? streamError.message
@@ -1856,7 +1784,7 @@ function AyTalkMainApp() {
     try {
       const reply = await streamNdjson({
         path: "/assistant-stream",
-        timeoutMs: 45000,
+        timeoutMs: 30000,
         body: {
           message: cleanText,
           language: languageAtRequest.name,
@@ -1957,7 +1885,7 @@ function AyTalkMainApp() {
         const message =
           fallbackError instanceof Error
             ? fallbackError.name === "AbortError"
-              ? "Sunucu 30 saniye içinde cevap vermedi."
+              ? "Sunucu zamanında cevap vermedi."
               : fallbackError.message
             : streamError instanceof Error
               ? streamError.message
@@ -2427,11 +2355,6 @@ function AyTalkMainApp() {
   };
 
   const openHomeSection = (section: HomeSection) => {
-    if (section === "emergency") {
-      setEmergencyOpen(true);
-      return;
-    }
-
     if (section === "livebridge") {
       setRemoteCallRoomCode("");
       setRemoteCallDefaultName("AyTalk Kullanıcısı");
@@ -2456,46 +2379,24 @@ function AyTalkMainApp() {
   };
 
   const captureAndTranscribeSpeech = async (language: Language): Promise<string> => {
-    if (!AySpeech || typeof AySpeech.capture !== "function") {
-      throw new Error("Mikrofon modülü bulunamadı.");
-    }
+    if (!AySpeech) throw new Error("Mikrofon modülü bulunamadı.");
 
-    const result = await AySpeech.capture(12000);
+    const result = await AySpeech.capture(9000);
     const audioBase64 = String(result?.audioBase64 || "");
     if (!audioBase64) throw new Error("Ses kaydı alınamadı.");
 
     const languageCode = language.speech.split("-")[0].toLowerCase();
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000);
-
-    try {
-      const response = await fetch(`${SERVER_URL}/audio/transcribe`, {
+    const transcribeResponse = await fetchJson<{text?: string; error?: string}>(
+      "/audio/transcribe",
+      {
         method: "POST",
-        headers: getApiJsonHeaders(),
+        headers: {"Content-Type": "application/json"},
         body: JSON.stringify({audioBase64, language: languageCode}),
-        signal: controller.signal,
-      });
+      },
+      20000,
+    );
 
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data?.error || `Ses yazıya çevrilemedi (${response.status}).`);
-      }
-
-      const recognizedText = String(data?.text || "").trim();
-      if (!recognizedText) {
-        throw new Error("Konuşma algılanmadı.");
-      }
-
-      return recognizedText;
-    } catch (error) {
-      if (error instanceof Error && error.name === "AbortError") {
-        throw new Error("Ses tanıma isteği zaman aşımına uğradı.");
-      }
-      throw error;
-    } finally {
-      clearTimeout(timeout);
-    }
+    return String(transcribeResponse?.text || "").trim();
   };
 
   const requestMicrophonePermission = async () => {
@@ -2615,7 +2516,6 @@ function AyTalkMainApp() {
     return (
       <>
         <HomeDashboard onOpen={openHomeSection} />
-        <EmergencyMode visible={emergencyOpen} onClose={() => setEmergencyOpen(false)} />
 
         <RemoteCallScreen
           visible={remoteCallOpen}
@@ -3553,40 +3453,10 @@ function AyTalkMainApp() {
                   {translation || (isLoading ? "▍" : "Çeviri burada görünecek.")}
                 </Text>
               </ScrollView>
-
-              {lastTranslationContext && !isLoading ? (
-                <View style={styles.translationInsightPanel}>
-                  <View style={styles.translationFeedbackRow}>
-                    <Text style={styles.translationFeedbackLabel}>Bu çeviri doğal mı?</Text>
-                    <TouchableOpacity
-                      style={[styles.feedbackButton, translationFeedback === "good" && styles.feedbackButtonActive]}
-                      onPress={() => void submitTranslationFeedback("good")}>
-                      <Text style={styles.feedbackButtonText}>👍 İyi</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      style={[styles.feedbackButton, translationFeedback === "bad" && styles.feedbackButtonActive]}
-                      onPress={() => void submitTranslationFeedback("bad")}>
-                      <Text style={styles.feedbackButtonText}>👎 Düzelt</Text>
-                    </TouchableOpacity>
-                  </View>
-
-                  <TouchableOpacity
-                    style={styles.cultureButton}
-                    onPress={() => void requestCultureNote()}
-                    disabled={cultureNoteLoading}>
-                    <Text style={styles.cultureButtonText}>
-                      {cultureNoteLoading ? "🌍 Kültürel not kontrol ediliyor..." : "🌍 Kültürel kullanım notunu göster"}
-                    </Text>
-                  </TouchableOpacity>
-                  {cultureNote ? <Text style={styles.cultureNoteText}>{cultureNote}</Text> : null}
-                </View>
-              ) : null}
             </Animated.View>
           ) : null}
         </ScrollView>
       </KeyboardAvoidingView>
-
-      <EmergencyMode visible={emergencyOpen} onClose={() => setEmergencyOpen(false)} />
 
       <RemoteCallScreen
         visible={remoteCallOpen}
@@ -3609,9 +3479,9 @@ function AyTalkMainApp() {
             return totals;
           }, {}),
         )
-          .sort((a, b) => b[1] - a[1])
+          .sort((a, b) => Number(b[1]) - Number(a[1]))
           .slice(0, 4)
-          .map(([name, count]) => ({name, count}))}
+          .map(([name, count]) => ({name, count: Number(count)}))}
         recentActivities={[
           ...translationHistory.slice(0, 3).map(item => ({
             id: `translation-${item.id}`,
@@ -5689,52 +5559,6 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "800",
   },
-  translationInsightPanel: {
-    borderTopWidth: 1,
-    borderTopColor: "rgba(96,165,250,0.24)",
-    marginTop: 10,
-    paddingTop: 12,
-  },
-  translationFeedbackRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    flexWrap: "wrap",
-    gap: 8,
-  },
-  translationFeedbackLabel: {
-    color: "#AFC7E6",
-    fontSize: 12,
-    fontWeight: "700",
-    marginRight: 2,
-  },
-  feedbackButton: {
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: "#28496B",
-    backgroundColor: "#0B1B31",
-    paddingHorizontal: 10,
-    paddingVertical: 7,
-  },
-  feedbackButtonActive: {
-    borderColor: "#2BC8F4",
-    backgroundColor: "#103A50",
-  },
-  feedbackButtonText: {color: "#D9ECFF", fontSize: 12, fontWeight: "800"},
-  cultureButton: {
-    marginTop: 10,
-    borderRadius: 12,
-    backgroundColor: "#122A46",
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-  },
-  cultureButtonText: {color: "#7DDCFF", fontSize: 12, fontWeight: "900"},
-  cultureNoteText: {
-    color: "#D5E7F7",
-    fontSize: 13,
-    lineHeight: 19,
-    marginTop: 10,
-    paddingHorizontal: 2,
-  },
   modalHeader: {
     flexDirection: "row",
     alignItems: "center",
@@ -5795,40 +5619,11 @@ const styles = StyleSheet.create({
 
 export default function App() {
   const [introVisible, setIntroVisible] = useState(true);
-  const [onboardingReady, setOnboardingReady] = useState(false);
-  const [onboardingVisible, setOnboardingVisible] = useState(false);
-
-  useEffect(() => {
-    let mounted = true;
-    AsyncStorage.getItem("aytalk_onboarding_v1_done")
-      .then(value => {
-        if (!mounted) return;
-        setOnboardingVisible(value !== "1");
-        setOnboardingReady(true);
-      })
-      .catch(() => {
-        if (!mounted) return;
-        setOnboardingVisible(true);
-        setOnboardingReady(true);
-      });
-    return () => {
-      mounted = false;
-    };
-  }, []);
-
-  const finishOnboarding = async () => {
-    try {
-      await AsyncStorage.setItem("aytalk_onboarding_v1_done", "1");
-    } catch {}
-    setOnboardingVisible(false);
-  };
 
   return (
     <SafeAreaProvider>
       {introVisible ? (
         <AppIntro onFinish={() => setIntroVisible(false)} />
-      ) : !onboardingReady ? null : onboardingVisible ? (
-        <FirstRunOnboarding onFinish={() => void finishOnboarding()} />
       ) : (
         <AyTalkMainApp />
       )}

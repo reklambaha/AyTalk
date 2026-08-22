@@ -24,7 +24,6 @@ import {
   AudioSession,
   isTrackReference,
   LiveKitRoom,
-  RoomAudioRenderer,
   TrackReferenceOrPlaceholder,
   useLocalParticipant,
   useRoomContext,
@@ -37,7 +36,6 @@ import Tts from "react-native-tts";
 import Sound from "react-native-sound";
 import Contacts from "react-native-contacts";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import messaging from "@react-native-firebase/messaging";
 import {SafeAreaView as SafeAreaViewSafe} from "react-native-safe-area-context";
 import RNFS from "react-native-fs";
 import RNShare from "react-native-share";
@@ -59,27 +57,9 @@ import {
   getLiveKitCredentials,
   LiveKitCredentials,
 } from "../../../services/livekitApi";
-import {SERVER_URL, getApiAuthHeaders, getApiJsonHeaders} from "../../../services/api";
+import {fetchJson} from "../../../services/api";
 import CallControlIcon from "../components/CallControlIcon";
 import {prepareSpeech} from "../../language-engine";
-
-
-const getSafeFcmToken = async (): Promise<string> => {
-  if (Platform.OS !== "android") return "";
-
-  try {
-    // google-services.json / Firebase native init henüz yoksa
-    // messaging() senkron olarak hata atabilir. Profil kaydını bunun yüzünden
-    // asla engellememeliyiz; FCM token daha sonra güncellenebilir.
-    const firebaseMessaging = messaging();
-    const token = await firebaseMessaging.getToken();
-    return String(token || "").trim();
-  } catch (error) {
-    console.warn("AyTalk FCM token alınamadı; profil FCM olmadan kaydedilecek:", error);
-    return "";
-  }
-};
-
 
 type RemoteCallScreenProps = {
   visible: boolean;
@@ -383,6 +363,7 @@ function RoomView({
   participantName,
   callMode,
   bridgeDistance,
+  remoteVoiceGender,
   onChangeSourceLanguage,
   onChangeTargetLanguage,
 }: {
@@ -396,14 +377,13 @@ function RoomView({
     firstCountry: string;
     secondCountry: string;
   } | null;
+  remoteVoiceGender: "male" | "female";
   onChangeSourceLanguage: (language: CallLanguage) => void;
   onChangeTargetLanguage: (language: CallLanguage) => void;
 }) {
   useKeepAwake();
 
-  const tracks = useTracks([
-    {source: Track.Source.Camera, withPlaceholder: true},
-  ]);
+  const tracks = useTracks([Track.Source.Camera]);
   const {localParticipant} = useLocalParticipant();
   const room = useRoomContext();
   const {height, width} = useWindowDimensions();
@@ -622,156 +602,82 @@ function RoomView({
     };
   }, []);
 
-  const playCloudTranslation = async (
-    text: string,
-    languageName: string,
-    gender: "male" | "female",
-  ) => {
-    const response = await fetch(`${SERVER_URL}/tts`, {
-      method: "POST",
-      headers: getApiJsonHeaders(),
-      body: JSON.stringify({text, language: languageName, gender}),
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data?.error || "Bulut seslendirme başarısız.");
-    }
-
+  const playCloudTranslation = async (text: string, languageName: string, gender: "male" | "female") => {
+    const data = await fetchJson<{audioBase64?: string}>(
+      "/tts",
+      {
+        method: "POST",
+        body: JSON.stringify({text, language: languageName, gender}),
+      },
+      12000,
+    );
     const audioBase64 = String(data?.audioBase64 || "");
     if (!audioBase64) throw new Error("Bulut sesi boş döndü.");
-
-    const filePath =
-      `${RNFS.CachesDirectoryPath}/livebridge-tts-${Date.now()}-${Math.random()
-        .toString(36)
-        .slice(2, 6)}.mp3`;
-
+    const filePath = `${RNFS.CachesDirectoryPath}/livebridge-tts-${Date.now()}.mp3`;
     await RNFS.writeFile(filePath, audioBase64, "base64");
-
-    try {
-      Sound.setCategory?.("Playback");
-      if (AyAudioRoute) {
-        await AyAudioRoute.setSpeakerEnabled(true);
-      }
-
-      await new Promise<void>((resolve, reject) => {
-        const sound = new Sound(filePath, "", error => {
-          if (error) {
-            reject(error);
-            return;
-          }
-
-          sound.setVolume(1);
-          sound.setNumberOfLoops(0);
-          sound.play(ok => {
-            try {
-              sound.release();
-            } catch {}
-            ok ? resolve() : reject(new Error("Ses oynatılamadı."));
-          });
+    await new Promise<void>((resolve, reject) => {
+      const sound = new Sound(filePath, "", error => {
+        if (error) return reject(error);
+        sound.setVolume(1);
+        sound.play(ok => {
+          sound.release();
+          void RNFS.unlink(filePath).catch(() => undefined);
+          ok ? resolve() : reject(new Error("Ses oynatılamadı."));
         });
       });
-    } finally {
-      void RNFS.unlink(filePath).catch(() => undefined);
-    }
+    });
   };
 
   const speakTranslation = async (translated: string, locale: string) => {
     if (!voiceTranslationEnabled || !translated.trim()) return;
-
-    const languageName =
-      CALL_LANGUAGES.find(item => item.locale === locale)?.name || locale;
-    const remoteGender: "male" | "female" =
-      outgoingCall?.calleeGender || incomingCall?.callerGender || "female";
-
-    const voices = await Tts.voices().catch(() => []);
-    const prepared = prepareSpeech({text: translated, locale, voices});
-
+    const languageName = CALL_LANGUAGES.find(item => item.locale === locale)?.name || locale;
+    const remoteGender: "male" | "female" = remoteVoiceGender;
     try {
       await Tts.stop();
-      await playCloudTranslation(
-        prepared.speechText,
-        languageName,
-        remoteGender,
-      );
-      return;
-    } catch (cloudError) {
-      console.log("LiveBridge cloud TTS fallback:", cloudError);
-    }
-
-    try {
-      if (prepared.selectedVoiceId) {
-        await Tts.setDefaultVoice(prepared.selectedVoiceId);
-      } else {
-        await Tts.setDefaultLanguage(prepared.selectedLocale);
+      const voices = await Tts.voices();
+      const prepared = prepareSpeech({text: translated, locale, voices});
+      if (!prepared.hasCompatibleLocalVoice) {
+        await playCloudTranslation(prepared.speechText, languageName, remoteGender);
+        return;
       }
-      await Tts.setDefaultRate(0.48);
-      await Tts.setDefaultPitch(remoteGender === "male" ? 0.92 : 1.04);
+      if (prepared.selectedVoiceId) await Tts.setDefaultVoice(prepared.selectedVoiceId);
+      else await Tts.setDefaultLanguage(prepared.selectedLocale);
       await Tts.speak(prepared.speechText, {
-        iosVoiceId: prepared.selectedVoiceId || "",
-        rate: 0.48,
-        androidParams: {
-          KEY_PARAM_PAN: 0,
-          KEY_PARAM_VOLUME: 1.0,
-          KEY_PARAM_STREAM: "STREAM_MUSIC",
-        },
+        iosVoiceId: prepared.selectedVoiceId || "", rate: 0.48,
+        androidParams: {KEY_PARAM_PAN:0, KEY_PARAM_VOLUME:1.0, KEY_PARAM_STREAM:"STREAM_MUSIC"},
       });
-    } catch (deviceTtsError) {
-      Alert.alert(
-        "Seslendirme",
-        deviceTtsError instanceof Error
-          ? deviceTtsError.message
-          : "Çeviri sesi oynatılamadı.",
-      );
+    } catch {
+      try {
+        const prepared = prepareSpeech({text: translated, locale, voices: []});
+        await playCloudTranslation(prepared.speechText, languageName, remoteGender);
+      } catch {}
     }
   };
 
   useEffect(() => {
     let cancelled = false;
 
-    const startLocalMedia = async () => {
+    const configureAudioRoute = async () => {
       try {
-        await localParticipant.setMicrophoneEnabled(true, {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          channelCount: 1,
-          sampleRate: 48000,
-        });
-        if (callMode === "video") {
-          await localParticipant.setCameraEnabled(true);
-        }
-
-        if (AyAudioRoute) {
+        if (callMode !== "chat" && AyAudioRoute) {
           await AyAudioRoute.setSpeakerEnabled(true);
         }
-
         if (!cancelled) {
-          setMicrophoneEnabled(true);
-          setSpeakerEnabled(true);
+          setMicrophoneEnabled(callMode !== "chat");
+          setSpeakerEnabled(callMode !== "chat");
           setCameraEnabled(callMode === "video");
           setVideoConversationEnabled(callMode === "video");
         }
-      } catch (mediaError) {
-        if (!cancelled) {
-          Alert.alert(
-            "Kamera/Mikrofon başlatılamadı",
-            mediaError instanceof Error
-              ? mediaError.message
-              : "Yerel kamera ve mikrofon açılamadı.",
-          );
-        }
+      } catch (routeError) {
+        console.warn("LiveBridge audio route:", routeError);
       }
     };
 
-    const startupTimer = setTimeout(() => {
-      void startLocalMedia();
-    }, 350);
-
+    void configureAudioRoute();
     return () => {
       cancelled = true;
-      clearTimeout(startupTimer);
     };
-  }, [callMode, localParticipant]);
+  }, [callMode]);
 
   useEffect(() => {
     const handleDataReceived = (
@@ -819,22 +725,6 @@ function RoomView({
     };
   }, [room, voiceTranslationEnabled, targetLanguage.locale]);
 
-  useEffect(() => {
-    const handleRemoteAudioTrack = () => {
-      if (AyAudioRoute && speakerEnabled) {
-        void AyAudioRoute.setSpeakerEnabled(true).catch(() => undefined);
-      }
-    };
-
-    room.on(RoomEvent.TrackSubscribed, handleRemoteAudioTrack);
-    room.on(RoomEvent.ParticipantConnected, handleRemoteAudioTrack);
-
-    return () => {
-      room.off(RoomEvent.TrackSubscribed, handleRemoteAudioTrack);
-      room.off(RoomEvent.ParticipantConnected, handleRemoteAudioTrack);
-    };
-  }, [room, speakerEnabled]);
-
   const restoreCallMicrophone = async () => {
     try {
       if (microphoneWasEnabledRef.current) {
@@ -846,8 +736,6 @@ function RoomView({
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
-          channelCount: 1,
-          sampleRate: 48000,
         });
         setMicrophoneEnabled(true);
       }
@@ -891,34 +779,26 @@ function RoomView({
     setLocalTranslated("");
 
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 30000);
-
-      const response = await fetch(`${SERVER_URL}/call/translate`, {
-        method: "POST",
-        headers: getApiJsonHeaders(),
-        body: JSON.stringify({
-          message: cleanText,
-          from: sourceLanguage.name,
-          to: targetLanguage.name,
-          profanityMode,
-          context: translationHistory
-            .slice(-8)
-            .map(entry => ({
-              role: entry.side === "local" ? "speaker" : "other",
-              source: entry.original,
-              translation: entry.translated,
-            })),
-        }),
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeout);
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data?.error || "Çeviri sunucusu hata verdi.");
-      }
+      const data = await fetchJson<{reply?: string}>(
+        "/call/translate",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            message: cleanText,
+            from: sourceLanguage.name,
+            to: targetLanguage.name,
+            profanityMode,
+            context: translationHistory
+              .slice(-8)
+              .map(entry => ({
+                role: entry.side === "local" ? "speaker" : "other",
+                source: entry.original,
+                translation: entry.translated,
+              })),
+          }),
+        },
+        15000,
+      );
 
       const translated = String(data?.reply || "").trim();
       if (!translated) {
@@ -987,9 +867,6 @@ function RoomView({
       const microphoneTrack = microphonePublication?.track;
 
       if (microphoneTrack && microphoneWasEnabledRef.current) {
-        // Çeviri kaydı sırasında LiveKit odasını kapatma.
-        // Track'i odadan geçici çıkar ama nesneyi destroy etme;
-        // çeviri bittiğinde mikrofon güvenli biçimde yeniden yayınlanabilir.
         await localParticipant.unpublishTrack(
           microphoneTrack,
           true,
@@ -1003,7 +880,7 @@ function RoomView({
 
       setTranslationListening(true);
 
-      const captured = await AySpeech.capture(12000);
+      const captured = await AySpeech.capture(9000);
       setTranslationListening(false);
 
       const audioBase64 = String(
@@ -1014,35 +891,19 @@ function RoomView({
         throw new Error("Ses kaydı boş geldi.");
       }
 
-      const controller = new AbortController();
-      const timeout = setTimeout(
-        () => controller.abort(),
-        30000,
-      );
-
-      const response = await fetch(
-        `${SERVER_URL}/audio/transcribe`,
+      const data = await fetchJson<{text?: string}>(
+        "/audio/transcribe",
         {
           method: "POST",
-          headers: getApiJsonHeaders(),
           body: JSON.stringify({
             audioBase64,
             language: sourceLanguage.locale
               .split("-")[0]
               .toLowerCase(),
           }),
-          signal: controller.signal,
         },
+        15000,
       );
-
-      clearTimeout(timeout);
-
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(
-          data?.error || "Ses yazıya çevrilemedi.",
-        );
-      }
 
       const recognized = String(
         data?.text || "",
@@ -1089,8 +950,6 @@ function RoomView({
               echoCancellation: true,
               noiseSuppression: true,
               autoGainControl: true,
-              channelCount: 1,
-              sampleRate: 48000,
             }
           : undefined,
       );
@@ -1706,7 +1565,6 @@ function RoomView({
 
   return (
     <SafeAreaViewSafe style={styles.roomContainer}>
-      <RoomAudioRenderer />
       <View style={styles.callStage}>
         {renderRemoteVideo()}
 
@@ -1972,13 +1830,6 @@ function RoomView({
               </Text>
             ) : null}
           </View>
-
-          <TouchableOpacity
-            style={styles.bottomFileButton}
-            onPress={() => setAttachmentMenuVisible(true)}>
-            <CallControlIcon name="more" size={21} />
-            <Text style={styles.bottomFileText}>Dosya</Text>
-          </TouchableOpacity>
 
           <TouchableOpacity style={styles.bottomHangupButton} onPress={onLeave}>
             <CallControlIcon name="hangup" size={31} danger />
@@ -2340,6 +2191,8 @@ export default function RemoteCallScreen({
   const [directoryLoading, setDirectoryLoading] = useState(false);
   const [incomingCall, setIncomingCall] = useState<LiveBridgeIncomingCall | null>(null);
   const [outgoingCall, setOutgoingCall] = useState<LiveBridgeOutgoingCall | null>(null);
+  const [activeRemoteVoiceGender, setActiveRemoteVoiceGender] =
+    useState<"male" | "female">("female");
   const [activeCallMode, setActiveCallMode] = useState<LiveBridgeCallMode>("video");
   const [contactsPermissionDenied, setContactsPermissionDenied] = useState(false);
   const [selectedDirectoryUser, setSelectedDirectoryUser] =
@@ -2426,12 +2279,9 @@ export default function RemoteCallScreen({
   }, [visible]);
 
   useEffect(() => {
-    if (credentials) return;
-
-    return () => {
-      void AudioSession.stopAudioSession();
-    };
-  }, [credentials]);
+    if (visible) return;
+    void AudioSession.stopAudioSession();
+  }, [visible]);
 
   const registerDirectoryProfile = useCallback(async (phoneOverride?: string) => {
     const cleanPhone = normalizeLiveBridgePhone(phoneOverride ?? directoryPhone);
@@ -2440,29 +2290,29 @@ export default function RemoteCallScreen({
       return false;
     }
     try {
-      const response = await fetch(`${SERVER_URL}/livebridge/profile/register`, {
-        method: "POST",
-        headers: getApiJsonHeaders(),
-        body: JSON.stringify({
-          phone: cleanPhone,
-          phoneKeys: liveBridgePhoneKeys(cleanPhone),
-          name: name.trim() || "LiveBridge Kullanıcısı",
-          language: sourceCallLanguage.name,
-          gender: voiceGender,
-          fcmToken: await getSafeFcmToken(),
-        }),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data?.error || "LiveBridge kaydı yapılamadı.");
+      const data = await fetchJson<{user?: unknown}>(
+        "/livebridge/profile/register",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            phone: cleanPhone,
+            phoneKeys: liveBridgePhoneKeys(cleanPhone),
+            name: name.trim() || "LiveBridge Kullanıcısı",
+            language: sourceCallLanguage.name,
+            gender: voiceGender,
+          }),
+        },
+        12000,
+      );
       setDirectoryPhone(cleanPhone);
       setDirectoryProfileReady(true);
       await AsyncStorage.setItem(LIVEBRIDGE_PROFILE_KEY, JSON.stringify({phone: cleanPhone, gender: voiceGender}));
       return true;
     } catch (error) {
-      Alert.alert("LiveBridge kayıt hatası", error instanceof Error ? error.message : "Profil kaydedilemedi. İnternet bağlantısını kontrol edip tekrar dene.");
+      Alert.alert("LiveBridge kayıt hatası", error instanceof Error ? error.message : "Profil kaydedilemedi.");
       return false;
     }
-  }, [directoryPhone, name, sourceCallLanguage.name, voiceGender]);
+  }, [directoryPhone, name, sourceCallLanguage.name]);
 
   const syncLiveBridgeContacts = useCallback(async () => {
     if (!directoryProfileReady || !directoryPhone) return;
@@ -2496,13 +2346,17 @@ export default function RemoteCallScreen({
       const deduped = Array.from(new Map(
         raw.filter(item => item.phone.length >= 7).map(item => [item.phone, item]),
       ).values());
-      const response = await fetch(`${SERVER_URL}/livebridge/contacts/match`, {
-        method: "POST",
-        headers: getApiJsonHeaders(),
-        body: JSON.stringify({ownerPhone: directoryPhone, contacts: deduped.slice(0, 3000)}),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data?.error || "Kişiler eşleştirilemedi.");
+      const data = await fetchJson<{users?: LiveBridgeDirectoryUser[]}>(
+        "/livebridge/contacts/match",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            ownerPhone: directoryPhone,
+            contacts: deduped.slice(0, 3000),
+          }),
+        },
+        15000,
+      );
       setDirectoryUsers(Array.isArray(data?.users) ? data.users : []);
     } catch (error) {
       Alert.alert("Kişiler yüklenemedi", error instanceof Error ? error.message : "Telefon rehberi okunamadı.");
@@ -2553,18 +2407,20 @@ export default function RemoteCallScreen({
     if (!visible || !directoryProfileReady || !directoryPhone) return;
     const heartbeat = async () => {
       try {
-        await fetch(`${SERVER_URL}/livebridge/presence`, {
-          method: "POST",
-          headers: getApiJsonHeaders(),
-          body: JSON.stringify({
-            phone: directoryPhone,
-            phoneKeys: liveBridgePhoneKeys(directoryPhone),
-            name: name.trim() || "LiveBridge Kullanıcısı",
-            language: sourceCallLanguage.name,
-            gender: voiceGender,
-            fcmToken: await getSafeFcmToken(),
-          }),
-        });
+        await fetchJson(
+          "/livebridge/presence",
+          {
+            method: "POST",
+            body: JSON.stringify({
+              phone: directoryPhone,
+              phoneKeys: liveBridgePhoneKeys(directoryPhone),
+              name: name.trim() || "LiveBridge Kullanıcısı",
+              language: sourceCallLanguage.name,
+              gender: voiceGender,
+            }),
+          },
+          8000,
+        );
       } catch {}
     };
     void heartbeat();
@@ -2573,19 +2429,22 @@ export default function RemoteCallScreen({
   }, [directoryPhone, directoryProfileReady, name, sourceCallLanguage.name, visible]);
 
   useEffect(() => {
-    if (!visible || !directoryProfileReady || !directoryPhone || credentials) return;
+    if (!visible || !directoryProfileReady || !directoryPhone || credentials || outgoingCall) return;
     let cancelled = false;
     const poll = async () => {
       try {
-        const response = await fetch(`${SERVER_URL}/livebridge/call/incoming?phone=${encodeURIComponent(directoryPhone)}`, {headers: getApiAuthHeaders()});
-        const data = await response.json();
-        if (!cancelled && response.ok) setIncomingCall(data?.call || null);
+        const data = await fetchJson<{call?: LiveBridgeIncomingCall | null}>(
+          `/livebridge/call/incoming?phone=${encodeURIComponent(directoryPhone)}`,
+          {method: "GET"},
+          8000,
+        );
+        if (!cancelled) setIncomingCall(data?.call || null);
       } catch {}
     };
     void poll();
     const timer = setInterval(() => void poll(), 1800);
     return () => { cancelled = true; clearInterval(timer); };
-  }, [credentials, directoryPhone, directoryProfileReady, visible]);
+  }, [credentials, directoryPhone, directoryProfileReady, outgoingCall, visible]);
 
   const participantIdentity = useMemo(
     () =>
@@ -2765,17 +2624,17 @@ export default function RemoteCallScreen({
       setRoomCode(cleanRoom);
       const permissionsGranted = await requestCallPermissions(mode);
       if (!permissionsGranted) return;
+      const result = await getLiveKitCredentials({
+        roomName: cleanRoom,
+        participantIdentity,
+        participantName: cleanName,
+      });
       if (mode !== "chat") {
         await AudioSession.startAudioSession();
         if (AyAudioRoute) {
           await AyAudioRoute.setSpeakerEnabled(true);
         }
       }
-      const result = await getLiveKitCredentials({
-        roomName: cleanRoom,
-        participantIdentity,
-        participantName: cleanName,
-      });
       setConnectionStatus("connecting");
       setCredentials(result);
     } catch (error) {
@@ -2799,18 +2658,20 @@ export default function RemoteCallScreen({
       return;
     }
     try {
-      const response = await fetch(`${SERVER_URL}/livebridge/call/start`, {
-        method: "POST",
-        headers: getApiJsonHeaders(),
-        body: JSON.stringify({
-          callerPhone: directoryPhone,
-          callerName: name.trim() || "LiveBridge Kullanıcısı",
-          calleePhone: user.phone,
-          mode,
-        }),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data?.error || "Arama başlatılamadı.");
+      const data = await fetchJson<{call: LiveBridgeIncomingCall & {calleeGender?: "male" | "female"}}>(
+        "/livebridge/call/start",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            callerPhone: directoryPhone,
+            callerName: name.trim() || "LiveBridge Kullanıcısı",
+            calleePhone: user.phone,
+            mode,
+          }),
+        },
+        10000,
+      );
+      setActiveRemoteVoiceGender(data.call.calleeGender === "male" ? "male" : "female");
       setOutgoingCall({
         id: data.call.id,
         roomName: data.call.roomName,
@@ -2830,14 +2691,22 @@ export default function RemoteCallScreen({
     const current = incomingCall;
     setIncomingCall(null);
     try {
-      const response = await fetch(`${SERVER_URL}/livebridge/call/respond`, {
-        method: "POST",
-        headers: getApiJsonHeaders(),
-        body: JSON.stringify({callId: current.id, calleePhone: directoryPhone, accepted}),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data?.error || "Arama yanıtlanamadı.");
-      if (accepted) await connectToRoom(current.roomName, current.mode);
+      await fetchJson(
+        "/livebridge/call/respond",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            callId: current.id,
+            calleePhone: directoryPhone,
+            accepted,
+          }),
+        },
+        10000,
+      );
+      if (accepted) {
+        setActiveRemoteVoiceGender(current.callerGender === "male" ? "male" : "female");
+        await connectToRoom(current.roomName, current.mode);
+      }
     } catch (error) {
       Alert.alert("Gelen arama", error instanceof Error ? error.message : "Arama yanıtlanamadı.");
     }
@@ -2849,9 +2718,12 @@ export default function RemoteCallScreen({
     let cancelled = false;
     const poll = async () => {
       try {
-        const response = await fetch(`${SERVER_URL}/livebridge/call/status/${encodeURIComponent(outgoingCall.id)}`, {headers: getApiAuthHeaders()});
-        const data = await response.json();
-        if (!response.ok || cancelled) return;
+        const data = await fetchJson<{call?: LiveBridgeOutgoingCall}>(
+          `/livebridge/call/status/${encodeURIComponent(outgoingCall.id)}`,
+          {method: "GET"},
+          8000,
+        );
+        if (cancelled) return;
         const status = data?.call?.status;
         if (status === "accepted") {
           const accepted = outgoingCall;
@@ -2865,7 +2737,7 @@ export default function RemoteCallScreen({
       } catch {}
     };
     void poll();
-    const timer = setInterval(() => void poll(), 1000);
+    const timer = setInterval(() => void poll(), 1500);
     return () => { cancelled = true; clearInterval(timer); };
   }, [credentials, outgoingCall]);
 
@@ -2900,16 +2772,13 @@ export default function RemoteCallScreen({
               echoCancellation: true,
               noiseSuppression: true,
               autoGainControl: true,
-              channelCount: 1,
-              sampleRate: 48000,
             },
             publishDefaults: {
-              // Konuşma için müzik preset'i yerine speech preset'i kullan.
               audioPreset: AudioPresets.speech,
               dtx: true,
               red: true,
               forceStereo: false,
-              stopMicTrackOnMute: true,
+              stopMicTrackOnMute: false,
             },
           }}
           onConnected={() => {
@@ -2921,10 +2790,11 @@ export default function RemoteCallScreen({
               roomError instanceof Error
                 ? roomError.message
                 : "LiveKit bağlantı hatası.";
-            // Geçici mikrofon/medya hatasında görüşme ekranını zorla kapatma.
-            // Gerçek bağlantı kopması onDisconnected tarafından yönetilir.
             setError(message);
-            Alert.alert("Görüşme bağlantı uyarısı", message);
+            setConnectionStatus("idle");
+            setCredentials(null);
+            void AudioSession.stopAudioSession();
+            Alert.alert("Görüşme bağlantı hatası", message);
           }}
           onMediaDeviceFailure={failure => {
             const message = `Medya aygıtı hatası: ${String(
@@ -2945,6 +2815,7 @@ export default function RemoteCallScreen({
             participantName={name.trim() || "LiveBridge Kullanıcısı"}
             callMode={activeCallMode}
             bridgeDistance={activeBridgeDistance}
+            remoteVoiceGender={activeRemoteVoiceGender}
             onChangeSourceLanguage={language => {
               const index = CALL_LANGUAGES.findIndex(
                 item => item.locale === language.locale,
@@ -4869,24 +4740,7 @@ const styles = StyleSheet.create({
     borderColor: "#1C2432",
   },
   bottomStatusBlock: {
-    minWidth: 76,
-  },
-  bottomFileButton: {
-    minWidth: 48,
-    height: 42,
-    borderRadius: 15,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "rgba(31,167,255,0.12)",
-    borderWidth: 1,
-    borderColor: "rgba(75,198,255,0.34)",
-    paddingHorizontal: 8,
-  },
-  bottomFileText: {
-    color: "#73CFFF",
-    fontSize: 8,
-    fontWeight: "900",
-    marginTop: 1,
+    minWidth: 88,
   },
   bottomStatusLabel: {
     color: "#DDE5EF",

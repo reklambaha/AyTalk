@@ -30,10 +30,11 @@ class AySpeechModule(
     private const val AUDIO_FORMAT =
       AudioFormat.ENCODING_PCM_16BIT
 
-    private const val SPEECH_THRESHOLD = 320
-    private const val SILENCE_AFTER_SPEECH_MS = 1150L
+    private const val SPEECH_THRESHOLD = 650
+    private const val SILENCE_AFTER_SPEECH_MS = 800L
     private const val MIN_SPEECH_MS = 350L
-    private const val DEFAULT_MAX_MS = 12000L
+    private const val NO_SPEECH_TIMEOUT_MS = 4500L
+    private const val DEFAULT_MAX_MS = 9000L
   }
 
   private val recording = AtomicBoolean(false)
@@ -148,6 +149,10 @@ class AySpeechModule(
           val now = System.currentTimeMillis()
 
           if (now - startedAt >= requestedMax) {
+            break
+          }
+
+          if (!speechStarted && now - startedAt >= NO_SPEECH_TIMEOUT_MS) {
             break
           }
 

@@ -4,34 +4,27 @@ const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
-const crypto = require("crypto");
 const {Pool} = require("pg");
 const OpenAI = require("openai");
 const {toFile} = require("openai");
 const {AccessToken, AgentDispatchClient} = require("livekit-server-sdk");
-const admin = require("firebase-admin");
 
-let firebaseMessaging = null;
-try {
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (raw) {
-    const serviceAccount = JSON.parse(raw);
-    admin.initializeApp({credential: admin.credential.cert(serviceAccount)});
-    firebaseMessaging = admin.messaging();
-    console.log("Firebase push hazır.");
-  } else {
-    console.warn("FIREBASE_SERVICE_ACCOUNT_JSON yok; kapalı uygulamaya arama push'u gönderilemez.");
-  }
-} catch (error) {
-  console.error("Firebase başlatılamadı:", error.message);
+// Hata takip sistemi (Sentry). SENTRY_DSN tanımlı değilse sessizce devre dışı kalır,
+// hiçbir şeyi bozmaz — sadece hataları uzaktan görme imkanın olmaz.
+const Sentry = require("@sentry/node");
+if (process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    tracesSampleRate: 0.1,
+    environment: process.env.NODE_ENV || "production",
+  });
+  console.log("Sentry hata takibi aktif.");
+} else {
+  console.warn("UYARI: SENTRY_DSN tanımlı değil. Sunucu hataları uzaktan izlenmiyor.");
 }
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-// Render/Cloudflare gibi ters proxy arkasında gerçek istemci IP adresinin
-// rate-limit tarafından doğru görülmesini sağlar.
-app.set("trust proxy", 1);
 
 // Kalıcı veritabanı (Postgres, örn. Supabase/Neon ücretsiz katman).
 // DATABASE_URL tanımlı değilse sunucu yine çalışır ama LiveBridge verisi
@@ -58,13 +51,11 @@ async function initDb() {
       name TEXT NOT NULL,
       language TEXT DEFAULT '',
       gender TEXT NOT NULL DEFAULT 'female',
-      fcm_token TEXT DEFAULT '',
       last_seen BIGINT NOT NULL
     );
   `);
   await dbPool.query(`
     ALTER TABLE livebridge_users ADD COLUMN IF NOT EXISTS gender TEXT NOT NULL DEFAULT 'female';
-    ALTER TABLE livebridge_users ADD COLUMN IF NOT EXISTS fcm_token TEXT DEFAULT '';
   `);
   await dbPool.query(`
     CREATE INDEX IF NOT EXISTS idx_livebridge_users_phone_keys
@@ -91,21 +82,6 @@ async function initDb() {
   await dbPool.query(`
     ALTER TABLE livebridge_calls ADD COLUMN IF NOT EXISTS callee_gender TEXT NOT NULL DEFAULT 'female';
   `);
-  await dbPool.query(`
-    CREATE TABLE IF NOT EXISTS translation_feedback (
-      id TEXT PRIMARY KEY,
-      source_text TEXT NOT NULL,
-      translated_text TEXT NOT NULL,
-      source_language TEXT NOT NULL,
-      target_language TEXT NOT NULL,
-      rating TEXT NOT NULL,
-      created_at BIGINT NOT NULL
-    );
-  `);
-  await dbPool.query(`
-    CREATE INDEX IF NOT EXISTS idx_translation_feedback_languages
-      ON translation_feedback (source_language, target_language, created_at DESC);
-  `);
   console.log("Veritabanı tabloları hazır.");
 }
 
@@ -120,17 +96,10 @@ if (!APP_SHARED_KEY) {
   );
 }
 
-function safeSecretEqual(provided, expected) {
-  const a = Buffer.from(String(provided || ""), "utf8");
-  const b = Buffer.from(String(expected || ""), "utf8");
-  if (a.length !== b.length || a.length === 0) return false;
-  return crypto.timingSafeEqual(a, b);
-}
-
 function requireAppKey(req, res, next) {
-  if (!APP_SHARED_KEY) return next(); // Geçiş dönemi: Render anahtarı eklenene kadar uygulamayı kırma.
+  if (!APP_SHARED_KEY) return next(); // env tanımlı değilse geliştirme modunda izin ver
   const provided = String(req.get("x-app-key") || "").trim();
-  if (!safeSecretEqual(provided, APP_SHARED_KEY)) {
+  if (!provided || provided !== APP_SHARED_KEY) {
     return res.status(401).json({error: "Yetkisiz istek."});
   }
   next();
@@ -157,28 +126,10 @@ const corsOptions = {
 
 const generalLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 120,
+  max: 300, // iki telefon + LiveBridge polling için güvenli üst sınır
   standardHeaders: true,
   legacyHeaders: false,
   message: {error: "Çok fazla istek gönderildi. Lütfen biraz bekleyin."},
-});
-
-// Maliyetli ve hassas uçları ayrıca sınırla. Gerçek zamanlı görüşmeyi
-// boğmayacak kadar geniş, bot/anahtar kötüye kullanımını azaltacak kadar sıkı.
-const aiLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 75,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {error: "Çeviri isteği limiti aşıldı. Kısa süre sonra tekrar deneyin."},
-});
-
-const livekitTokenLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {error: "Çok fazla görüşme oturumu isteği gönderildi."},
 });
 
 // Uzun süre beklemeyi ve gereksiz tekrarları azaltır.
@@ -200,33 +151,10 @@ const translatorDispatchClient =
     : null;
 
 app.disable("x-powered-by");
-app.use(helmet({
-  crossOriginResourcePolicy: {policy: "cross-origin"},
-}));
+app.use(helmet());
 app.use(cors(corsOptions));
-app.use(express.json({limit: "12mb", strict: true}));
-app.use((req, res, next) => {
-  res.setHeader("Cache-Control", "no-store");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("X-Request-ID", crypto.randomUUID());
-  next();
-});
+app.use(express.json({limit: "12mb"}));
 app.use(generalLimiter);
-
-app.use("/livekit/token", livekitTokenLimiter);
-for (const path of [
-  "/chat",
-  "/chat-stream",
-  "/call/translate",
-  "/audio/transcribe",
-  "/tts",
-  "/vision-ocr",
-  "/assistant",
-  "/assistant-stream",
-  "/culture-note",
-]) {
-  app.use(path, aiLimiter);
-}
 
 // Sağlık kontrolü hariç tüm uçlar paylaşımlı anahtar ister.
 app.use((req, res, next) => {
@@ -237,7 +165,6 @@ app.use((req, res, next) => {
 // LiveBridge Contacts Cloud — DATABASE_URL varsa Postgres, yoksa RAM (yedek).
 const liveBridgeUsersMem = new Map();
 const liveBridgeCallsMem = new Map();
-const translationFeedbackMem = [];
 const normalizeLiveBridgePhone = value =>
   String(value || "").replace(/[^0-9]/g, "").slice(0, 18);
 
@@ -281,7 +208,6 @@ function rowToUser(row) {
     name: row.name,
     language: row.language || "",
     gender: row.gender === "male" ? "male" : "female",
-    fcmToken: row.fcm_token || "",
     lastSeen: Number(row.last_seen || 0),
   };
 }
@@ -318,16 +244,15 @@ const liveBridgeStore = {
   async saveUser(user) {
     if (dbPool) {
       await dbPool.query(
-        `INSERT INTO livebridge_users (phone, phone_keys, name, language, gender, fcm_token, last_seen)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `INSERT INTO livebridge_users (phone, phone_keys, name, language, gender, last_seen)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (phone) DO UPDATE SET
            phone_keys = EXCLUDED.phone_keys,
            name = EXCLUDED.name,
            language = EXCLUDED.language,
            gender = EXCLUDED.gender,
-           fcm_token = EXCLUDED.fcm_token,
            last_seen = EXCLUDED.last_seen`,
-        [user.phone, user.phoneKeys, user.name, user.language, user.gender === "male" ? "male" : "female", user.fcmToken || "", user.lastSeen],
+        [user.phone, user.phoneKeys, user.name, user.language, user.gender === "male" ? "male" : "female", user.lastSeen],
       );
       return user;
     }
@@ -348,6 +273,27 @@ const liveBridgeStore = {
       if (userKeys.some(key => requestedKeys.includes(key))) return user;
     }
     return null;
+  },
+
+  async findUsersByPhoneKeys(requestedKeys) {
+    const uniqueKeys = Array.from(new Set(requestedKeys || []))
+      .map(normalizeLiveBridgePhone)
+      .filter(key => key.length >= 8)
+      .slice(0, 12000);
+    if (uniqueKeys.length === 0) return [];
+
+    if (dbPool) {
+      const {rows} = await dbPool.query(
+        "SELECT * FROM livebridge_users WHERE phone_keys && $1::text[]",
+        [uniqueKeys],
+      );
+      return rows.map(rowToUser).filter(Boolean);
+    }
+
+    return Array.from(liveBridgeUsersMem.values()).filter(user => {
+      const userKeys = liveBridgePhoneKeys(user.phone, user.phoneKeys || []);
+      return userKeys.some(key => uniqueKeys.includes(key));
+    });
   },
 
   async saveCall(call) {
@@ -442,7 +388,6 @@ app.post("/livebridge/profile/register", async (req, res) => {
       name,
       language,
       gender,
-      fcmToken: String(req.body?.fcmToken || existing?.fcmToken || "").slice(0, 4096),
       lastSeen: liveBridgeNow(),
     };
     await liveBridgeStore.saveUser(user);
@@ -465,7 +410,6 @@ app.post("/livebridge/presence", async (req, res) => {
       name: String(req.body?.name || old.name || "LiveBridge Kullanıcısı").slice(0, 80),
       language: String(req.body?.language || old.language || "").slice(0, 80),
       gender: req.body?.gender === "male" || req.body?.gender === "female" ? req.body.gender : (old.gender || "female"),
-      fcmToken: String(req.body?.fcmToken || old.fcmToken || "").slice(0, 4096),
       lastSeen: liveBridgeNow(),
     };
     await liveBridgeStore.saveUser(user);
@@ -479,66 +423,54 @@ app.post("/livebridge/presence", async (req, res) => {
 app.post("/livebridge/contacts/match", async (req, res) => {
   try {
     const ownerPhone = normalizeLiveBridgePhone(req.body?.ownerPhone);
-    const contacts = Array.isArray(req.body?.contacts) ? req.body.contacts.slice(0, 3000) : [];
-    const users = [];
-    const seen = new Set();
-    const normalizedContacts = contacts
-      .map(c => ({
-        phone: normalizeLiveBridgePhone(c?.phone),
-        keys: liveBridgePhoneKeys(c?.phone, c?.keys),
-        name: String(c?.name || "").trim(),
-      }))
-      .filter(c => c.phone.length >= 7 && c.phone !== ownerPhone);
+    const contacts = Array.isArray(req.body?.contacts)
+      ? req.body.contacts.slice(0, 3000)
+      : [];
 
-    if (dbPool && normalizedContacts.length > 0) {
-      const allKeys = Array.from(
-        new Set(normalizedContacts.flatMap(c => c.keys)),
-      );
-      const {rows} = await dbPool.query(
-        "SELECT * FROM livebridge_users WHERE phone_keys && $1::text[]",
-        [allKeys],
-      );
-      const matchedUsers = rows.map(rowToUser);
-      const keyToUser = new Map();
-      for (const user of matchedUsers) {
-        for (const key of liveBridgePhoneKeys(user.phone, user.phoneKeys)) {
-          if (!keyToUser.has(key)) keyToUser.set(key, user);
-        }
-      }
+    const prepared = contacts
+      .map(contact => {
+        const phone = normalizeLiveBridgePhone(contact?.phone);
+        return {
+          contact,
+          phone,
+          keys: liveBridgePhoneKeys(phone, contact?.keys),
+        };
+      })
+      .filter(item => item.phone && item.phone !== ownerPhone && item.keys.length > 0);
 
-      for (const c of normalizedContacts) {
-        const r = c.keys.map(key => keyToUser.get(key)).find(Boolean);
-        if (!r) continue;
-        const matchedIdentity = normalizeLiveBridgePhone(r.phone);
-        if (seen.has(matchedIdentity) || matchedIdentity === ownerPhone) continue;
-        seen.add(matchedIdentity);
-        users.push({
-          phone: r.phone,
-          name: String(c.name || r.name || "LiveBridge Kullanıcısı").slice(0, 100),
-          language: r.language || "",
-          gender: r.gender === "male" ? "male" : "female",
-          online: liveBridgeUserOnline(r),
-          lastSeen: r.lastSeen || 0,
-        });
-      }
-    } else {
-      for (const c of normalizedContacts) {
-        const r = await liveBridgeStore.findUserByPhoneKeys(c.keys);
-        if (!r) continue;
-        const matchedIdentity = normalizeLiveBridgePhone(r.phone);
-        if (seen.has(matchedIdentity) || matchedIdentity === ownerPhone) continue;
-        seen.add(matchedIdentity);
-        users.push({
-          phone: r.phone,
-          name: String(c.name || r.name || "LiveBridge Kullanıcısı").slice(0, 100),
-          language: r.language || "",
-          gender: r.gender === "male" ? "male" : "female",
-          online: liveBridgeUserOnline(r),
-          lastSeen: r.lastSeen || 0,
-        });
+    const allKeys = prepared.flatMap(item => item.keys);
+    const registeredUsers = await liveBridgeStore.findUsersByPhoneKeys(allKeys);
+    const userByKey = new Map();
+
+    for (const user of registeredUsers) {
+      for (const key of liveBridgePhoneKeys(user.phone, user.phoneKeys || [])) {
+        if (!userByKey.has(key)) userByKey.set(key, user);
       }
     }
-    users.sort((a, b) => a.online === b.online ? String(a.name).localeCompare(String(b.name), "tr") : (a.online ? -1 : 1));
+
+    const users = [];
+    const seen = new Set();
+    for (const item of prepared) {
+      const matched = item.keys.map(key => userByKey.get(key)).find(Boolean);
+      if (!matched) continue;
+      const identity = normalizeLiveBridgePhone(matched.phone);
+      if (!identity || identity === ownerPhone || seen.has(identity)) continue;
+      seen.add(identity);
+      users.push({
+        phone: matched.phone,
+        name: String(item.contact?.name || matched.name || "LiveBridge Kullanıcısı").slice(0, 100),
+        language: matched.language || "",
+        gender: matched.gender === "male" ? "male" : "female",
+        online: liveBridgeUserOnline(matched),
+        lastSeen: matched.lastSeen || 0,
+      });
+    }
+
+    users.sort((a, b) =>
+      a.online === b.online
+        ? String(a.name).localeCompare(String(b.name), "tr")
+        : a.online ? -1 : 1,
+    );
     res.json({ok: true, users});
   } catch (error) {
     console.error("contacts/match hatası:", error);
@@ -570,20 +502,6 @@ app.post("/livebridge/call/start", async (req, res) => {
       status: "ringing", createdAt: liveBridgeNow(), updatedAt: liveBridgeNow(),
     };
     await liveBridgeStore.saveCall(call);
-    if (firebaseMessaging && calleeUser.fcmToken) {
-      try {
-        await firebaseMessaging.send({
-          token: calleeUser.fcmToken,
-          data: {
-            type: "livebridge_incoming_call", callId: call.id, roomName: call.roomName,
-            callerPhone: call.callerPhone, callerName: call.callerName, mode: call.mode,
-          },
-          android: {priority: "high", ttl: 60000},
-        });
-      } catch (pushError) {
-        console.error("LiveBridge push gönderilemedi:", pushError.message);
-      }
-    }
     res.json({ok: true, call});
   } catch (error) {
     console.error("call/start hatası:", error);
@@ -880,7 +798,7 @@ app.post("/livekit/token", async (req, res) => {
     const accessToken = new AccessToken(apiKey, apiSecret, {
       identity: participantIdentity,
       name: participantName,
-      ttl: "1h",
+      ttl: "2h",
     });
 
     accessToken.addGrant({
@@ -910,7 +828,7 @@ app.post("/livekit/token", async (req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ok: true, service: "LiveBridge", version: "11.1-auth-fix", authConfigured: Boolean(APP_SHARED_KEY)});
+  res.json({authConfigured: Boolean(APP_SHARED_KEY), ok: true, service: "LiveBridge", version: "11.0-realtime-bridge"});
 });
 
 app.get("/livebridge/voice/capabilities", (_req, res) => {
@@ -928,27 +846,6 @@ app.get("/livebridge/voice/capabilities", (_req, res) => {
       : "Demo uses device TTS until eligible custom-voice access is configured.",
   });
 });
-
-function buildTranslationInstructions(from, to, {live = false} = {}) {
-  const livePrefix = live
-    ? "You are LiveBridge, a professional real-time human interpreter. Translate ONLY the CURRENT utterance. "
-    : "You are AyTalk, a high-fidelity real-world translator. ";
-
-  return (
-    livePrefix +
-    `Translate from ${from} to ${to}. ` +
-    "Return only the translation; never answer the speaker, explain, summarize, censor, moralize, or add information. " +
-    "Preserve meaning, ambiguity, uncertainty, negation, names, numbers, dates, units, punctuation, questions, repetitions, hesitations, fillers, profanity and emotional intensity. " +
-    "Do not silently correct factual mistakes made by the speaker. " +
-    "Resolve pronouns and omitted subjects from context only when the context clearly supports it; otherwise preserve the ambiguity. " +
-    "Translate idioms, kinship terms, honorifics and forms of address by their social function, not literal spelling. " +
-    "Never reinterpret an ordinary spoken word as an acronym just because its Latin spelling resembles one. Preserve genuine acronyms, brands and proper names. " +
-    "CRITICAL REGISTER MATCHING: informal, rural, regional, dialectal, slang, broken, non-standard or low-literacy speech must remain equally natural and informal in the target language. " +
-    "Never upgrade everyday speech into formal, literary, bureaucratic or textbook language. Never make the speaker sound more educated, more polite or more precise than they were. " +
-    "For medical, legal and technical vocabulary, use the established target-language term while preserving the speaker's original level of certainty and detail. " +
-    "If the input is incomplete, translate it as incomplete; do not invent the ending."
-  );
-}
 
 // GÖRÜŞME İÇİN BAĞLAMLI VE SIKI ÇEVİRİ
 app.post("/call/translate", async (req, res) => {
@@ -984,28 +881,29 @@ app.post("/call/translate", async (req, res) => {
           .join("\n\n")
       : "No previous context.";
 
-    const requestedProfanityMode = String(req.body?.profanityMode || "direct")
-      .trim()
-      .toLowerCase();
-    const profanityMode = ["direct", "soften", "hide"].includes(requestedProfanityMode)
-      ? requestedProfanityMode
-      : "direct";
-
-    const profanityInstruction =
-      profanityMode === "soften"
-        ? "PROFANITY MODE: SOFTEN. Preserve the speaker's anger, intention and social force, but replace explicit profanity and slurs with natural milder target-language equivalents. Do not make the whole sentence formal or emotionless. "
-        : profanityMode === "hide"
-          ? "PROFANITY MODE: HIDE. Preserve the non-profane meaning and emotional intent, but omit explicit profanity/slurs and use a concise neutral target-language paraphrase where needed. "
-          : "PROFANITY MODE: DIRECT. Translate profanity, insults, slang and emotional intensity directly and naturally. Do not censor, soften, euphemize or moralize. ";
-
     const response = await openai.responses.create({
       model: "gpt-4.1-mini",
       store: false,
       max_output_tokens: Math.min(1200, Math.max(80, Math.ceil(message.length * 1.6))),
       instructions:
-        buildTranslationInstructions(from, to, {live: true}) +
-        " " +
-        profanityInstruction,
+        "You are LiveBridge, a professional real-time human interpreter. " +
+        `Translate ONLY the CURRENT utterance from ${from} to ${to}. ` +
+        "The dialogue history may contain both speakers. Use it only to resolve pronouns, references, names, terminology, register and implied subjects. " +
+        "Do not translate previous turns again. Do not answer either speaker. " +
+        "Never add facts, explanations, summaries, politeness, completions, diagnoses, advice or guesses. " +
+        "Preserve names, numbers, units, dates, negation, uncertainty, question form and professional terminology exactly in meaning. " +
+        "For medical, legal or technical terms, prefer the standard target-language term and do not simplify unless the speaker simplified it. " +
+        "If CURRENT_UTTERANCE is incomplete, translate it as an incomplete fragment rather than inventing the ending. " +
+        "Keep the speaker's tone and level of formality. " +
+        "Translate culturally meaningful kinship terms, honorifics, forms of address, idioms and discourse markers by their FUNCTION and meaning in the current context, not by superficial spelling. " +
+        "A normal spoken word that happens to look like a Latin-letter abbreviation must remain a word; do not reinterpret it as an acronym unless context clearly shows an acronym, company name or initialism. " +
+        "When an address term has a natural target-language equivalent, use that equivalent while preserving relationship, respect and register. " +
+        "Do not transliterate ordinary vocabulary when an established target-language translation exists. Preserve proper names and genuine acronyms. " +
+        "CRITICAL — register matching: the speaker may use informal, rural, regional, dialectal, or uneducated everyday speech, " +
+        "non-standard grammar, slang, or spoken-language shortcuts. Render this in equally informal, everyday spoken language " +
+        "in the target language — the kind an ordinary villager or non-literate speaker would actually use in daily life. " +
+        "NEVER upgrade informal speech into formal, literary, official, or textbook-correct language. Match the register down, not up. " +
+        "Return ONLY the translation of CURRENT_UTTERANCE.",
       input:
         `PREVIOUS_CONTEXT:\n${contextText}\n\n` +
         `CURRENT_UTTERANCE:\n${message}`,
@@ -1022,86 +920,6 @@ app.post("/call/translate", async (req, res) => {
     return res.status(500).json({
       error: error instanceof Error ? error.message : "Görüşme çevirisi başarısız.",
     });
-  }
-});
-
-// KÜLTÜREL KULLANIM NOTU — ana çeviriden ayrı ve isteğe bağlıdır.
-// Böylece normal çeviri hızını ve cevabını bozmaz.
-app.post("/culture-note", async (req, res) => {
-  try {
-    const sourceText = String(req.body?.sourceText || "").trim();
-    const translatedText = String(req.body?.translatedText || "").trim();
-    const from = String(req.body?.from || "").trim();
-    const to = String(req.body?.to || "").trim();
-
-    if (!sourceText || !translatedText || !from || !to) {
-      return res.status(400).json({error: "Kültürel not için çeviri bilgileri eksik."});
-    }
-
-    const response = await openai.responses.create({
-      model: "gpt-4.1-mini",
-      store: false,
-      max_output_tokens: 180,
-      instructions:
-        "You are AyTalk's cultural usage assistant. Assess only practical, real-world communication risk. " +
-        "Do not stereotype countries, religions, ethnicities, genders, or regions. Do not invent rules. " +
-        "If there is no meaningful cultural/register warning, say so briefly. " +
-        "If there is a possible issue, explain it cautiously using words like 'may', 'can', or 'depending on context'. " +
-        "Focus on politeness, formality, forms of address, gestures only if explicitly mentioned, and likely misunderstandings. " +
-        "Reply in Turkish in at most 2 short sentences. Never change the translation itself.",
-      input:
-        `Source language: ${from}\nTarget language: ${to}\n` +
-        `Original: ${sourceText}\nTranslation: ${translatedText}`,
-    });
-
-    const note = String(response.output_text || "").trim();
-    return res.json({note: note || "Bu ifade için belirgin bir kültürel uyarı bulunmadı."});
-  } catch (error) {
-    console.error("Culture note error:", error);
-    return res.status(500).json({error: "Kültürel kullanım notu şu anda alınamadı."});
-  }
-});
-
-// TOPLULUK SÖZLÜĞÜNÜN İLK VERİ KATMANI — iyi/kötü çeviri geri bildirimi.
-// DATABASE_URL varsa kalıcı Postgres'e, yoksa sınırlı RAM yedeğine yazılır.
-app.post("/translation-feedback", async (req, res) => {
-  try {
-    const sourceText = String(req.body?.sourceText || "").trim().slice(0, 12000);
-    const translatedText = String(req.body?.translatedText || "").trim().slice(0, 12000);
-    const from = String(req.body?.from || "").trim().slice(0, 80);
-    const to = String(req.body?.to || "").trim().slice(0, 80);
-    const rating = String(req.body?.rating || "").trim();
-
-    if (!sourceText || !translatedText || !from || !to || !["good", "bad"].includes(rating)) {
-      return res.status(400).json({error: "Geçersiz çeviri geri bildirimi."});
-    }
-
-    const item = {
-      id: `feedback-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-      sourceText,
-      translatedText,
-      from,
-      to,
-      rating,
-      createdAt: Date.now(),
-    };
-
-    if (dbPool) {
-      await dbPool.query(
-        `INSERT INTO translation_feedback
-          (id, source_text, translated_text, source_language, target_language, rating, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [item.id, sourceText, translatedText, from, to, rating, item.createdAt],
-      );
-    } else {
-      translationFeedbackMem.unshift(item);
-      if (translationFeedbackMem.length > 1000) translationFeedbackMem.length = 1000;
-    }
-
-    return res.json({ok: true});
-  } catch (error) {
-    console.error("Translation feedback error:", error);
-    return res.status(500).json({error: "Geri bildirim kaydedilemedi."});
   }
 });
 
@@ -1136,8 +954,20 @@ app.post("/chat", async (req, res) => {
         Math.max(120, Math.ceil(message.length * 1.35))
       ),
 
-      // Tek merkezden yönetilen kalite talimatı; chat ve görüşme aynı anlam koruma kurallarını kullanır.
-      instructions: buildTranslationInstructions(from, to),
+      // Kısa ve doğrudan talimat daha hızlıdır.
+      instructions:
+        `Translate from ${from} to ${to}. ` +
+        "Return only the translation. Preserve meaning exactly. Never answer the speaker and never add information. " +
+        "Translate kinship terms, honorifics, forms of address, idioms and discourse markers by their function in context. " +
+        "A normal word must never be reinterpreted as an acronym only because its Latin spelling resembles one. " +
+        "Preserve genuine acronyms, brands, proper names, numbers, punctuation, paragraphs, tone and question form. " +
+        "Use the natural target-language equivalent for ordinary vocabulary and address terms. " +
+        "CRITICAL — register matching: the speaker may use informal, rural, regional, dialectal, or uneducated everyday speech, " +
+        "non-standard grammar, slang, or spoken-language shortcuts. Render this in equally informal, everyday spoken language " +
+        "in the target language — the kind an ordinary villager or non-literate speaker would actually use in daily life. " +
+        "NEVER upgrade informal speech into formal, literary, official, or textbook-correct language. Match the register down, " +
+        "not up. If the input is broken or ungrammatical because that is how the speaker naturally talks, the translation should " +
+        "sound just as plain and natural — not more polished than the original.",
 
       input: message,
     });
@@ -1208,7 +1038,18 @@ app.post("/chat-stream", async (req, res) => {
         3000,
         Math.max(120, Math.ceil(message.length * 1.35))
       ),
-      instructions: buildTranslationInstructions(from, to),
+      instructions:
+        `Translate from ${from} to ${to}. ` +
+        "Return only the translation. Preserve meaning exactly. Never answer the speaker and never add information. " +
+        "Translate kinship terms, honorifics, forms of address, idioms and discourse markers by their function in context. " +
+        "A normal word must never be reinterpreted as an acronym only because its Latin spelling resembles one. " +
+        "Preserve genuine acronyms, brands, proper names, numbers, punctuation, paragraphs, tone and question form. " +
+        "Use the natural target-language equivalent for ordinary vocabulary and address terms. " +
+        "CRITICAL — register matching: the speaker may use informal, rural, regional, dialectal, or uneducated everyday speech, " +
+        "non-standard grammar, slang, or spoken-language shortcuts. Render this in equally informal, everyday spoken language " +
+        "in the target language — the kind an ordinary villager or non-literate speaker would actually use in daily life. " +
+        "NEVER upgrade informal speech into formal, literary, official, or textbook-correct language. Match the register down, " +
+        "not up.",
       input: message,
     });
 
@@ -1549,50 +1390,23 @@ app.post("/tts", async (req, res) => {
         .toLowerCase();
     const voice = requestedGender === "male" ? "onyx" : "coral";
 
-    const primaryInstructions = language
-      ? `You are a native ${language} speaker recording a warm, natural voice message for a friend. ` +
-        `Speak with the authentic accent, rhythm, and intonation a real native speaker of ${language} would use — not a flat or robotic reading. ` +
-        "Use natural pacing with brief, human-like pauses at commas and sentence breaks. Vary pitch naturally as a person would in casual conversation. " +
-        "Pronounce ordinary words as words, not as letter-by-letter acronyms, unless clearly intended as an acronym."
-      : "Speak naturally and clearly, like a real person in casual conversation, with natural rhythm and pauses. Pronounce ordinary words as words.";
-
-    let speech;
-    let modelUsed = "gpt-4o-mini-tts";
-
-    try {
-      speech = await openai.audio.speech.create({
-        model: "gpt-4o-mini-tts",
-        voice,
-        input: text,
-        response_format: "mp3",
-        instructions: primaryInstructions,
-      });
-    } catch (primaryError) {
-      console.warn("Primary TTS failed, falling back to tts-1:", primaryError);
-      modelUsed = "tts-1";
-      const fallbackVoice = requestedGender === "male" ? "onyx" : "nova";
-      speech = await openai.audio.speech.create({
-        model: "tts-1",
-        voice: fallbackVoice,
-        input: text,
-        response_format: "mp3",
-      });
-    }
+    const speech = await openai.audio.speech.create({
+      model: "gpt-4o-mini-tts",
+      voice,
+      input: text,
+      response_format: "mp3",
+      instructions: language
+        ? `You are a native ${language} speaker recording a warm, natural voice message for a friend. ` +
+          `Speak with the authentic accent, rhythm, and intonation a real native speaker of ${language} would use — not a flat or robotic reading. ` +
+          "Use natural pacing with brief, human-like pauses at commas and sentence breaks. Vary pitch naturally as a person would in casual conversation. " +
+          "Pronounce ordinary words as words, not as letter-by-letter acronyms, unless clearly intended as an acronym."
+        : "Speak naturally and clearly, like a real person in casual conversation, with natural rhythm and pauses. Pronounce ordinary words as words.",
+    });
 
     const buffer = Buffer.from(await speech.arrayBuffer());
 
-    if (!buffer.length) {
-      throw new Error("TTS servisi boş ses verisi döndürdü.");
-    }
-
     return res.json({
       audioBase64: buffer.toString("base64"),
-      mimeType: "audio/mpeg",
-      model: modelUsed,
-      voice: modelUsed === "tts-1"
-        ? (requestedGender === "male" ? "onyx" : "nova")
-        : voice,
-      bytes: buffer.length,
     });
   } catch (error) {
     console.error("TTS error:", error);
@@ -1606,6 +1420,103 @@ app.post("/tts", async (req, res) => {
   }
 });
 
+const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || "destek@aytalk.app";
+
+app.get("/privacy", (_req, res) => {
+  res.set("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AyTalk — Gizlilik Politikası</title>
+<style>
+  body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:720px;margin:0 auto;padding:32px 20px;line-height:1.6;color:#1a1a1a;background:#fff}
+  h1{font-size:26px} h2{font-size:19px;margin-top:32px}
+  p,li{font-size:15px;color:#333}
+  .updated{color:#777;font-size:13px;margin-bottom:24px}
+</style>
+</head>
+<body>
+<h1>AyTalk — Gizlilik Politikası</h1>
+<p class="updated">Son güncelleme: ${new Date().toLocaleDateString("tr-TR", {year:"numeric",month:"long",day:"numeric"})}</p>
+
+<p>AyTalk ("uygulama", "biz"), kullanıcılarının ("siz") gizliliğine önem verir. Bu belge, uygulamayı kullanırken hangi verilerin toplandığını, nasıl kullanıldığını ve haklarınızı açıklar.</p>
+
+<h2>1. Topladığımız Veriler</h2>
+<ul>
+  <li><b>Hesap bilgileri:</b> telefon numarası, görünen ad, tercih edilen dil, ses cinsiyeti tercihi (LiveBridge özelliği için)</li>
+  <li><b>Çeviri verileri:</b> yazılı/sesli çeviri istekleriniz, konuşma tanıma için gönderilen ses kayıtları (kalıcı olarak saklanmaz, sadece işlenip silinir)</li>
+  <li><b>Rehber eşleştirme:</b> LiveBridge özelliğini kullanırken, rehberinizdeki kişilerin telefon numaraları uygulamamızın kullanıcısı olup olmadığını kontrol etmek için sunucumuza gönderilir (isimleriyle birlikte saklanmaz, sadece eşleştirme için kullanılır)</li>
+  <li><b>Görüşme meta verileri:</b> kimin kimi aradığı, görüşme süresi ve durumu (görüşmenin ses/görüntü içeriği kaydedilmez)</li>
+  <li><b>Cihaz izinleri:</b> mikrofon, kamera, kişiler — sadece ilgili özellik kullanılırken erişilir</li>
+</ul>
+
+<h2>2. Verileri Nasıl Kullanıyoruz</h2>
+<ul>
+  <li>Çeviri, konuşma tanıma ve metinden sese dönüştürme hizmetlerini sağlamak için üçüncü taraf yapay zeka servisine (OpenAI) iletilir</li>
+  <li>Sesli/görüntülü görüşmeleri bağlamak için üçüncü taraf altyapı servisine (LiveKit) iletilir</li>
+  <li>LiveBridge kişi eşleştirmesi ve arama geçmişi için veritabanımızda saklanır</li>
+</ul>
+
+<h2>3. Üçüncü Taraflar</h2>
+<p>Verileriniz aşağıdaki hizmet sağlayıcılarla, yalnızca hizmeti sunmak amacıyla paylaşılır: OpenAI (çeviri/ses işleme), LiveKit (görüşme altyapısı), Render (sunucu barındırma), Supabase (veritabanı barındırma). Bu üçüncü taraflara veri satışı yapılmaz.</p>
+
+<h2>4. Veri Saklama</h2>
+<p>Ses kayıtları işlendikten hemen sonra silinir. LiveBridge profil bilgileri ve arama geçmişi, hesabınızı silene kadar saklanır.</p>
+
+<h2>5. Haklarınız</h2>
+<p>Verilerinizin silinmesini istediğinizde bizimle iletişime geçebilirsiniz. Uygulamayı kaldırmak, cihazınızdaki yerel verileri siler; sunucudaki hesap verilerinizin silinmesi için ayrıca talep etmeniz gerekir.</p>
+
+<h2>6. İletişim</h2>
+<p>Sorularınız için: <b>${SUPPORT_EMAIL}</b></p>
+
+</body>
+</html>`);
+});
+
+app.get("/terms", (_req, res) => {
+  res.set("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AyTalk — Kullanım Şartları</title>
+<style>
+  body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:720px;margin:0 auto;padding:32px 20px;line-height:1.6;color:#1a1a1a;background:#fff}
+  h1{font-size:26px} h2{font-size:19px;margin-top:32px}
+  p,li{font-size:15px;color:#333}
+  .updated{color:#777;font-size:13px;margin-bottom:24px}
+</style>
+</head>
+<body>
+<h1>AyTalk — Kullanım Şartları</h1>
+<p class="updated">Son güncelleme: ${new Date().toLocaleDateString("tr-TR", {year:"numeric",month:"long",day:"numeric"})}</p>
+
+<h2>1. Kabul</h2>
+<p>AyTalk'ı kullanarak bu şartları kabul etmiş olursunuz.</p>
+
+<h2>2. Hizmetin Tanımı</h2>
+<p>AyTalk, yapay zeka destekli yazılı/sesli/görüntülü çeviri ve LiveBridge adlı çevirili görüşme özelliği sunar.</p>
+
+<h2>3. Kullanıcı Sorumlulukları</h2>
+<ul>
+  <li>Uygulamayı yasa dışı amaçlarla kullanamazsınız</li>
+  <li>Başka kullanıcıları taciz, tehdit veya dolandırma amacıyla kullanamazsınız</li>
+  <li>Hesap bilgilerinizin güvenliğinden siz sorumlusunuz</li>
+</ul>
+
+<h2>4. Sorumluluk Sınırlaması</h2>
+<p>Çeviriler yapay zeka tarafından üretilir ve %100 doğruluk garanti edilmez. Tıbbi, hukuki veya acil durumlarda profesyonel/resmi çeviri hizmetlerine başvurulması önerilir.</p>
+
+<h2>5. İletişim</h2>
+<p>Sorularınız için: <b>${SUPPORT_EMAIL}</b></p>
+
+</body>
+</html>`);
+});
+
 // Tanımsız uç noktalar için 404.
 app.use((req, res) => {
   res.status(404).json({error: "Uç nokta bulunamadı."});
@@ -1615,6 +1526,7 @@ app.use((req, res) => {
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   console.error("Beklenmeyen sunucu hatası:", err);
+  if (process.env.SENTRY_DSN) Sentry.captureException(err);
   if (res.headersSent) return;
   res.status(err.message?.startsWith("CORS") ? 403 : 500).json({
     error: err.message?.startsWith("CORS")
@@ -1626,10 +1538,12 @@ app.use((err, req, res, next) => {
 // Beklenmeyen hatalarda sunucunun sessizce çökmesini önler, en azından loglar.
 process.on("uncaughtException", err => {
   console.error("YAKALANMAMIŞ İSTİSNA:", err);
+  if (process.env.SENTRY_DSN) Sentry.captureException(err);
 });
 
 process.on("unhandledRejection", reason => {
   console.error("İŞLENMEMİŞ PROMISE REDDİ:", reason);
+  if (process.env.SENTRY_DSN) Sentry.captureException(reason);
 });
 
 initDb()
