@@ -1726,7 +1726,9 @@ function AyTalkMainApp() {
         if (conversationMode && appMode === "translate") {
           setSourceLanguage(targetAtRequest);
           setTargetLanguage(sourceAtRequest);
-          setText("");
+          // Fallback endpoint kullanılsa bile az önce algılanan kaynak metni
+          // ekranda koru. Yalnızca sıradaki konuşmacı için dilleri değiştir.
+          setText(cleanText);
           accumulatedTextRef.current = "";
           latestPartialRef.current = "";
         }
