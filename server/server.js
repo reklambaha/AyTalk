@@ -11,14 +11,8 @@ const {AccessToken, AgentDispatchClient} = require("livekit-server-sdk");
 
 // Hata takip sistemi (Sentry). SENTRY_DSN tanımlı değilse sessizce devre dışı kalır,
 // hiçbir şeyi bozmaz — sadece hataları uzaktan görme imkanın olmaz.
-const Sentry = require("@sentry/node");
 if (process.env.SENTRY_DSN) {
-  Sentry.init({
-    dsn: process.env.SENTRY_DSN,
-    tracesSampleRate: 0.1,
-    environment: process.env.NODE_ENV || "production",
-  });
-  console.log("Sentry hata takibi aktif.");
+console.log("Sentry hata takibi aktif.");
 } else {
   console.warn("UYARI: SENTRY_DSN tanımlı değil. Sunucu hataları uzaktan izlenmiyor.");
 }
