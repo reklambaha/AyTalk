@@ -160,6 +160,7 @@ function AyTalkMainApp() {
   const [conferenceNameDraft, setConferenceNameDraft] = useState("");
   const [conferenceAutoTurnEnabled, setConferenceAutoTurnEnabled] = useState(true);
   const [conferenceAutoMicEnabled, setConferenceAutoMicEnabled] = useState(true);
+  const [conferenceAutoDetectLanguage, setConferenceAutoDetectLanguage] = useState(true);
   const [conferenceRoundRobinEnabled, setConferenceRoundRobinEnabled] = useState(true);
   const [voicePace, setVoicePace] = useState<VoicePace>("normal");
   const [text, setText] = useState("");
@@ -324,7 +325,9 @@ function AyTalkMainApp() {
 
     setActiveConferenceParticipantId(nextSpeaker.id);
     setConferenceListenerParticipantId(listener.id);
-    setSourceLanguage(nextSpeaker.language);
+    if (!conferenceAutoDetectLanguage) {
+      setSourceLanguage(nextSpeaker.language);
+    }
     setTargetLanguage(listener.language);
     setResultLanguage(listener.language);
     setText("");
@@ -352,7 +355,10 @@ function AyTalkMainApp() {
       listeningStartedAtRef.current = Date.now();
       setIsListening(true);
 
-      const recognizedText = await captureAndTranscribeSpeech(nextSpeaker.language);
+      const recognizedText = await captureAndTranscribeSpeech(
+        nextSpeaker.language,
+        conferenceAutoDetectLanguage,
+      );
       setIsListening(false);
       listeningStartedAtRef.current = 0;
 
@@ -1567,8 +1573,12 @@ function AyTalkMainApp() {
 
     const sourceAtRequest = sourceLanguage;
     const targetAtRequest = targetLanguage;
+    const translationSourceName =
+      appMode === "conference" && conferenceAutoDetectLanguage
+        ? "Auto"
+        : sourceAtRequest.name;
     const normalizedText = cleanText.replace(/\s+/g, " ").trim().toLocaleLowerCase();
-    const cacheKey = `${sourceAtRequest.name}:${targetAtRequest.name}:${normalizedText}`;
+    const cacheKey = `${translationSourceName}:${targetAtRequest.name}:${normalizedText}`;
     const cachedReply = translationCacheRef.current.get(cacheKey);
 
     if (cachedReply) {
@@ -1609,7 +1619,7 @@ function AyTalkMainApp() {
       return;
     }
 
-    const requestKey = `translate:${sourceAtRequest.name}:${targetAtRequest.name}:${cleanText}`;
+    const requestKey = `translate:${translationSourceName}:${targetAtRequest.name}:${cleanText}`;
     if (activeRequestKeyRef.current === requestKey) return;
     activeRequestKeyRef.current = requestKey;
     let receivedStreamingText = false;
@@ -1624,7 +1634,7 @@ function AyTalkMainApp() {
         timeoutMs: 20000,
         body: {
           message: cleanText,
-          from: sourceAtRequest.name,
+          from: translationSourceName,
           to: targetAtRequest.name,
         },
         onDelta: (_delta, fullText) => {
@@ -1683,7 +1693,7 @@ function AyTalkMainApp() {
           headers: getApiJsonHeaders(),
           body: JSON.stringify({
             message: cleanText,
-            from: sourceAtRequest.name,
+            from: translationSourceName,
             to: targetAtRequest.name,
           }),
           signal: controller.signal,
@@ -2296,9 +2306,29 @@ function AyTalkMainApp() {
     };
   }, [isLoading, loadingAnim]);
 
+  const openPendingLiveBridgeCall = async () => {
+    try {
+      const pending = await AsyncStorage.getItem("aytalk_pending_livebridge_call");
+      if (!pending) return;
+      await AsyncStorage.removeItem("aytalk_pending_livebridge_call");
+      setRemoteCallRoomCode("");
+      setRemoteCallDefaultName("AyTalk Kullanıcısı");
+      setRemoteCallOpen(true);
+    } catch {}
+  };
+
+  useEffect(() => {
+    // FCM/Notifee tam ekran gelen arama uygulamayı açtıysa LiveBridge'i
+    // otomatik göster. Arama ayrıntısını RemoteCallScreen sunucudan doğrular.
+    void openPendingLiveBridgeCall();
+  }, []);
+
   useEffect(() => {
     const subscription = AppState.addEventListener("change", nextState => {
       setAppState(nextState);
+      if (nextState === "active") {
+        void openPendingLiveBridgeCall();
+      }
     });
 
     return () => {
@@ -2389,7 +2419,10 @@ function AyTalkMainApp() {
     });
   };
 
-  const captureAndTranscribeSpeech = async (language: Language): Promise<string> => {
+  const captureAndTranscribeSpeech = async (
+    language: Language,
+    autoDetectLanguage = false,
+  ): Promise<string> => {
     if (!AySpeech) throw new Error("Mikrofon modülü bulunamadı.");
 
     const result = await AySpeech.capture(9000);
@@ -2402,7 +2435,11 @@ function AyTalkMainApp() {
       {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({audioBase64, language: languageCode}),
+        body: JSON.stringify(
+          autoDetectLanguage
+            ? {audioBase64}
+            : {audioBase64, language: languageCode},
+        ),
       },
       20000,
     );
@@ -2442,7 +2479,10 @@ function AyTalkMainApp() {
       setIsListening(true);
       listeningStartedAtRef.current = Date.now();
 
-      const recognizedText = await captureAndTranscribeSpeech(sourceLanguage);
+      const recognizedText = await captureAndTranscribeSpeech(
+        sourceLanguage,
+        appMode === "conference" && conferenceAutoDetectLanguage,
+      );
       setIsListening(false);
 
       if (!recognizedText) {
@@ -2798,7 +2838,7 @@ function AyTalkMainApp() {
                         <Text style={styles.conferenceTitle}>{conferenceTitle} ✏️</Text>
                       </TouchableOpacity>
                       <Text style={styles.conferenceDescription}>
-                        Konuşan ve dinleyen kişiyi seç. Hedef dil dinleyenin diline otomatik ayarlanır.
+                        Konuşanı ve dinleyeni seç. Konuşma dili otomatik algılanır; çeviri dinleyenin tercih ettiği dile yapılır.
                       </Text>
                     </View>
                     <View style={styles.conferenceLiveBadge}>
@@ -2823,6 +2863,23 @@ function AyTalkMainApp() {
                     <View style={styles.conferenceAutomationRow}>
                       <View style={styles.conferenceAutomationTextWrap}>
                         <Text style={styles.conferenceAutomationTitle}>
+                          Konuşma dilini otomatik algıla
+                        </Text>
+                        <Text style={styles.conferenceAutomationDescription}>
+                          Konuşan kişi hangi dili kullanırsa kullansın AyTalk otomatik algılar ve dinleyenin diline çevirir.
+                        </Text>
+                      </View>
+                      <Switch
+                        value={conferenceAutoDetectLanguage}
+                        onValueChange={setConferenceAutoDetectLanguage}
+                      />
+                    </View>
+
+                    <View style={styles.conferenceAutomationDivider} />
+
+                    <View style={styles.conferenceAutomationRow}>
+                      <View style={styles.conferenceAutomationTextWrap}>
+                        <Text style={styles.conferenceAutomationTitle}>
                           Otomatik konuşan değişimi
                         </Text>
                         <Text style={styles.conferenceAutomationDescription}>
@@ -2843,7 +2900,7 @@ function AyTalkMainApp() {
                           Otomatik mikrofon
                         </Text>
                         <Text style={styles.conferenceAutomationDescription}>
-                          Yeni konuşanın dilinde mikrofonu otomatik açar.
+                          Yeni konuşmacı için mikrofonu otomatik açar; konuşma dili otomatik algılanabilir.
                         </Text>
                       </View>
                       <Switch
@@ -3027,13 +3084,28 @@ function AyTalkMainApp() {
               <View style={styles.languagePanel}>
                 <TouchableOpacity
                   style={styles.languageButton}
-                  onPress={() => setSourcePickerOpen(true)}
-                  disabled={isListening || isLoading || isOcrLoading}>
+                  onPress={() =>
+                    appMode === "conference" && conferenceAutoDetectLanguage
+                      ? undefined
+                      : setSourcePickerOpen(true)
+                  }
+                  disabled={
+                    isListening ||
+                    isLoading ||
+                    isOcrLoading ||
+                    (appMode === "conference" && conferenceAutoDetectLanguage)
+                  }>
                   <Text style={styles.selectorLabel}>
-                    {appMode === "image" ? "Görseldeki dil" : appMode === "conference" ? "Aktif konuşmacı dili" : "Konuşulan dil"}
+                    {appMode === "image"
+                      ? "Görseldeki dil"
+                      : appMode === "conference"
+                        ? "Konuşma dili"
+                        : "Konuşulan dil"}
                   </Text>
                   <Text style={styles.selectorValue}>
-                    {sourceLanguage.flag} {sourceLanguage.nativeName} ▼
+                    {appMode === "conference" && conferenceAutoDetectLanguage
+                      ? "🌐 Otomatik algıla"
+                      : `${sourceLanguage.flag} ${sourceLanguage.nativeName} ▼`}
                   </Text>
                 </TouchableOpacity>
 
@@ -3045,7 +3117,7 @@ function AyTalkMainApp() {
                   style={styles.languageButton}
                   onPress={() => appMode === "conference" ? undefined : setTargetPickerOpen(true)}
                   disabled={isListening || isLoading || isOcrLoading || appMode === "conference"}>
-                  <Text style={styles.selectorLabel}>{appMode === "conference" ? "Dinleyenin dili" : "Çevrilecek dil"}</Text>
+                  <Text style={styles.selectorLabel}>{appMode === "conference" ? "Dinleyenin tercih ettiği dil" : "Çevrilecek dil"}</Text>
                   <Text style={styles.selectorValue}>
                     {targetLanguage.flag} {targetLanguage.nativeName} ▼
                   </Text>

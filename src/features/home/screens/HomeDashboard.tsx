@@ -21,8 +21,7 @@ export type HomeSection =
   | "image"
   | "conference"
   | "history"
-  | "profile"
-  | "emergency";
+  | "profile";
 
 export default function HomeDashboard({
   onOpen,
@@ -126,20 +125,6 @@ export default function HomeDashboard({
         </View>
       </TouchableOpacity>
 
-      <TouchableOpacity
-        activeOpacity={0.9}
-        style={[styles.emergencyCard, {marginBottom: gap}]}
-        onPress={() => onOpen("emergency")}>
-        <View style={styles.emergencyIconWrap}>
-          <Text style={styles.emergencyIcon}>🆘</Text>
-        </View>
-        <View style={styles.emergencyTextWrap}>
-          <Text style={styles.emergencyTitle}>Acil Durum</Text>
-          <Text style={styles.emergencySubtitle}>Offline Emergency Phrases</Text>
-        </View>
-        <Text style={styles.emergencyArrow}>›</Text>
-      </TouchableOpacity>
-
       <View style={[styles.grid, {gap}]}>
         <FeatureCard
           icon="translation"
@@ -148,14 +133,6 @@ export default function HomeDashboard({
           detail="Text & Voice"
           tiny={tiny}
           onPress={() => onOpen("translate")}
-        />
-        <FeatureCard
-          icon="assistant"
-          title="AI Asistanı"
-          english="AI Assistant"
-          detail="Artificial Intelligence"
-          tiny={tiny}
-          onPress={() => onOpen("assistant")}
         />
         <FeatureCard
           icon="visual"
@@ -167,9 +144,9 @@ export default function HomeDashboard({
         />
         <FeatureCard
           icon="conference"
-          title="Konferans"
-          english="Conference"
-          detail="Multi-language"
+          title="Akıllı Konferans"
+          english="Smart Conference"
+          detail="Auto Language Detection"
           tiny={tiny}
           onPress={() => onOpen("conference")}
         />
@@ -239,7 +216,7 @@ function FeatureCard({
   onPress,
   tiny,
 }: {
-  icon: "translation" | "assistant" | "visual" | "conference";
+  icon: "translation" | "visual" | "conference";
   title: string;
   english: string;
   detail: string;
@@ -324,29 +301,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#030817",
   },
-  emergencyCard: {
-    minHeight: 64,
-    borderRadius: 18,
-    borderWidth: 1,
-    borderColor: "rgba(255,112,112,0.52)",
-    backgroundColor: "#241222",
-    flexDirection: "row",
-    alignItems: "center",
-    paddingHorizontal: 14,
-  },
-  emergencyIconWrap: {
-    width: 44,
-    height: 44,
-    borderRadius: 14,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "rgba(255,255,255,0.06)",
-  },
-  emergencyIcon: {fontSize: 25},
-  emergencyTextWrap: {flex: 1, marginLeft: 12},
-  emergencyTitle: {color: "#FFFFFF", fontSize: 16, fontWeight: "900"},
-  emergencySubtitle: {color: "#E8A9B1", fontSize: 11, marginTop: 2},
-  emergencyArrow: {color: "#FFFFFF", fontSize: 30, fontWeight: "300"},
   glassCard: {
     borderWidth: 1,
     borderColor: "rgba(94,183,255,0.40)",

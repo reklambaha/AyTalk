@@ -37,6 +37,8 @@ import Tts from "react-native-tts";
 import Sound from "react-native-sound";
 import Contacts from "react-native-contacts";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import messaging from "@react-native-firebase/messaging";
+import notifee from "@notifee/react-native";
 import {SafeAreaView as SafeAreaViewSafe} from "react-native-safe-area-context";
 import RNFS from "react-native-fs";
 import RNShare from "react-native-share";
@@ -419,6 +421,7 @@ function RoomView({
   const [videoConversationEnabled, setVideoConversationEnabled] = useState(callMode === "video");
   const [chatInput, setChatInput] = useState("");
   const [attachments, setAttachments] = useState<LiveBridgeAttachment[]>([]);
+  const [activeImageAttachment, setActiveImageAttachment] = useState<LiveBridgeAttachment | null>(null);
   const [attachmentMenuVisible, setAttachmentMenuVisible] = useState(false);
   const [attachmentBusy, setAttachmentBusy] = useState(false);
   const [attachmentProgress, setAttachmentProgress] = useState(0);
@@ -1315,6 +1318,57 @@ function RoomView({
     });
   };
 
+  const renderAttachmentBubble = (item: LiveBridgeAttachment) => {
+    const isImage = item.mimeType.toLowerCase().startsWith("image/");
+    return (
+      <View
+        key={item.id}
+        style={[
+          styles.attachmentBubble,
+          item.side === "local"
+            ? styles.attachmentBubbleLocal
+            : styles.attachmentBubbleRemote,
+        ]}>
+        {isImage ? (
+          <TouchableOpacity
+            activeOpacity={0.9}
+            onPress={() => setActiveImageAttachment(item)}>
+            <Image
+              source={{
+                uri: item.localPath.startsWith("file://")
+                  ? item.localPath
+                  : `file://${item.localPath}`,
+              }}
+              style={styles.attachmentImagePreview}
+              resizeMode="cover"
+            />
+          </TouchableOpacity>
+        ) : (
+          <CallControlIcon name="message" size={22} />
+        )}
+        <View style={styles.attachmentTextWrap}>
+          <Text style={styles.attachmentName} numberOfLines={1}>
+            {item.name}
+          </Text>
+          <Text style={styles.attachmentMeta}>
+            {item.side === "local" ? "Sen" : "Karşı taraf"} · {formatBytes(item.size)}
+          </Text>
+          <TouchableOpacity
+            style={styles.attachmentShareButton}
+            onPress={() =>
+              isImage
+                ? setActiveImageAttachment(item)
+                : void shareAttachment(item)
+            }>
+            <Text style={styles.attachmentShareText}>
+              {isImage ? "Aç" : "Aç / paylaş"}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    );
+  };
+
   const exportConversationPdf = async () => {
     if (!AyPdf) {
       Alert.alert("PDF modülü", "AyPdf native modülü yüklenmedi.");
@@ -1427,43 +1481,7 @@ function RoomView({
                 </View>
               ))
             )}
-            {attachments.map(item => (
-              <View
-                key={item.id}
-                style={[
-                  styles.attachmentBubble,
-                  item.side === "local"
-                    ? styles.attachmentBubbleLocal
-                    : styles.attachmentBubbleRemote,
-                ]}>
-                {item.mimeType.toLowerCase().startsWith("image/") ? (
-                  <Image
-                    source={{
-                      uri: item.localPath.startsWith("file://")
-                        ? item.localPath
-                        : `file://${item.localPath}`,
-                    }}
-                    style={styles.attachmentImagePreview}
-                    resizeMode="cover"
-                  />
-                ) : (
-                  <CallControlIcon name="message" size={22} />
-                )}
-                <View style={styles.attachmentTextWrap}>
-                  <Text style={styles.attachmentName} numberOfLines={1}>
-                    {item.name}
-                  </Text>
-                  <Text style={styles.attachmentMeta}>
-                    {(item.size / 1024 / 1024).toFixed(1)} MB
-                  </Text>
-                </View>
-                <TouchableOpacity
-                  style={styles.attachmentShareButton}
-                  onPress={() => void shareAttachment(item)}>
-                  <Text style={styles.attachmentShareText}>Paylaş</Text>
-                </TouchableOpacity>
-              </View>
-            ))}
+            {attachments.map(renderAttachmentBubble)}
 
             {attachmentBusy ? (
               <View style={styles.attachmentProgressWrap}>
@@ -1640,7 +1658,7 @@ function RoomView({
 
         {videoConversationEnabled &&
         subtitlesVisible &&
-        (translationHistory.length > 0 || translationListening || translationBusy || localOriginal) ? (
+        (translationHistory.length > 0 || attachments.length > 0 || translationListening || translationBusy || localOriginal) ? (
           <View style={styles.unifiedSubtitlePanel}>
             <View style={styles.subtitlePanelHandle} />
             <View style={styles.subtitlePanelHeader}>
@@ -1718,6 +1736,8 @@ function RoomView({
                   <Text style={styles.subtitleTranslated}>{entry.translated}</Text>
                 </View>
               ))}
+
+              {attachments.map(renderAttachmentBubble)}
 
               {translationListening ? (
                 <Text style={styles.subtitleState}>Dinliyorum… Konuş.</Text>
@@ -1860,6 +1880,38 @@ function RoomView({
             </Text>
           </TouchableOpacity>
         </View>
+
+        <Modal
+          visible={activeImageAttachment !== null}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setActiveImageAttachment(null)}>
+          <View style={styles.imageViewerBackdrop}>
+            <TouchableOpacity
+              style={styles.imageViewerClose}
+              onPress={() => setActiveImageAttachment(null)}>
+              <Text style={styles.imageViewerCloseText}>×</Text>
+            </TouchableOpacity>
+            {activeImageAttachment ? (
+              <Image
+                source={{
+                  uri: activeImageAttachment.localPath.startsWith("file://")
+                    ? activeImageAttachment.localPath
+                    : `file://${activeImageAttachment.localPath}`,
+                }}
+                style={styles.imageViewerImage}
+                resizeMode="contain"
+              />
+            ) : null}
+            {activeImageAttachment ? (
+              <TouchableOpacity
+                style={styles.imageViewerShareButton}
+                onPress={() => void shareAttachment(activeImageAttachment)}>
+                <Text style={styles.imageViewerShareText}>Paylaş / başka uygulamada aç</Text>
+              </TouchableOpacity>
+            ) : null}
+          </View>
+        </Modal>
 
         <Modal
           visible={inCallLanguagePicker !== null}
@@ -2316,6 +2368,7 @@ export default function RemoteCallScreen({
             name: name.trim() || "LiveBridge Kullanıcısı",
             language: sourceCallLanguage.name,
             gender: voiceGender,
+            fcmToken: await messaging().getToken().catch(() => ""),
           }),
         },
         12000,
@@ -2328,7 +2381,7 @@ export default function RemoteCallScreen({
       Alert.alert("LiveBridge kayıt hatası", error instanceof Error ? error.message : "Profil kaydedilemedi.");
       return false;
     }
-  }, [directoryPhone, name, sourceCallLanguage.name]);
+  }, [directoryPhone, name, sourceCallLanguage.name, voiceGender]);
 
   const syncLiveBridgeContacts = useCallback(async () => {
     if (!directoryProfileReady || !directoryPhone) return;
@@ -2401,6 +2454,17 @@ export default function RemoteCallScreen({
     void load();
     return () => { cancelled = true; };
   }, [registerDirectoryProfile, visible]);
+
+  useEffect(() => {
+    // FCM token zaman içinde değişebilir. Değiştiğinde aynı LiveBridge profiline
+    // sessizce yeniden kaydederek kapalı uygulama aramalarını canlı tut.
+    const unsubscribe = messaging().onTokenRefresh(() => {
+      if (directoryProfileReady && directoryPhone) {
+        void registerDirectoryProfile(directoryPhone);
+      }
+    });
+    return unsubscribe;
+  }, [directoryPhone, directoryProfileReady, registerDirectoryProfile]);
 
   useEffect(() => {
     if (!visible || !directoryProfileReady || !directoryPhone) {
@@ -2706,6 +2770,7 @@ export default function RemoteCallScreen({
     if (!incomingCall) return;
     const current = incomingCall;
     setIncomingCall(null);
+    void notifee.cancelNotification(current.id).catch(() => undefined);
     try {
       await fetchJson(
         "/livebridge/call/respond",
@@ -3756,6 +3821,26 @@ const styles = StyleSheet.create({
   chatPdfText: {
     color: "#C4B4FF", fontSize: 9, fontWeight: "900",
   },
+  imageViewerBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.96)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  imageViewerImage: {width: "100%", height: "82%"},
+  imageViewerClose: {
+    position: "absolute", top: 48, right: 20, zIndex: 4,
+    width: 44, height: 44, borderRadius: 22,
+    alignItems: "center", justifyContent: "center",
+    backgroundColor: "rgba(15,31,55,0.9)",
+  },
+  imageViewerCloseText: {color: "#FFFFFF", fontSize: 30, fontWeight: "700"},
+  imageViewerShareButton: {
+    position: "absolute", bottom: 34,
+    paddingHorizontal: 18, paddingVertical: 11, borderRadius: 18,
+    backgroundColor: "#147AF3",
+  },
+  imageViewerShareText: {color: "#FFFFFF", fontSize: 13, fontWeight: "800"},
   attachmentBubble: {
     minHeight: 58, maxWidth: "92%", borderRadius: 17,
     padding: 10, marginTop: 8, flexDirection: "row",

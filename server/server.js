@@ -8,6 +8,8 @@ const {Pool} = require("pg");
 const OpenAI = require("openai");
 const {toFile} = require("openai");
 const {AccessToken, AgentDispatchClient} = require("livekit-server-sdk");
+const {cert, getApps, initializeApp} = require("firebase-admin/app");
+const {getMessaging} = require("firebase-admin/messaging");
 
 // Hata takip sistemi (Sentry). SENTRY_DSN tanımlı değilse sessizce devre dışı kalır,
 // hiçbir şeyi bozmaz — sadece hataları uzaktan görme imkanın olmaz.
@@ -19,6 +21,34 @@ console.log("Sentry hata takibi aktif.");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Firebase Admin yalnız kapalı/arka plandaki telefona gelen arama push'u göndermek
+// için kullanılır. Ayar yoksa sunucu ve açık-app polling aynen çalışmaya devam eder.
+let firebaseMessaging = null;
+try {
+  const rawServiceAccount = String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim();
+  const base64ServiceAccount = String(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 || "").trim();
+  let serviceAccount = null;
+  if (rawServiceAccount) {
+    serviceAccount = JSON.parse(rawServiceAccount);
+  } else if (base64ServiceAccount) {
+    serviceAccount = JSON.parse(Buffer.from(base64ServiceAccount, "base64").toString("utf8"));
+  }
+  if (serviceAccount?.private_key) {
+    serviceAccount.private_key = String(serviceAccount.private_key).replace(/\\n/g, "\n");
+  }
+  if (serviceAccount && getApps().length === 0) {
+    initializeApp({credential: cert(serviceAccount)});
+  }
+  if (getApps().length > 0) {
+    firebaseMessaging = getMessaging();
+    console.log("Firebase push hazır.");
+  } else {
+    console.warn("UYARI: Firebase service account yok. Kapalı uygulama arama push'u devre dışı.");
+  }
+} catch (error) {
+  console.error("Firebase Admin başlatılamadı:", error?.message || error);
+}
 
 // Kalıcı veritabanı (Postgres, örn. Supabase/Neon ücretsiz katman).
 // DATABASE_URL tanımlı değilse sunucu yine çalışır ama LiveBridge verisi
@@ -50,6 +80,9 @@ async function initDb() {
   `);
   await dbPool.query(`
     ALTER TABLE livebridge_users ADD COLUMN IF NOT EXISTS gender TEXT NOT NULL DEFAULT 'female';
+  `);
+  await dbPool.query(`
+    ALTER TABLE livebridge_users ADD COLUMN IF NOT EXISTS fcm_token TEXT NOT NULL DEFAULT '';
   `);
   await dbPool.query(`
     CREATE INDEX IF NOT EXISTS idx_livebridge_users_phone_keys
@@ -202,6 +235,7 @@ function rowToUser(row) {
     name: row.name,
     language: row.language || "",
     gender: row.gender === "male" ? "male" : "female",
+    fcmToken: String(row.fcm_token || ""),
     lastSeen: Number(row.last_seen || 0),
   };
 }
@@ -238,15 +272,16 @@ const liveBridgeStore = {
   async saveUser(user) {
     if (dbPool) {
       await dbPool.query(
-        `INSERT INTO livebridge_users (phone, phone_keys, name, language, gender, last_seen)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        `INSERT INTO livebridge_users (phone, phone_keys, name, language, gender, fcm_token, last_seen)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (phone) DO UPDATE SET
            phone_keys = EXCLUDED.phone_keys,
            name = EXCLUDED.name,
            language = EXCLUDED.language,
            gender = EXCLUDED.gender,
+           fcm_token = CASE WHEN EXCLUDED.fcm_token <> '' THEN EXCLUDED.fcm_token ELSE livebridge_users.fcm_token END,
            last_seen = EXCLUDED.last_seen`,
-        [user.phone, user.phoneKeys, user.name, user.language, user.gender === "male" ? "male" : "female", user.lastSeen],
+        [user.phone, user.phoneKeys, user.name, user.language, user.gender === "male" ? "male" : "female", String(user.fcmToken || ""), user.lastSeen],
       );
       return user;
     }
@@ -382,6 +417,7 @@ app.post("/livebridge/profile/register", async (req, res) => {
       name,
       language,
       gender,
+      fcmToken: String(req.body?.fcmToken || existing?.fcmToken || "").trim().slice(0, 4096),
       lastSeen: liveBridgeNow(),
     };
     await liveBridgeStore.saveUser(user);
@@ -404,6 +440,7 @@ app.post("/livebridge/presence", async (req, res) => {
       name: String(req.body?.name || old.name || "LiveBridge Kullanıcısı").slice(0, 80),
       language: String(req.body?.language || old.language || "").slice(0, 80),
       gender: req.body?.gender === "male" || req.body?.gender === "female" ? req.body.gender : (old.gender || "female"),
+      fcmToken: String(req.body?.fcmToken || old.fcmToken || "").trim().slice(0, 4096),
       lastSeen: liveBridgeNow(),
     };
     await liveBridgeStore.saveUser(user);
@@ -472,6 +509,35 @@ app.post("/livebridge/contacts/match", async (req, res) => {
   }
 });
 
+async function sendLiveBridgeIncomingCallPush(call, calleeUser) {
+  const token = String(calleeUser?.fcmToken || "").trim();
+  if (!firebaseMessaging || !token) return false;
+  try {
+    await firebaseMessaging.send({
+      token,
+      data: {
+        type: "livebridge_incoming_call",
+        callId: String(call.id),
+        roomName: String(call.roomName),
+        callerPhone: String(call.callerPhone),
+        callerName: String(call.callerName),
+        callerGender: String(call.callerGender || "female"),
+        calleePhone: String(call.calleePhone),
+        mode: String(call.mode),
+        video: call.mode === "video" ? "true" : "false",
+      },
+      android: {
+        priority: "high",
+        ttl: 60 * 1000,
+      },
+    });
+    return true;
+  } catch (error) {
+    console.error("LiveBridge FCM gönderilemedi:", error?.message || error);
+    return false;
+  }
+}
+
 app.post("/livebridge/call/start", async (req, res) => {
   try {
     await liveBridgeStore.cleanExpiredCalls();
@@ -496,6 +562,8 @@ app.post("/livebridge/call/start", async (req, res) => {
       status: "ringing", createdAt: liveBridgeNow(), updatedAt: liveBridgeNow(),
     };
     await liveBridgeStore.saveCall(call);
+    // Push başarısız olsa bile mevcut açık-app polling araması çalışmaya devam eder.
+    void sendLiveBridgeIncomingCallPush(call, calleeUser);
     res.json({ok: true, call});
   } catch (error) {
     console.error("call/start hatası:", error);
