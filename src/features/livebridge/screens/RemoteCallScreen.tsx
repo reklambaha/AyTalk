@@ -3,6 +3,7 @@ import {Buffer} from "buffer";
 import {
   ActivityIndicator,
   FlatList,
+  Image,
   ListRenderItem,
   Alert,
   Modal,
@@ -1168,6 +1169,9 @@ function RoomView({
         topic: FILE_STREAM_TOPIC,
         name,
         mimeType,
+        // JPEG/PNG/PDF/ZIP gibi zaten sıkıştırılmış ikili dosyalarda
+        // tekrar sıkıştırma hem gereksiz hem de mobilde bellek yükü yaratır.
+        compress: false,
         onProgress: progress =>
           setAttachmentProgress(
             Math.max(0, Math.min(1, progress || 0)),
@@ -1432,7 +1436,19 @@ function RoomView({
                     ? styles.attachmentBubbleLocal
                     : styles.attachmentBubbleRemote,
                 ]}>
-                <CallControlIcon name="message" size={22} />
+                {item.mimeType.toLowerCase().startsWith("image/") ? (
+                  <Image
+                    source={{
+                      uri: item.localPath.startsWith("file://")
+                        ? item.localPath
+                        : `file://${item.localPath}`,
+                    }}
+                    style={styles.attachmentImagePreview}
+                    resizeMode="cover"
+                  />
+                ) : (
+                  <CallControlIcon name="message" size={22} />
+                )}
                 <View style={styles.attachmentTextWrap}>
                   <Text style={styles.attachmentName} numberOfLines={1}>
                     {item.name}
@@ -3750,6 +3766,12 @@ const styles = StyleSheet.create({
   },
   attachmentBubbleRemote: {
     alignSelf: "flex-start", backgroundColor: "#11182E", borderColor: "#39336C",
+  },
+  attachmentImagePreview: {
+    width: 72,
+    height: 72,
+    borderRadius: 12,
+    backgroundColor: "#10233F",
   },
   attachmentTextWrap: {flex: 1, minWidth: 0, marginLeft: 8},
   attachmentName: {

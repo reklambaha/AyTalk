@@ -1600,7 +1600,9 @@ function AyTalkMainApp() {
       if (conversationMode && appMode === "translate") {
         setSourceLanguage(targetAtRequest);
         setTargetLanguage(sourceAtRequest);
-        setText("");
+        // Konuşma modunda dilleri sıradaki konuşmacı için değiştir,
+        // fakat az önce algılanan kaynak metni ekranda bırak.
+        setText(cleanText);
         accumulatedTextRef.current = "";
         latestPartialRef.current = "";
       }
@@ -1664,7 +1666,9 @@ function AyTalkMainApp() {
       if (conversationMode && appMode === "translate") {
         setSourceLanguage(targetAtRequest);
         setTargetLanguage(sourceAtRequest);
-        setText("");
+        // Konuşma modunda dilleri sıradaki konuşmacı için değiştir,
+        // fakat az önce algılanan kaynak metni ekranda bırak.
+        setText(cleanText);
         accumulatedTextRef.current = "";
         latestPartialRef.current = "";
       }
@@ -1779,7 +1783,10 @@ function AyTalkMainApp() {
       () => pageScrollRef.current?.scrollToEnd({animated: true}),
       80,
     );
-    beginStreamingTts();
+    // Asistan metni ekranda canlı akar; seslendirme ise cevap tamamlandıktan
+    // sonra tek parça yapılır. Böylece "1-bir, 2-two, 3-üç" gibi dil
+    // karışmaları oluşmaz.
+    stopStreamingTts();
 
     try {
       const reply = await streamNdjson({
@@ -1790,8 +1797,7 @@ function AyTalkMainApp() {
           language: languageAtRequest.name,
           history,
         },
-        onDelta: (delta, fullText) => {
-          pushStreamingTtsDelta(delta, languageAtRequest);
+        onDelta: (_delta, fullText) => {
           setAssistantMessages(previous => {
             if (previous.length === 0) return previous;
 
@@ -1806,7 +1812,7 @@ function AyTalkMainApp() {
         },
       });
 
-      finishStreamingTts(languageAtRequest);
+      stopStreamingTts();
 
       setAssistantMessages(previous => {
         const next = [...previous];
@@ -1830,6 +1836,9 @@ function AyTalkMainApp() {
         () => pageScrollRef.current?.scrollToEnd({animated: true}),
         80,
       );
+
+      // Tam cevap tek TTS isteğiyle, seçili asistan dilinde okunur.
+      void speakTranslation(reply, languageAtRequest);
     } catch (streamError) {
       // Streaming çalışmazsa normal endpoint'e otomatik dönüş.
       try {

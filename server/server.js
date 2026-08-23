@@ -1399,6 +1399,7 @@ app.post("/tts", async (req, res) => {
         ? `You are a native ${language} speaker recording a warm, natural voice message for a friend. ` +
           `Speak with the authentic accent, rhythm, and intonation a real native speaker of ${language} would use — not a flat or robotic reading. ` +
           "Use natural pacing with brief, human-like pauses at commas and sentence breaks. Vary pitch naturally as a person would in casual conversation. " +
+          `Read every numeral, numbered-list marker, date and quantity in ${language}; never switch to another language just because the input contains digits such as 1, 2 or 3. ` +
           "Pronounce ordinary words as words, not as letter-by-letter acronyms, unless clearly intended as an acronym."
         : "Speak naturally and clearly, like a real person in casual conversation, with natural rhythm and pauses. Pronounce ordinary words as words.",
     });
