@@ -549,7 +549,33 @@ app.post("/livebridge/call/start", async (req, res) => {
     const calleeUser = await liveBridgeStore.findUserByPhoneKeys(liveBridgePhoneKeys(calleePhone));
     if (!calleeUser) return res.status(404).json({error: "Kişi LiveBridge'de bulunamadı."});
     const resolvedCalleePhone = calleeUser.phone;
-    const callerUser = await liveBridgeStore.getUser(callerPhone);
+    let callerUser = await liveBridgeStore.findUserByPhoneKeys(
+      liveBridgePhoneKeys(callerPhone),
+    );
+
+    // Eski APK/yerel kayıt Postgres'e henüz senkron olmadıysa bile arama yapan
+    // kişiyi anında directory'ye yaz. Bir sonraki uygulama açılışında FCM tokenı
+    // ayrıca istemciden güncellenir.
+    if (!callerUser) {
+      callerUser = {
+        phone: callerPhone,
+        phoneKeys: liveBridgePhoneKeys(callerPhone),
+        name: String(req.body?.callerName || "LiveBridge Kullanıcısı").slice(0, 80),
+        language: "",
+        gender: "female",
+        fcmToken: "",
+        lastSeen: liveBridgeNow(),
+      };
+      await liveBridgeStore.saveUser(callerUser);
+    } else {
+      callerUser = {
+        ...callerUser,
+        name: String(req.body?.callerName || callerUser.name || "LiveBridge Kullanıcısı").slice(0, 80),
+        lastSeen: liveBridgeNow(),
+      };
+      await liveBridgeStore.saveUser(callerUser);
+    }
+
     const id = `LBC-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
     const roomName = `LB-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
     const call = {
@@ -562,9 +588,12 @@ app.post("/livebridge/call/start", async (req, res) => {
       status: "ringing", createdAt: liveBridgeNow(), updatedAt: liveBridgeNow(),
     };
     await liveBridgeStore.saveCall(call);
-    // Push başarısız olsa bile mevcut açık-app polling araması çalışmaya devam eder.
-    void sendLiveBridgeIncomingCallPush(call, calleeUser);
-    res.json({ok: true, call});
+    // Push sonucu loglanır; başarısız olsa bile açık-app polling devam eder.
+    const pushSent = await sendLiveBridgeIncomingCallPush(call, calleeUser);
+    console.log(
+      `LiveBridge arama ${call.id}: ${callerPhone} -> ${resolvedCalleePhone}; push=${pushSent ? "OK" : "YOK"}`,
+    );
+    res.json({ok: true, call, pushSent});
   } catch (error) {
     console.error("call/start hatası:", error);
     res.status(500).json({error: "Arama başlatılamadı."});

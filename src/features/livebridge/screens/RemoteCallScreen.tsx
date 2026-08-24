@@ -1086,28 +1086,29 @@ function RoomView({
           id?: string;
         };
         readAll: () => Promise<Uint8Array[]>;
+        [Symbol.asyncIterator]?: () => AsyncIterator<Uint8Array>;
       },
     ) => {
       try {
-        const chunks = await reader.readAll();
-        const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-        const joined = new Uint8Array(total);
-        let offset = 0;
-
-        chunks.forEach(chunk => {
-          joined.set(chunk, offset);
-          offset += chunk.length;
-        });
-
         const safeName = String(reader.info.name || `dosya-${Date.now()}`)
           .replace(/[^a-zA-Z0-9._-]/g, "_");
         const targetPath = `${RNFS.CachesDirectoryPath}/${Date.now()}-${safeName}`;
+        let total = 0;
 
-        await RNFS.writeFile(
-          targetPath,
-          Buffer.from(joined).toString("base64"),
-          "base64",
-        );
+        // Alıcı tarafta da tüm dosyayı RAM'de birleştirme. Gelen parçaları
+        // doğrudan cache dosyasına ekle; video açıkken bellek sıçramasını önler.
+        await RNFS.writeFile(targetPath, "", "base64");
+        for await (const chunk of reader as any) {
+          const bytes = chunk instanceof Uint8Array
+            ? chunk
+            : new Uint8Array(chunk);
+          total += bytes.length;
+          await RNFS.appendFile(
+            targetPath,
+            Buffer.from(bytes).toString("base64"),
+            "base64",
+          );
+        }
 
         setAttachments(current => [
           ...current,
@@ -1165,21 +1166,44 @@ function RoomView({
     setAttachmentProgress(0);
 
     try {
-      const base64 = await RNFS.readFile(cleanPath, "base64");
-      const bytes = new Uint8Array(Buffer.from(base64, "base64"));
-
-      await room.localParticipant.sendBytes(bytes, {
+      // Video görüşmesi sırasında büyük resmi/dosyayı tek seferde Base64 +
+      // Uint8Array olarak belleğe almak Android'de uygulamayı düşürebilir.
+      // LiveKit byte stream'i küçük parçalar halinde yazılır.
+      const writer = await room.localParticipant.streamBytes({
         topic: FILE_STREAM_TOPIC,
         name,
         mimeType,
-        // JPEG/PNG/PDF/ZIP gibi zaten sıkıştırılmış ikili dosyalarda
-        // tekrar sıkıştırma hem gereksiz hem de mobilde bellek yükü yaratır.
-        compress: false,
-        onProgress: progress =>
+        totalSize: size,
+      } as any);
+
+      const chunkSize = 12 * 1024;
+      let position = 0;
+
+      try {
+        while (position < size) {
+          const length = Math.min(chunkSize, size - position);
+          const chunkBase64 = await RNFS.read(
+            cleanPath,
+            length,
+            position,
+            "base64",
+          );
+          const chunk = new Uint8Array(
+            Buffer.from(chunkBase64, "base64"),
+          );
+          await writer.write(chunk);
+          position += length;
           setAttachmentProgress(
-            Math.max(0, Math.min(1, progress || 0)),
-          ),
-      });
+            size > 0 ? Math.min(1, position / size) : 1,
+          );
+        }
+        await writer.close();
+      } catch (streamError) {
+        try {
+          await writer.close("Gönderim iptal edildi");
+        } catch {}
+        throw streamError;
+      }
 
       setAttachments(current => [
         ...current,
@@ -2275,6 +2299,51 @@ export default function RemoteCallScreen({
     "source" | "target" | null
   >(null);
   const [languageSearch, setLanguageSearch] = useState("");
+  const outgoingRingRef = useRef<Sound | null>(null);
+  const incomingRingRef = useRef<Sound | null>(null);
+
+  const stopLocalRingSound = useCallback((kind: "incoming" | "outgoing") => {
+    const ref = kind === "incoming" ? incomingRingRef : outgoingRingRef;
+    const sound = ref.current;
+    ref.current = null;
+    if (!sound) return;
+    try {
+      sound.stop(() => {
+        try { sound.release(); } catch {}
+      });
+    } catch {
+      try { sound.release(); } catch {}
+    }
+  }, []);
+
+  const startLocalRingSound = useCallback((kind: "incoming" | "outgoing") => {
+    const ref = kind === "incoming" ? incomingRingRef : outgoingRingRef;
+    if (ref.current) return;
+
+    try {
+      Sound.setCategory?.("Playback");
+      const filename =
+        kind === "incoming"
+          ? "livebridge_ring.wav"
+          : "livebridge_ringback.wav";
+      const sound = new Sound(filename, Sound.MAIN_BUNDLE, error => {
+        if (error) {
+          try { sound.release(); } catch {}
+          if (ref.current === sound) ref.current = null;
+          return;
+        }
+        sound.setNumberOfLoops(-1);
+        sound.setVolume(kind === "incoming" ? 1 : 0.45);
+        sound.play(success => {
+          if (!success && ref.current === sound) {
+            ref.current = null;
+            try { sound.release(); } catch {}
+          }
+        });
+      });
+      ref.current = sound;
+    } catch {}
+  }, []);
 
   const sourceCallLanguage = CALL_LANGUAGES[sourceLanguageIndex];
   const targetCallLanguage = CALL_LANGUAGES[targetLanguageIndex];
@@ -2526,6 +2595,42 @@ export default function RemoteCallScreen({
     return () => { cancelled = true; clearInterval(timer); };
   }, [credentials, directoryPhone, directoryProfileReady, outgoingCall, visible]);
 
+  useEffect(() => {
+    if (incomingCall && !credentials) {
+      startLocalRingSound("incoming");
+    } else {
+      stopLocalRingSound("incoming");
+    }
+    return () => stopLocalRingSound("incoming");
+  }, [
+    credentials,
+    incomingCall?.id,
+    startLocalRingSound,
+    stopLocalRingSound,
+  ]);
+
+  useEffect(() => {
+    if (outgoingCall?.status === "ringing" && !credentials) {
+      startLocalRingSound("outgoing");
+    } else {
+      stopLocalRingSound("outgoing");
+    }
+    return () => stopLocalRingSound("outgoing");
+  }, [
+    credentials,
+    outgoingCall?.id,
+    outgoingCall?.status,
+    startLocalRingSound,
+    stopLocalRingSound,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      stopLocalRingSound("incoming");
+      stopLocalRingSound("outgoing");
+    };
+  }, [stopLocalRingSound]);
+
   const participantIdentity = useMemo(
     () =>
       `${name.trim().toLowerCase().replace(/\s+/g, "-") || "user"}-${Date.now()
@@ -2733,6 +2838,12 @@ export default function RemoteCallScreen({
   const startDirectCall = async (user: LiveBridgeDirectoryUser, mode: LiveBridgeCallMode) => {
     if (!directoryProfileReady || !directoryPhone) return;
     setSelectedDirectoryUser(null);
+
+    // Yerelde kayıtlı görünmek, Render/Postgres tarafında kaydın hâlâ var
+    // olduğu anlamına gelmez. Her direkt aramadan önce profil + FCM tokenı
+    // sunucuda kesinleştirilir; böylece iki yönlü kişi keşfi bozulmaz.
+    const profileReady = await registerDirectoryProfile(directoryPhone);
+    if (!profileReady) return;
     if (mode === "video" && !DEMO_VIP_VIDEO_UNLOCKED) {
       Alert.alert("LiveBridge VIP", "Görüntülü LiveBridge görüşmesi VIP üyeliğe dahildir.");
       return;

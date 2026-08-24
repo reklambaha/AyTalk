@@ -23,6 +23,38 @@ if (typeof global.DOMException === "undefined") {
 registerGlobals();
 
 const PENDING_CALL_KEY = "aytalk_pending_livebridge_call";
+const LIVEBRIDGE_PROFILE_KEY = "livebridge_demo_profile_v1";
+
+const syncSavedLiveBridgeProfile = async tokenOverride => {
+  try {
+    const raw = await AsyncStorage.getItem(LIVEBRIDGE_PROFILE_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    const phone = String(saved?.phone || "").replace(/[^0-9]/g, "");
+    if (phone.length < 7) return;
+    const token =
+      String(tokenOverride || "").trim() ||
+      String(await messaging().getToken().catch(() => "")).trim();
+
+    await fetchJson(
+      "/livebridge/profile/register",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          phone,
+          name: "",
+          language: "",
+          gender: saved?.gender === "male" ? "male" : "female",
+          fcmToken: token,
+        }),
+      },
+      10000,
+    );
+  } catch (error) {
+    console.log("LiveBridge arka plan profil senkronu:", error?.message || error);
+  }
+};
+
 
 const rememberIncomingCall = async data => {
   if (!data?.callId) return;
@@ -38,10 +70,10 @@ const showIncomingCallNotification = async remoteMessage => {
   await rememberIncomingCall(data);
 
   const channelId = await notifee.createChannel({
-    id: "livebridge_calls_v2",
+    id: "livebridge_calls_v3",
     name: "LiveBridge Aramaları",
     importance: AndroidImportance.HIGH,
-    sound: "default",
+    sound: "livebridge_ring",
     vibration: true,
     vibrationPattern: [300, 500, 300, 800],
   });
@@ -115,5 +147,12 @@ messaging().setBackgroundMessageHandler(showIncomingCallNotification);
 notifee.onBackgroundEvent(handleNotificationAction);
 notifee.onForegroundEvent(handleNotificationAction);
 messaging().onMessage(showIncomingCallNotification);
+
+// Postgres/Render yeniden başlasa bile uygulama her açıldığında kendi LiveBridge
+// kaydını ve güncel FCM tokenını geri yazar. Token değişiminde de aynı işlem yapılır.
+void syncSavedLiveBridgeProfile();
+messaging().onTokenRefresh(token => {
+  void syncSavedLiveBridgeProfile(token);
+});
 
 AppRegistry.registerComponent(appName, () => App);
