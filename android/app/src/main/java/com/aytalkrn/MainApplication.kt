@@ -23,6 +23,7 @@ class MainApplication : Application(), ReactApplication {
                 PackageList(this).packages.apply {
                     add(AySpeechPackage())
                     add(AyAudioRoutePackage())
+                    add(AyPdfPackage())
                 }
 
             override fun getJSMainModuleName(): String = "index"

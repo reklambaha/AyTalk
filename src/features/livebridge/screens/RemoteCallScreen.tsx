@@ -140,6 +140,18 @@ type LiveBridgeAttachment = {
   createdAt: number;
 };
 
+type LiveBridgeFilePacket =
+  | {
+      type: "aytalk-file-meta";
+      id: string;
+      name: string;
+      mimeType: string;
+      size: number;
+      createdAt: number;
+    }
+  | {type: "aytalk-file-chunk"; id: string; data: string}
+  | {type: "aytalk-file-end"; id: string};
+
 type AyPdfModule = {
   createConversationPdf(title: string, lines: string[]): Promise<string>;
 };
@@ -150,7 +162,7 @@ type AyFileModule = {
 
 const AyPdf = NativeModules.AyPdf as AyPdfModule | undefined;
 const AyFile = NativeModules.AyFile as AyFileModule | undefined;
-const FILE_STREAM_TOPIC = "aytalk-file-v1";
+const FILE_STREAM_TOPIC = "aytalk-file-v2";
 
 type AySpeechModule = {
   capture(maxDurationMs: number): Promise<{
@@ -428,6 +440,20 @@ function RoomView({
   const [localPreviewPosition, setLocalPreviewPosition] = useState({x: 0, y: 0});
   const localPreviewDragStart = useRef({x: 0, y: 0});
   const subtitleScrollRef = useRef<ScrollView | null>(null);
+  const incomingFilesRef = useRef<
+    Map<
+      string,
+      {
+        path: string;
+        name: string;
+        mimeType: string;
+        size: number;
+        received: number;
+        createdAt: number;
+      }
+    >
+  >(new Map());
+  const incomingFileQueuesRef = useRef<Map<string, Promise<void>>>(new Map());
 
   const remoteTrack = tracks.find(track => !track.participant.isLocal);
   const localCameraPublication = localParticipant.getTrackPublication(
@@ -684,23 +710,98 @@ function RoomView({
   }, [callMode]);
 
   useEffect(() => {
+    const finishIncomingFile = async (id: string) => {
+      const queued = incomingFileQueuesRef.current.get(id);
+      if (queued) {
+        try {
+          await queued;
+        } catch {}
+      }
+
+      const incoming = incomingFilesRef.current.get(id);
+      if (!incoming) return;
+
+      incomingFilesRef.current.delete(id);
+      incomingFileQueuesRef.current.delete(id);
+      setAttachments(current => [
+        ...current,
+        {
+          id,
+          side: "remote",
+          name: incoming.name,
+          mimeType: incoming.mimeType,
+          localPath: incoming.path,
+          size: incoming.received || incoming.size,
+          createdAt: incoming.createdAt,
+        },
+      ]);
+    };
+
+    const handleFilePacket = (packet: LiveBridgeFilePacket) => {
+      if (packet.type === "aytalk-file-meta") {
+        const safeName = String(packet.name || `dosya-${Date.now()}`)
+          .replace(/[^a-zA-Z0-9._-]/g, "_");
+        const path = `${RNFS.CachesDirectoryPath}/${Date.now()}-${safeName}`;
+        incomingFilesRef.current.set(packet.id, {
+          path,
+          name: safeName,
+          mimeType: packet.mimeType || "application/octet-stream",
+          size: Number(packet.size || 0),
+          received: 0,
+          createdAt: Number(packet.createdAt || Date.now()),
+        });
+        incomingFileQueuesRef.current.set(
+          packet.id,
+          RNFS.writeFile(path, "", "base64"),
+        );
+        return;
+      }
+
+      if (packet.type === "aytalk-file-chunk") {
+        const incoming = incomingFilesRef.current.get(packet.id);
+        if (!incoming) return;
+        const previous = incomingFileQueuesRef.current.get(packet.id) ?? Promise.resolve();
+        const next = previous.then(async () => {
+          await RNFS.appendFile(incoming.path, packet.data, "base64");
+          incoming.received += Buffer.from(packet.data, "base64").length;
+        });
+        incomingFileQueuesRef.current.set(packet.id, next);
+        return;
+      }
+
+      if (packet.type === "aytalk-file-end") {
+        void finishIncomingFile(packet.id);
+      }
+    };
+
     const handleDataReceived = (
       payload: Uint8Array,
       _participant?: unknown,
       _kind?: unknown,
       topic?: string,
     ) => {
-      if (topic && topic !== "aytalk.translation") {
-        return;
-      }
-
       try {
         const decoded = Buffer.from(payload).toString("utf8");
-        const packet = JSON.parse(decoded) as TranslationPacket;
+        const parsed = JSON.parse(decoded) as
+          | TranslationPacket
+          | LiveBridgeFilePacket;
 
-        if (packet.type !== "aytalk-translation") {
+        if (
+          topic === FILE_STREAM_TOPIC ||
+          parsed.type === "aytalk-file-meta" ||
+          parsed.type === "aytalk-file-chunk" ||
+          parsed.type === "aytalk-file-end"
+        ) {
+          handleFilePacket(parsed as LiveBridgeFilePacket);
           return;
         }
+
+        if (topic && topic !== "aytalk.translation") {
+          return;
+        }
+
+        const packet = parsed as TranslationPacket;
+        if (packet.type !== "aytalk-translation") return;
 
         setRemoteOriginal(packet.original);
         setRemoteTranslated(packet.translated);
@@ -717,17 +818,16 @@ function RoomView({
           packet.translated,
           packet.toLocale || targetLanguage.locale,
         );
-      } catch {
-        // AyTalk dışındaki veri paketlerini sessizce yok say.
+      } catch (error) {
+        console.log("LiveBridge veri paketi:", error);
       }
     };
 
     room.on(RoomEvent.DataReceived, handleDataReceived);
-
     return () => {
       room.off(RoomEvent.DataReceived, handleDataReceived);
     };
-  }, [room, voiceTranslationEnabled, targetLanguage.locale]);
+  }, [room, targetLanguage.locale]);
 
   const restoreCallMicrophone = async () => {
     try {
@@ -739,7 +839,9 @@ function RoomView({
         await localParticipant.setMicrophoneEnabled(true, {
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true,
+          voiceIsolation: true,
+          autoGainControl: false,
+          channelCount: 1,
         });
         setMicrophoneEnabled(true);
       }
@@ -953,7 +1055,9 @@ function RoomView({
           ? {
               echoCancellation: true,
               noiseSuppression: true,
-              autoGainControl: true,
+              voiceIsolation: true,
+              autoGainControl: false,
+              channelCount: 1,
             }
           : undefined,
       );
@@ -1076,74 +1180,14 @@ function RoomView({
     }
   };
 
-  useEffect(() => {
-    const handleIncomingFile = async (
-      reader: {
-        info: {
-          name?: string;
-          mimeType?: string;
-          size?: number;
-          id?: string;
-        };
-        readAll: () => Promise<Uint8Array[]>;
-        [Symbol.asyncIterator]?: () => AsyncIterator<Uint8Array>;
-      },
-    ) => {
-      try {
-        const safeName = String(reader.info.name || `dosya-${Date.now()}`)
-          .replace(/[^a-zA-Z0-9._-]/g, "_");
-        const targetPath = `${RNFS.CachesDirectoryPath}/${Date.now()}-${safeName}`;
-        let total = 0;
 
-        // Alıcı tarafta da tüm dosyayı RAM'de birleştirme. Gelen parçaları
-        // doğrudan cache dosyasına ekle; video açıkken bellek sıçramasını önler.
-        await RNFS.writeFile(targetPath, "", "base64");
-        for await (const chunk of reader as any) {
-          const bytes = chunk instanceof Uint8Array
-            ? chunk
-            : new Uint8Array(chunk);
-          total += bytes.length;
-          await RNFS.appendFile(
-            targetPath,
-            Buffer.from(bytes).toString("base64"),
-            "base64",
-          );
-        }
-
-        setAttachments(current => [
-          ...current,
-          {
-            id: String(reader.info.id || `${Date.now()}-${safeName}`),
-            side: "remote",
-            name: safeName,
-            mimeType: String(
-              reader.info.mimeType || "application/octet-stream",
-            ),
-            localPath: targetPath,
-            size: Number(reader.info.size || total),
-            createdAt: Date.now(),
-          },
-        ]);
-      } catch (error) {
-        console.log("LiveBridge dosya alma hatası:", error);
-      }
-    };
-
-    try {
-      room.registerByteStreamHandler(
-        FILE_STREAM_TOPIC,
-        handleIncomingFile,
-      );
-    } catch (error) {
-      console.log("LiveBridge byte stream handler:", error);
-    }
-
-    return () => {
-      try {
-        room.unregisterByteStreamHandler(FILE_STREAM_TOPIC);
-      } catch {}
-    };
-  }, [room]);
+  const publishFilePacket = async (packet: LiveBridgeFilePacket) => {
+    const payload = Buffer.from(JSON.stringify(packet), "utf8");
+    await room.localParticipant.publishData(payload, {
+      reliable: true,
+      topic: FILE_STREAM_TOPIC,
+    });
+  };
 
   const sendLocalFile = async ({
     localPath,
@@ -1158,57 +1202,62 @@ function RoomView({
     const stat = await RNFS.stat(cleanPath);
     const size = Number(stat.size);
 
-    if (size > 40 * 1024 * 1024) {
-      throw new Error("Demo sürümünde dosya sınırı 40 MB.");
+    if (size > 20 * 1024 * 1024) {
+      throw new Error("LiveBridge dosya sınırı 20 MB.");
     }
 
     setAttachmentBusy(true);
     setAttachmentProgress(0);
 
+    const transferId = `file-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2, 9)}`;
+
     try {
-      // Video görüşmesi sırasında büyük resmi/dosyayı tek seferde Base64 +
-      // Uint8Array olarak belleğe almak Android'de uygulamayı düşürebilir.
-      // LiveKit byte stream'i küçük parçalar halinde yazılır.
-      const writer = await room.localParticipant.streamBytes({
-        topic: FILE_STREAM_TOPIC,
+      await publishFilePacket({
+        type: "aytalk-file-meta",
+        id: transferId,
         name,
         mimeType,
-        totalSize: size,
-      } as any);
+        size,
+        createdAt: Date.now(),
+      });
 
-      const chunkSize = 12 * 1024;
+      // publishData LiveBridge çevirisinde zaten stabil çalışıyor. Dosyayı da
+      // küçük güvenilir paketlere bölerek aynı kanaldan gönderiyoruz. Böylece
+      // video açıkken stream writer/native bellek çökmesine girmiyoruz.
+      const chunkSize = 8 * 1024;
       let position = 0;
+      let chunkIndex = 0;
 
-      try {
-        while (position < size) {
-          const length = Math.min(chunkSize, size - position);
-          const chunkBase64 = await RNFS.read(
-            cleanPath,
-            length,
-            position,
-            "base64",
-          );
-          const chunk = new Uint8Array(
-            Buffer.from(chunkBase64, "base64"),
-          );
-          await writer.write(chunk);
-          position += length;
-          setAttachmentProgress(
-            size > 0 ? Math.min(1, position / size) : 1,
-          );
+      while (position < size) {
+        const length = Math.min(chunkSize, size - position);
+        const chunkBase64 = await RNFS.read(
+          cleanPath,
+          length,
+          position,
+          "base64",
+        );
+        await publishFilePacket({
+          type: "aytalk-file-chunk",
+          id: transferId,
+          data: chunkBase64,
+        });
+        position += length;
+        chunkIndex += 1;
+        setAttachmentProgress(size > 0 ? Math.min(1, position / size) : 1);
+
+        if (chunkIndex % 16 === 0) {
+          await new Promise<void>(resolve => setTimeout(resolve, 8));
         }
-        await writer.close();
-      } catch (streamError) {
-        try {
-          await writer.close("Gönderim iptal edildi");
-        } catch {}
-        throw streamError;
       }
+
+      await publishFilePacket({type: "aytalk-file-end", id: transferId});
 
       setAttachments(current => [
         ...current,
         {
-          id: `local-${Date.now()}-${name}`,
+          id: transferId,
           side: "local",
           name,
           mimeType,
@@ -1223,15 +1272,44 @@ function RoomView({
     }
   };
 
+  const runWithVideoPickerPause = async <T,>(task: () => Promise<T>) => {
+    const shouldRestore =
+      callMode === "video" && videoConversationEnabled && cameraEnabled;
+
+    if (shouldRestore) {
+      try {
+        await localParticipant.setCameraEnabled(false);
+        setCameraEnabled(false);
+        await new Promise<void>(resolve => setTimeout(resolve, 180));
+      } catch {}
+    }
+
+    try {
+      return await task();
+    } finally {
+      if (shouldRestore) {
+        try {
+          await new Promise<void>(resolve => setTimeout(resolve, 160));
+          await localParticipant.setCameraEnabled(true);
+          setCameraEnabled(true);
+        } catch {}
+      }
+    }
+  };
+
   const pickConversationImage = async () => {
     setAttachmentMenuVisible(false);
 
     try {
-      const result = await launchImageLibrary({
-        mediaType: "photo",
-        selectionLimit: 1,
-        quality: 0.9,
-      });
+      const result = await runWithVideoPickerPause(() =>
+        launchImageLibrary({
+          mediaType: "photo",
+          selectionLimit: 1,
+          quality: 0.72,
+          maxWidth: 1600,
+          maxHeight: 1600,
+        }),
+      );
 
       if (result.didCancel) return;
       if (result.errorCode) {
@@ -1258,11 +1336,13 @@ function RoomView({
     setAttachmentMenuVisible(false);
 
     try {
-      const [file] = await pick({
-        type: [types.allFiles],
-        allowMultiSelection: false,
-        mode: "import",
-      });
+      const [file] = await runWithVideoPickerPause(() =>
+        pick({
+          type: [types.allFiles],
+          allowMultiSelection: false,
+          mode: "import",
+        }).then(items => items),
+      );
 
       const [copy] = await keepLocalCopy({
         destination: "cachesDirectory",
@@ -2963,7 +3043,9 @@ export default function RemoteCallScreen({
             audioCaptureDefaults: {
               echoCancellation: true,
               noiseSuppression: true,
-              autoGainControl: true,
+              voiceIsolation: true,
+              autoGainControl: false,
+              channelCount: 1,
             },
             publishDefaults: {
               audioPreset: AudioPresets.speech,

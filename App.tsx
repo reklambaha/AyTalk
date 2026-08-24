@@ -3419,6 +3419,23 @@ function AyTalkMainApp() {
             )}
           </TouchableOpacity>
 
+          {appMode === "translate" ? (
+            <View style={styles.sourceSpeechCard}>
+              <View style={styles.sourceSpeechHeader}>
+                <Text style={styles.sourceSpeechEyebrow}>KONUŞTUĞUN METİN</Text>
+                <Text style={styles.sourceSpeechLanguage}>
+                  {sourceLanguage.flag} {sourceLanguage.nativeName}
+                </Text>
+              </View>
+              <Text style={styles.sourceSpeechText} selectable>
+                {text.trim() ||
+                  (isListening
+                    ? "Konuşman burada yazıya dönüşecek..."
+                    : "Mikrofona dokun ve konuş.")}
+              </Text>
+            </View>
+          ) : null}
+
           {appMode !== "image" ? (
             <View style={styles.voiceStage}>
               <VoiceStatusCard
@@ -4767,6 +4784,38 @@ const styles = StyleSheet.create({
     letterSpacing: 0.2,
   },
 
+  sourceSpeechCard: {
+    marginTop: 14,
+    borderRadius: 18,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    backgroundColor: "rgba(18,42,70,0.88)",
+    borderWidth: 1,
+    borderColor: "rgba(45,212,255,0.22)",
+  },
+  sourceSpeechHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 8,
+  },
+  sourceSpeechEyebrow: {
+    color: "#7DDCFF",
+    fontSize: 10,
+    fontWeight: "900",
+    letterSpacing: 0.8,
+  },
+  sourceSpeechLanguage: {
+    color: "#BBD4EC",
+    fontSize: 11,
+    fontWeight: "800",
+  },
+  sourceSpeechText: {
+    color: "#FFFFFF",
+    fontSize: 18,
+    lineHeight: 27,
+    fontWeight: "700",
+  },
   voiceStage: {
     width: "100%",
     alignItems: "center",
