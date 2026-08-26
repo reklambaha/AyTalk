@@ -595,6 +595,25 @@ app.post("/livebridge/chat/file",async(req,res)=>{
  fileName:name,mimeType:mime,storagePath:path,fileSize:buf.length,createdAt:Date.now()};await lbSaveMessage(m);
  res.json({ok:true,message:{...m,url:await lbSigned(path)}});}catch(e){console.error("chat/file",e);res.status(500).json({error:e?.message||"Dosya gönderilemedi."});}
 });
+app.get("/livebridge/chat/history",async(req,res)=>{
+ try{
+  const p=normalizeLiveBridgePhone(req.query?.phone),peer=normalizeLiveBridgePhone(req.query?.peerPhone);
+  if(p.length<7||peer.length<7)return res.status(400).json({error:"Telefon gerekli."});
+  let list=[];
+  if(dbPool){
+    const {rows}=await dbPool.query(`SELECT * FROM livebridge_messages
+      WHERE (sender_phone=$1 AND recipient_phone=$2) OR (sender_phone=$2 AND recipient_phone=$1)
+      ORDER BY created_at ASC LIMIT 160`,[p,peer]);
+    list=rows.map(lbRow);
+  }else{
+    list=liveBridgeMessagesMem.filter(m=>(m.senderPhone===p&&m.recipientPhone===peer)||(m.senderPhone===peer&&m.recipientPhone===p))
+      .sort((a,b)=>a.createdAt-b.createdAt).slice(-160);
+  }
+  const messages=await Promise.all(list.map(async m=>({...m,url:m.kind==="file"?await lbSigned(m.storagePath):""})));
+  res.json({ok:true,messages});
+ }catch(e){console.error("chat/history",e);res.status(500).json({error:"Sohbet geçmişi alınamadı."});}
+});
+
 app.get("/livebridge/chat/recent",async(req,res)=>{
  try{const p=normalizeLiveBridgePhone(req.query?.phone);if(p.length<7)return res.status(400).json({error:"Telefon gerekli."});
  let list=[];if(dbPool){const {rows}=await dbPool.query(`SELECT * FROM livebridge_messages WHERE sender_phone=$1 OR recipient_phone=$1 ORDER BY created_at DESC LIMIT 250`,[p]);list=rows.map(lbRow)}
@@ -1014,7 +1033,7 @@ app.post("/call/translate", async (req, res) => {
     const to = String(req.body?.to || "English").trim();
     const rawContext = Array.isArray(req.body?.context) ? req.body.context : [];
     const context = rawContext
-      .slice(-12)
+      .slice(-18)
       .map(item => ({
         role: String(item?.role || "speaker").trim().slice(0, 20),
         source: String(item?.source || "").trim().slice(0, 1200),
@@ -1038,8 +1057,11 @@ app.post("/call/translate", async (req, res) => {
           .join("\n\n")
       : "No previous context.";
 
+    const liveBridgeTranslationModel =
+      String(process.env.LIVEBRIDGE_TRANSLATION_MODEL || "gpt-4.1").trim();
+
     const response = await openai.responses.create({
-      model: "gpt-4.1-mini",
+      model: liveBridgeTranslationModel,
       store: false,
       max_output_tokens: Math.min(1200, Math.max(80, Math.ceil(message.length * 1.6))),
       instructions:
@@ -1047,6 +1069,8 @@ app.post("/call/translate", async (req, res) => {
         `Translate ONLY the CURRENT utterance from ${from} to ${to}. ` +
         "The dialogue history may contain both speakers. Use it to resolve pronouns, references, names, terminology, register and implied subjects. Keep names and terminology consistent across turns unless the speaker clearly changes them. " +
         "Do not translate previous turns again. Do not answer either speaker. " +
+        "Before translating, silently repair only obvious speech-to-text slips when the intended wording is unambiguous from the current sentence and dialogue context; never invent missing meaning. " +
+        "Resolve omitted subjects, pronouns and short colloquial fragments from the conversation only when the context makes them clear. " +
         "Never add facts, explanations, summaries, politeness, completions, diagnoses, advice or guesses. " +
         "Preserve names, numbers, units, dates, negation, uncertainty, question form and professional terminology exactly in meaning. " +
         "For medical, legal or technical terms, prefer the standard target-language term and do not simplify unless the speaker simplified it. " +
@@ -1714,7 +1738,11 @@ initDb()
       console.log("AyTalk Fast Server Başladı");
       console.log(`Port: ${PORT}`);
       console.log(`Veritabanı: ${dbPool ? "Postgres (kalıcı)" : "RAM (kalıcı DEĞİL)"}`);
-      console.log("Model: gpt-4.1-nano (translation)");
+      console.log(
+        `LiveBridge çeviri modeli: ${
+          process.env.LIVEBRIDGE_TRANSLATION_MODEL || "gpt-4.1"
+        }`,
+      );
       console.log("================================");
     });
   });

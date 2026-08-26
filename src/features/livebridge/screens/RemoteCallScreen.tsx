@@ -133,7 +133,28 @@ type TranslationEntry = {
 type LiveBridgeAttachment = {
   id:string;side:"local"|"remote";name:string;mimeType:string;localPath:string;remoteUrl?:string;size:number;createdAt:number;
 };
-type LiveBridgeRecentConversation={peerPhone:string;peerName:string;peerOnline?:boolean;lastKind:"text"|"file";lastText:string;updatedAt:number};
+type LiveBridgeRecentConversation = {
+  peerPhone: string;
+  peerName: string;
+  peerOnline?: boolean;
+  lastKind: "text" | "file";
+  lastText: string;
+  updatedAt: number;
+};
+type LiveBridgeStoredMessage = {
+  id: string;
+  senderPhone: string;
+  recipientPhone: string;
+  senderName?: string;
+  kind: "text" | "file";
+  originalText?: string;
+  translatedText?: string;
+  fileName?: string;
+  mimeType?: string;
+  fileSize?: number;
+  createdAt: number;
+  url?: string;
+};
 
 type AyPdfModule = {
   createConversationPdf(title: string, lines: string[]): Promise<string>;
@@ -410,6 +431,8 @@ function RoomView({
   const [translationHistory, setTranslationHistory] = useState<TranslationEntry[]>([]);
   const [controlsExpanded, setControlsExpanded] = useState(false);
   const [voiceTranslationEnabled, setVoiceTranslationEnabled] = useState(true);
+  const [translationVoiceGender, setTranslationVoiceGender] =
+    useState<"male" | "female">(remoteVoiceGender);
   const [profanityMode, setProfanityMode] =
     useState<ProfanityMode>("soften");
   const [inCallLanguagePicker, setInCallLanguagePicker] = useState<
@@ -429,9 +452,49 @@ function RoomView({
   const subtitleScrollRef = useRef<ScrollView | null>(null);
 
   const remoteTrack = tracks.find(track => !track.participant.isLocal);
-  const localCameraPublication = localParticipant.getTrackPublication(
-    Track.Source.Camera,
-  );
+  const localTrack = tracks.find(track => track.participant.isLocal);
+  const cameraRecoveryDoneRef = useRef(false);
+
+  useEffect(() => {
+    setTranslationVoiceGender(remoteVoiceGender);
+  }, [remoteVoiceGender]);
+
+  useEffect(() => {
+    if (
+      callMode !== "video" ||
+      !videoConversationEnabled ||
+      !cameraEnabled ||
+      !remoteTrack ||
+      cameraRecoveryDoneRef.current
+    ) {
+      return;
+    }
+
+    cameraRecoveryDoneRef.current = true;
+    const timer = setTimeout(() => {
+      const publication = localParticipant.getTrackPublication(Track.Source.Camera);
+      const healthy = Boolean(publication?.track && !publication.isMuted);
+      if (healthy) return;
+
+      void (async () => {
+        try {
+          await localParticipant.setCameraEnabled(false);
+          await new Promise<void>(resolve => setTimeout(resolve, 140));
+          await localParticipant.setCameraEnabled(true);
+          setCameraEnabled(true);
+          setVideoConversationEnabled(true);
+        } catch {}
+      })();
+    }, 650);
+
+    return () => clearTimeout(timer);
+  }, [
+    cameraEnabled,
+    callMode,
+    localParticipant,
+    remoteTrack,
+    videoConversationEnabled,
+  ]);
 
   const filteredInCallLanguages = useMemo(() => {
     const query = inCallLanguageSearch
@@ -634,7 +697,7 @@ function RoomView({
   const speakTranslation = async (translated: string, locale: string) => {
     if (!voiceTranslationEnabled || !translated.trim()) return;
     const languageName = CALL_LANGUAGES.find(item => item.locale === locale)?.name || locale;
-    const remoteGender: "male" | "female" = remoteVoiceGender;
+    const remoteGender: "male" | "female" = translationVoiceGender;
     try {
       await Tts.stop();
       const voices = await Tts.voices();
@@ -692,6 +755,58 @@ function RoomView({
       if(voiceTranslationEnabled)void speakTranslation(packet.translated,packet.toLocale||targetLanguage.locale);}catch{}
     };room.on(RoomEvent.DataReceived,h);return()=>room.off(RoomEvent.DataReceived,h);
   },[room,voiceTranslationEnabled,targetLanguage.locale]);
+
+  useEffect(() => {
+    if (!ownerPhone || !peerPhone) return;
+
+    let cancelled = false;
+    const syncFiles = async () => {
+      try {
+        const data = await fetchJson<{messages?: LiveBridgeStoredMessage[]}>(
+          `/livebridge/chat/history?phone=${encodeURIComponent(
+            ownerPhone,
+          )}&peerPhone=${encodeURIComponent(peerPhone)}`,
+          {method: "GET"},
+          12000,
+        );
+        if (cancelled || !Array.isArray(data?.messages)) return;
+
+        const remoteFiles = data.messages.filter(
+          item =>
+            item.kind === "file" &&
+            item.senderPhone === peerPhone &&
+            Boolean(item.url),
+        );
+
+        if (remoteFiles.length === 0) return;
+
+        setAttachments(current => {
+          const known = new Set(current.map(item => item.id));
+          const additions = remoteFiles
+            .filter(item => !known.has(item.id))
+            .map(item => ({
+              id: item.id,
+              side: "remote" as const,
+              name: item.fileName || "Dosya",
+              mimeType: item.mimeType || "application/octet-stream",
+              localPath: "",
+              remoteUrl: item.url || "",
+              size: Number(item.fileSize || 0),
+              createdAt: Number(item.createdAt || Date.now()),
+            }));
+
+          return additions.length ? [...current, ...additions] : current;
+        });
+      } catch {}
+    };
+
+    void syncFiles();
+    const timer = setInterval(() => void syncFiles(), 2500);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [ownerPhone, peerPhone]);
 
   const restoreCallMicrophone = async () => {
     try {
@@ -759,7 +874,7 @@ function RoomView({
             to: targetLanguage.name,
             profanityMode,
             context: translationHistory
-              .slice(-8)
+              .slice(-16)
               .map(entry => ({
                 role: entry.side === "local" ? "speaker" : "other",
                 source: entry.original,
@@ -1224,9 +1339,11 @@ function RoomView({
             onPress={() => setActiveImageAttachment(item)}>
             <Image
               source={{
-                uri: item.localPath.startsWith("file://")
-                  ? item.localPath
-                  : `file://${item.localPath}`,
+                uri: item.remoteUrl
+                  ? item.remoteUrl
+                  : item.localPath.startsWith("file://")
+                    ? item.localPath
+                    : `file://${item.localPath}`,
               }}
               style={styles.attachmentImagePreview}
               resizeMode="cover"
@@ -1453,14 +1570,10 @@ function RoomView({
   };
 
   const renderLocalPreview = () => {
-    if (cameraEnabled && localCameraPublication) {
+    if (cameraEnabled && localTrack && isTrackReference(localTrack)) {
       return (
         <VideoTrack
-          trackRef={{
-            participant: localParticipant,
-            publication: localCameraPublication,
-            source: Track.Source.Camera,
-          }}
+          trackRef={localTrack}
           style={{
             ...styles.localVideo,
             width: localPreviewWidth,
@@ -1558,6 +1671,18 @@ function RoomView({
               <Text style={styles.subtitleLanguageTarget}>
                 {targetLanguage.nativeName}
               </Text>
+
+              <TouchableOpacity
+                style={styles.subtitleVoiceGenderButton}
+                onPress={() =>
+                  setTranslationVoiceGender(value =>
+                    value === "female" ? "male" : "female",
+                  )
+                }>
+                <Text style={styles.subtitleVoiceGenderText}>
+                  {translationVoiceGender === "female" ? "👩 Kadın" : "👨 Erkek"}
+                </Text>
+              </TouchableOpacity>
 
               <TouchableOpacity
                 style={styles.subtitleHeaderButton}
@@ -1717,19 +1842,6 @@ function RoomView({
             <Text style={styles.railControlLabel}>Hoparlör</Text>
           </TouchableOpacity>
 
-          <TouchableOpacity
-            style={styles.railControlButton}
-            onPress={() => setAttachmentMenuVisible(true)}>
-            <CallControlIcon name="more" size={25} />
-            <Text style={styles.railControlLabel}>Dosya</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={styles.railControlButton}
-            onPress={() => void exportConversationPdf()}>
-            <CallControlIcon name="message" size={25} />
-            <Text style={styles.railControlLabel}>PDF</Text>
-          </TouchableOpacity>
         </View>
         ) : null}
 
@@ -1784,9 +1896,11 @@ function RoomView({
             {activeImageAttachment ? (
               <Image
                 source={{
-                  uri: activeImageAttachment.localPath.startsWith("file://")
-                    ? activeImageAttachment.localPath
-                    : `file://${activeImageAttachment.localPath}`,
+                  uri: activeImageAttachment.remoteUrl
+                    ? activeImageAttachment.remoteUrl
+                    : activeImageAttachment.localPath.startsWith("file://")
+                      ? activeImageAttachment.localPath
+                      : `file://${activeImageAttachment.localPath}`,
                 }}
                 style={styles.imageViewerImage}
                 resizeMode="contain"
@@ -2005,6 +2119,64 @@ function RoomView({
                 </View>
               </TouchableOpacity>
 
+              <TouchableOpacity
+                style={styles.moreMenuItem}
+                onPress={() => {
+                  setMoreMenuVisible(false);
+                  setAttachmentMenuVisible(true);
+                }}>
+                <View style={styles.moreMenuIconWrap}>
+                  <CallControlIcon name="message" size={23} />
+                </View>
+                <View style={styles.moreMenuTextWrap}>
+                  <Text style={styles.moreMenuText}>Dosya / Resim gönder</Text>
+                  <Text style={styles.moreMenuSubtext}>
+                    Fotoğraf, belge ve diğer dosyaları paylaş
+                  </Text>
+                </View>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.moreMenuItem}
+                onPress={() => {
+                  setMoreMenuVisible(false);
+                  void exportConversationPdf();
+                }}>
+                <View style={styles.moreMenuIconWrap}>
+                  <Text style={styles.moreMenuPdfIcon}>PDF</Text>
+                </View>
+                <View style={styles.moreMenuTextWrap}>
+                  <Text style={styles.moreMenuText}>Görüşme PDF'i</Text>
+                  <Text style={styles.moreMenuSubtext}>
+                    Çeviri geçmişini PDF oluştur ve paylaş
+                  </Text>
+                </View>
+              </TouchableOpacity>
+
+              <View style={styles.moreMenuVoiceSection}>
+                <Text style={styles.moreMenuLanguageLabel}>Çeviri sesi</Text>
+                <View style={styles.moreMenuVoiceRow}>
+                  <TouchableOpacity
+                    style={[
+                      styles.moreMenuVoiceButton,
+                      translationVoiceGender === "female" &&
+                        styles.moreMenuVoiceButtonActive,
+                    ]}
+                    onPress={() => setTranslationVoiceGender("female")}>
+                    <Text style={styles.moreMenuVoiceText}>👩 Kadın</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[
+                      styles.moreMenuVoiceButton,
+                      translationVoiceGender === "male" &&
+                        styles.moreMenuVoiceButtonActive,
+                    ]}
+                    onPress={() => setTranslationVoiceGender("male")}>
+                    <Text style={styles.moreMenuVoiceText}>👨 Erkek</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+
               {callMode === "video" ? (
                 <TouchableOpacity
                   style={styles.moreMenuItem}
@@ -2151,6 +2323,15 @@ export default function RemoteCallScreen({
   const [activeRemoteVoiceGender, setActiveRemoteVoiceGender] =
     useState<"male" | "female">("female");
   const [activeCallMode, setActiveCallMode] = useState<LiveBridgeCallMode>("video");
+  const [activePeerPhone, setActivePeerPhone] = useState("");
+  const [activePeerName, setActivePeerName] = useState("");
+  const [liveBridgeHomeTab, setLiveBridgeHomeTab] =
+    useState<"contacts" | "invites" | "chats">("contacts");
+  const [historyPeer, setHistoryPeer] =
+    useState<LiveBridgeRecentConversation | null>(null);
+  const [historyMessages, setHistoryMessages] =
+    useState<LiveBridgeStoredMessage[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [contactsPermissionDenied, setContactsPermissionDenied] = useState(false);
   const [recentConversations,setRecentConversations]=useState<LiveBridgeRecentConversation[]>([]);
   const [recentLoading,setRecentLoading]=useState(false);
@@ -2279,6 +2460,9 @@ export default function RemoteCallScreen({
       setQrInviteVisible(false);
       setQrScannerVisible(false);
       setQrScanLocked(false);
+      setActivePeerPhone("");
+      setActivePeerName("");
+      setLiveBridgeHomeTab("contacts");
     }
   }, [visible]);
 
@@ -2324,6 +2508,33 @@ export default function RemoteCallScreen({
     try{setRecentLoading(true);const d=await fetchJson<any>(`/livebridge/chat/recent?phone=${encodeURIComponent(directoryPhone)}`,{method:"GET"},12000);
     setRecentConversations(Array.isArray(d?.recents)?d.recents:[]);}catch{setRecentConversations([]);}finally{setRecentLoading(false);}
   },[directoryPhone,directoryProfileReady]);
+
+  const openConversationHistory = useCallback(
+    async (item: LiveBridgeRecentConversation) => {
+      if (!directoryPhone) return;
+      setHistoryPeer(item);
+      setHistoryMessages([]);
+      setHistoryLoading(true);
+      try {
+        const data = await fetchJson<{messages?: LiveBridgeStoredMessage[]}>(
+          `/livebridge/chat/history?phone=${encodeURIComponent(
+            directoryPhone,
+          )}&peerPhone=${encodeURIComponent(item.peerPhone)}`,
+          {method: "GET"},
+          15000,
+        );
+        setHistoryMessages(Array.isArray(data?.messages) ? data.messages : []);
+      } catch (error) {
+        Alert.alert(
+          "Sohbet geçmişi",
+          error instanceof Error ? error.message : "Geçmiş yüklenemedi.",
+        );
+      } finally {
+        setHistoryLoading(false);
+      }
+    },
+    [directoryPhone],
+  );
 
   const syncLiveBridgeContacts = useCallback(async () => {
     if (!directoryProfileReady || !directoryPhone) return;
@@ -2711,6 +2922,8 @@ export default function RemoteCallScreen({
   const startDirectCall = async (user: LiveBridgeDirectoryUser, mode: LiveBridgeCallMode) => {
     if (!directoryProfileReady || !directoryPhone) return;
     setSelectedDirectoryUser(null);
+    setActivePeerPhone(user.phone);
+    setActivePeerName(user.name);
 
     // Yerelde kayıtlı görünmek, Render/Postgres tarafında kaydın hâlâ var
     // olduğu anlamına gelmez. Her direkt aramadan önce profil + FCM tokenı
@@ -2753,6 +2966,10 @@ export default function RemoteCallScreen({
   const respondIncomingCall = async (accepted: boolean) => {
     if (!incomingCall) return;
     const current = incomingCall;
+    if (accepted) {
+      setActivePeerPhone(current.callerPhone);
+      setActivePeerName(current.callerName);
+    }
     setIncomingCall(null);
     void notifee.cancelNotification(current.id).catch(() => undefined);
     try {
@@ -2792,6 +3009,8 @@ export default function RemoteCallScreen({
         const status = data?.call?.status;
         if (status === "accepted") {
           const accepted = outgoingCall;
+          setActivePeerPhone(accepted.calleePhone);
+          setActivePeerName(accepted.calleeName);
           setOutgoingCall(null);
           void connectToRoom(accepted.roomName, accepted.mode);
         } else if (status === "rejected" || status === "expired") {
@@ -2874,6 +3093,8 @@ export default function RemoteCallScreen({
           onDisconnected={() => {
             setConnectionStatus("idle");
             setCredentials(null);
+            setActivePeerPhone("");
+            setActivePeerName("");
             void AudioSession.stopAudioSession();
           }}>
           <RoomView
@@ -2884,7 +3105,7 @@ export default function RemoteCallScreen({
             bridgeDistance={activeBridgeDistance}
             remoteVoiceGender={activeRemoteVoiceGender}
             ownerPhone={directoryPhone}
-            peerPhone={outgoingCall?.calleePhone || incomingCall?.callerPhone || ""}
+            peerPhone={activePeerPhone}
             onChangeSourceLanguage={language => {
               const index = CALL_LANGUAGES.findIndex(
                 item => item.locale === language.locale,
@@ -2904,6 +3125,8 @@ export default function RemoteCallScreen({
             onLeave={() => {
               setConnectionStatus("idle");
               setCredentials(null);
+              setActivePeerPhone("");
+              setActivePeerName("");
               void AudioSession.stopAudioSession();
             }}
           />
@@ -2927,11 +3150,36 @@ export default function RemoteCallScreen({
             showsVerticalScrollIndicator={false}>
             {directoryProfileReady ? (
               <View style={styles.liveBridgeTopMenu}>
-                <TouchableOpacity style={styles.liveBridgeTopMenuActive} onPress={()=>void syncLiveBridgeContacts()}><Text style={styles.liveBridgeTopMenuTextActive}>Kişiler</Text></TouchableOpacity>
-                <TouchableOpacity style={styles.liveBridgeTopMenuButton} onPress={showQrInvite}><Text style={styles.liveBridgeTopMenuText}>Davetler</Text></TouchableOpacity>
-                <TouchableOpacity style={styles.liveBridgeTopMenuButton} onPress={()=>void loadRecentConversations()}><Text style={styles.liveBridgeTopMenuText}>Sohbetler</Text></TouchableOpacity>
+                {([
+                  ["contacts", "Kişiler"],
+                  ["invites", "Davetler"],
+                  ["chats", "Sohbetler"],
+                ] as const).map(([tab, label]) => {
+                  const selected = liveBridgeHomeTab === tab;
+                  return (
+                    <TouchableOpacity
+                      key={tab}
+                      style={[
+                        styles.liveBridgeTopMenuButton,
+                        selected && styles.liveBridgeTopMenuActive,
+                      ]}
+                      onPress={() => {
+                        setLiveBridgeHomeTab(tab);
+                        if (tab === "contacts") void syncLiveBridgeContacts();
+                        if (tab === "chats") void loadRecentConversations();
+                      }}>
+                      <Text
+                        style={[
+                          styles.liveBridgeTopMenuText,
+                          selected && styles.liveBridgeTopMenuTextActive,
+                        ]}>
+                        {label}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
               </View>
-            ):null}
+            ) : null}
 
             {!directoryProfileReady ? (
               <View style={styles.directorySetupCard}>
@@ -2961,7 +3209,7 @@ export default function RemoteCallScreen({
                   <Text style={styles.directoryRegisterButtonText}>LiveBridge'e Kaydol</Text>
                 </TouchableOpacity>
               </View>
-            ) : (
+            ) : liveBridgeHomeTab === "contacts" ? (
               <>
                 <View style={styles.directoryHeaderRow}>
                   <View>
@@ -3043,18 +3291,22 @@ export default function RemoteCallScreen({
                   </View>
                 )}
               </>
-            )}
+            ) : null}
 
-            {directoryProfileReady?(
+            {directoryProfileReady &&
+            (liveBridgeHomeTab === "contacts" || liveBridgeHomeTab === "chats") ? (
               <View style={styles.recentSection}>
-                <View style={styles.directoryHeaderRow}><View><Text style={styles.directoryTitle}>Son Görüşmeler</Text>
-                <Text style={styles.directorySubtitle}>Yazışmalar · çeviriler · dosyalar</Text></View>
+                <View style={styles.directoryHeaderRow}><View><Text style={styles.directoryTitle}>
+                  {liveBridgeHomeTab === "chats" ? "Sohbetler" : "Son Görüşmeler"}
+                </Text>
+                <Text style={styles.directorySubtitle}>
+                  Yazışmalar · çeviriler · dosyalar
+                </Text></View>
                 <TouchableOpacity style={styles.directorySyncButton} onPress={()=>void loadRecentConversations()}>
                 {recentLoading?<ActivityIndicator size="small" color="#4BC6FF"/>:<CallControlIcon name="loading" size={22}/>}</TouchableOpacity></View>
                 {recentConversations.length?(
                   <View style={styles.directoryListCard}>{recentConversations.slice(0,8).map(item=>(
-                    <TouchableOpacity key={item.peerPhone} style={styles.directoryUserRow} onPress={()=>setSelectedDirectoryUser({
-                      phone:item.peerPhone,name:item.peerName,online:Boolean(item.peerOnline),lastSeen:item.updatedAt})}>
+                    <TouchableOpacity key={item.peerPhone} style={styles.directoryUserRow} onPress={() => void openConversationHistory(item)}>
                       <View style={styles.directoryAvatar}><Text style={styles.directoryAvatarText}>{(item.peerName||"?").slice(0,1).toUpperCase()}</Text></View>
                       <View style={styles.directoryUserInfo}><Text style={styles.directoryUserName}>{item.peerName}</Text>
                       <Text style={styles.directoryUserPresence} numberOfLines={1}>{item.lastText}</Text></View><Text style={styles.directoryChevronText}>›</Text>
@@ -3064,6 +3316,8 @@ export default function RemoteCallScreen({
               </View>
             ):null}
 
+            {directoryProfileReady && liveBridgeHomeTab === "invites" ? (
+              <>
             <View style={styles.directoryFallbackDivider}>
               <View style={styles.advancedDividerLine} />
               <Text style={styles.directoryFallbackText}>DİĞER BAĞLANTI SEÇENEKLERİ</Text>
@@ -3203,6 +3457,9 @@ export default function RemoteCallScreen({
               </TouchableOpacity>
             </View>
 
+              </>
+            ) : null}
+
             {connectionStatus !== "idle" ? (
               <View style={styles.connectionStatusCard}>
                 <ActivityIndicator size="small" color="#4BC6FF" />
@@ -3227,6 +3484,92 @@ export default function RemoteCallScreen({
           </ScrollView>
         </SafeAreaViewSafe>
       )}
+
+      <Modal
+        visible={historyPeer !== null}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setHistoryPeer(null)}>
+        <View style={styles.contactActionBackdrop}>
+          <View style={styles.chatHistoryCard}>
+            <View style={styles.chatHistoryHeader}>
+              <View>
+                <Text style={styles.chatHistoryTitle}>
+                  {historyPeer?.peerName || "Sohbet"}
+                </Text>
+                <Text style={styles.chatHistorySubtitle}>
+                  Kalıcı LiveBridge geçmişi
+                </Text>
+              </View>
+              <TouchableOpacity onPress={() => setHistoryPeer(null)}>
+                <Text style={styles.chatHistoryClose}>✕</Text>
+              </TouchableOpacity>
+            </View>
+            {historyLoading ? (
+              <ActivityIndicator size="large" color="#4BC6FF" />
+            ) : (
+              <ScrollView style={styles.chatHistoryScroll}>
+                {historyMessages.map(message => {
+                  const mine = message.senderPhone === directoryPhone;
+                  return (
+                    <View
+                      key={message.id}
+                      style={[
+                        styles.chatHistoryBubble,
+                        mine
+                          ? styles.chatHistoryBubbleMine
+                          : styles.chatHistoryBubbleRemote,
+                      ]}>
+                      {message.kind === "file" ? (
+                        <>
+                          <Text style={styles.chatHistoryFile}>
+                            📎 {message.fileName || "Dosya"}
+                          </Text>
+                          <Text style={styles.chatHistoryMeta}>
+                            {message.mimeType || "Dosya"} ·{" "}
+                            {formatBytes(Number(message.fileSize || 0))}
+                          </Text>
+                          {message.url ? (
+                            <TouchableOpacity
+                              onPress={() =>
+                                void RNShare.open({
+                                  url: message.url,
+                                  type: message.mimeType || undefined,
+                                  title: message.fileName || "AyTalk dosyası",
+                                  failOnCancel: false,
+                                })
+                              }>
+                              <Text style={styles.chatHistoryOpen}>
+                                Aç / Paylaş
+                              </Text>
+                            </TouchableOpacity>
+                          ) : null}
+                        </>
+                      ) : (
+                        <>
+                          {message.originalText ? (
+                            <Text style={styles.chatHistoryOriginal}>
+                              {message.originalText}
+                            </Text>
+                          ) : null}
+                          <Text style={styles.chatHistoryTranslated}>
+                            {message.translatedText || message.originalText}
+                          </Text>
+                        </>
+                      )}
+                    </View>
+                  );
+                })}
+                {!historyLoading && historyMessages.length === 0 ? (
+                  <Text style={styles.chatHistoryEmpty}>
+                    Bu kişiyle henüz kayıtlı mesaj yok.
+                  </Text>
+                ) : null}
+              </ScrollView>
+            )}
+          </View>
+        </View>
+      </Modal>
 
       <Modal
         visible={selectedDirectoryUser !== null}
@@ -3729,6 +4072,72 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     textAlign: "center",
   },
+  chatHistoryCard: {
+    width: "92%",
+    maxHeight: "82%",
+    borderRadius: 24,
+    padding: 16,
+    backgroundColor: "#07172C",
+    borderWidth: 1,
+    borderColor: "#1C4A78",
+  },
+  chatHistoryHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 14,
+  },
+  chatHistoryTitle: {color: "#FFFFFF", fontSize: 20, fontWeight: "900"},
+  chatHistorySubtitle: {color: "#7897BA", fontSize: 11, marginTop: 2},
+  chatHistoryClose: {color: "#FFFFFF", fontSize: 22, padding: 6},
+  chatHistoryScroll: {maxHeight: 520},
+  chatHistoryBubble: {
+    maxWidth: "88%",
+    padding: 12,
+    borderRadius: 16,
+    marginBottom: 9,
+  },
+  chatHistoryBubbleMine: {alignSelf: "flex-end", backgroundColor: "#123B68"},
+  chatHistoryBubbleRemote: {alignSelf: "flex-start", backgroundColor: "#10233F"},
+  chatHistoryOriginal: {color: "#9AB5D3", fontSize: 12, marginBottom: 4},
+  chatHistoryTranslated: {color: "#FFFFFF", fontSize: 14, lineHeight: 20},
+  chatHistoryFile: {color: "#FFFFFF", fontSize: 14, fontWeight: "800"},
+  chatHistoryMeta: {color: "#89A7C8", fontSize: 11, marginTop: 4},
+  chatHistoryOpen: {color: "#4BC6FF", fontSize: 12, fontWeight: "900", marginTop: 8},
+  chatHistoryEmpty: {color: "#7897BA", textAlign: "center", paddingVertical: 24},
+  subtitleVoiceGenderButton: {
+    paddingHorizontal: 9,
+    minHeight: 30,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#102D4D",
+    marginLeft: "auto",
+    marginRight: 6,
+  },
+  subtitleVoiceGenderText: {color: "#FFFFFF", fontSize: 10, fontWeight: "800"},
+  moreMenuPdfIcon: {color: "#FFFFFF", fontSize: 10, fontWeight: "900"},
+  moreMenuVoiceSection: {
+    marginTop: 8,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: "rgba(255,255,255,0.08)",
+  },
+  moreMenuVoiceRow: {flexDirection: "row", gap: 10, marginTop: 8},
+  moreMenuVoiceButton: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 12,
+    alignItems: "center",
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+  },
+  moreMenuVoiceButtonActive: {
+    backgroundColor: "#123B68",
+    borderColor: "#4BC6FF",
+  },
+  moreMenuVoiceText: {color: "#FFFFFF", fontSize: 12, fontWeight: "800"},
   liveBridgeTopMenu:{flexDirection:"row",gap:8,marginBottom:16,padding:4,borderRadius:18,backgroundColor:"#08162B",borderWidth:1,borderColor:"#16345A"},
   liveBridgeTopMenuButton:{flex:1,minHeight:42,borderRadius:14,alignItems:"center",justifyContent:"center"},
   liveBridgeTopMenuActive:{flex:1,minHeight:42,borderRadius:14,alignItems:"center",justifyContent:"center",backgroundColor:"#123B68"},
