@@ -10,6 +10,7 @@ const {toFile} = require("openai");
 const {AccessToken, AgentDispatchClient} = require("livekit-server-sdk");
 const {cert, getApps, initializeApp} = require("firebase-admin/app");
 const {getMessaging} = require("firebase-admin/messaging");
+const {getStorage} = require("firebase-admin/storage");
 
 // Hata takip sistemi (Sentry). SENTRY_DSN tanımlı değilse sessizce devre dışı kalır,
 // hiçbir şeyi bozmaz — sadece hataları uzaktan görme imkanın olmaz.
@@ -25,6 +26,7 @@ const PORT = process.env.PORT || 3000;
 // Firebase Admin yalnız kapalı/arka plandaki telefona gelen arama push'u göndermek
 // için kullanılır. Ayar yoksa sunucu ve açık-app polling aynen çalışmaya devam eder.
 let firebaseMessaging = null;
+let firebaseStorageBucket = null;
 try {
   const rawServiceAccount = String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim();
   const base64ServiceAccount = String(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 || "").trim();
@@ -38,11 +40,14 @@ try {
     serviceAccount.private_key = String(serviceAccount.private_key).replace(/\\n/g, "\n");
   }
   if (serviceAccount && getApps().length === 0) {
-    initializeApp({credential: cert(serviceAccount)});
+    const storageBucket=String(process.env.FIREBASE_STORAGE_BUCKET||"").trim()||
+      (serviceAccount.project_id?`${serviceAccount.project_id}.firebasestorage.app`:undefined);
+    initializeApp({credential:cert(serviceAccount),...(storageBucket?{storageBucket}:{})});
   }
   if (getApps().length > 0) {
     firebaseMessaging = getMessaging();
-    console.log("Firebase push hazır.");
+    try { firebaseStorageBucket=getStorage().bucket(); console.log("Firebase push + Storage hazır."); }
+    catch(e){ console.warn("Firebase Storage hazır değil:",e?.message||e); }
   } else {
     console.warn("UYARI: Firebase service account yok. Kapalı uygulama arama push'u devre dışı.");
   }
@@ -109,6 +114,17 @@ async function initDb() {
   await dbPool.query(`
     ALTER TABLE livebridge_calls ADD COLUMN IF NOT EXISTS callee_gender TEXT NOT NULL DEFAULT 'female';
   `);
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS livebridge_messages (
+      id TEXT PRIMARY KEY,sender_phone TEXT NOT NULL,recipient_phone TEXT NOT NULL,
+      sender_name TEXT NOT NULL DEFAULT '',kind TEXT NOT NULL,
+      original_text TEXT NOT NULL DEFAULT '',translated_text TEXT NOT NULL DEFAULT '',
+      file_name TEXT NOT NULL DEFAULT '',mime_type TEXT NOT NULL DEFAULT '',
+      storage_path TEXT NOT NULL DEFAULT '',file_size BIGINT NOT NULL DEFAULT 0,
+      created_at BIGINT NOT NULL
+    );
+  `);
+  await dbPool.query(`CREATE INDEX IF NOT EXISTS idx_livebridge_messages_pair ON livebridge_messages(sender_phone,recipient_phone,created_at DESC);`);
   console.log("Veritabanı tabloları hazır.");
 }
 
@@ -192,6 +208,7 @@ app.use((req, res, next) => {
 // LiveBridge Contacts Cloud — DATABASE_URL varsa Postgres, yoksa RAM (yedek).
 const liveBridgeUsersMem = new Map();
 const liveBridgeCallsMem = new Map();
+const liveBridgeMessagesMem=[];
 const normalizeLiveBridgePhone = value =>
   String(value || "").replace(/[^0-9]/g, "").slice(0, 18);
 
@@ -509,6 +526,24 @@ app.post("/livebridge/contacts/match", async (req, res) => {
   }
 });
 
+
+async function lbSaveMessage(m){
+  if(dbPool){
+    await dbPool.query(`INSERT INTO livebridge_messages
+      (id,sender_phone,recipient_phone,sender_name,kind,original_text,translated_text,file_name,mime_type,storage_path,file_size,created_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(id) DO NOTHING`,
+      [m.id,m.senderPhone,m.recipientPhone,m.senderName||"",m.kind,m.originalText||"",m.translatedText||"",
+       m.fileName||"",m.mimeType||"",m.storagePath||"",Number(m.fileSize||0),Number(m.createdAt||Date.now())]);
+  } else { liveBridgeMessagesMem.push(m); if(liveBridgeMessagesMem.length>1000)liveBridgeMessagesMem.shift(); }
+}
+async function lbSigned(path){
+  if(!firebaseStorageBucket||!path)return"";
+  try{const [u]=await firebaseStorageBucket.file(path).getSignedUrl({action:"read",expires:Date.now()+7*86400000});return u;}catch{return"";}
+}
+function lbRow(r){return{id:r.id,senderPhone:r.sender_phone??r.senderPhone,recipientPhone:r.recipient_phone??r.recipientPhone,
+ senderName:r.sender_name??r.senderName??"",kind:r.kind,originalText:r.original_text??r.originalText??"",
+ translatedText:r.translated_text??r.translatedText??"",fileName:r.file_name??r.fileName??"",mimeType:r.mime_type??r.mimeType??"",
+ storagePath:r.storage_path??r.storagePath??"",fileSize:Number(r.file_size??r.fileSize??0),createdAt:Number(r.created_at??r.createdAt??0)}}
 async function sendLiveBridgeIncomingCallPush(call, calleeUser) {
   const token = String(calleeUser?.fcmToken || "").trim();
   if (!firebaseMessaging || !token) return false;
@@ -538,6 +573,37 @@ async function sendLiveBridgeIncomingCallPush(call, calleeUser) {
   }
 }
 
+
+app.post("/livebridge/chat/text",async(req,res)=>{
+ try{const s=normalizeLiveBridgePhone(req.body?.senderPhone),r=normalizeLiveBridgePhone(req.body?.recipientPhone);
+ if(s.length<7||r.length<7)return res.status(400).json({error:"Telefon gerekli."});
+ const m={id:`LBM-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,senderPhone:s,recipientPhone:r,
+ senderName:String(req.body?.senderName||"").slice(0,80),kind:"text",originalText:String(req.body?.originalText||"").slice(0,5000),
+ translatedText:String(req.body?.translatedText||"").slice(0,5000),createdAt:Date.now()};await lbSaveMessage(m);res.json({ok:true,message:m});
+ }catch(e){console.error("chat/text",e);res.status(500).json({error:"Mesaj kaydedilemedi."});}
+});
+app.post("/livebridge/chat/file",async(req,res)=>{
+ try{if(!firebaseStorageBucket)return res.status(503).json({error:"Firebase Storage hazır değil."});
+ const s=normalizeLiveBridgePhone(req.body?.senderPhone),r=normalizeLiveBridgePhone(req.body?.recipientPhone);
+ const name=String(req.body?.fileName||`dosya-${Date.now()}`).replace(/[^a-zA-Z0-9._-]/g,"_").slice(0,180);
+ const mime=String(req.body?.mimeType||"application/octet-stream").slice(0,120),b64=String(req.body?.dataBase64||"");
+ const buf=Buffer.from(b64,"base64");if(s.length<7||r.length<7||!b64)return res.status(400).json({error:"Dosya bilgisi eksik."});
+ if(buf.length<=0||buf.length>6*1024*1024)return res.status(400).json({error:"Dosya en fazla 6 MB olabilir."});
+ const id=`LBF-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,path=`livebridge/${s}/${r}/${id}-${name}`;
+ await firebaseStorageBucket.file(path).save(buf,{resumable:false,contentType:mime,metadata:{cacheControl:"private,max-age=3600"}});
+ const m={id,senderPhone:s,recipientPhone:r,senderName:String(req.body?.senderName||"").slice(0,80),kind:"file",
+ fileName:name,mimeType:mime,storagePath:path,fileSize:buf.length,createdAt:Date.now()};await lbSaveMessage(m);
+ res.json({ok:true,message:{...m,url:await lbSigned(path)}});}catch(e){console.error("chat/file",e);res.status(500).json({error:e?.message||"Dosya gönderilemedi."});}
+});
+app.get("/livebridge/chat/recent",async(req,res)=>{
+ try{const p=normalizeLiveBridgePhone(req.query?.phone);if(p.length<7)return res.status(400).json({error:"Telefon gerekli."});
+ let list=[];if(dbPool){const {rows}=await dbPool.query(`SELECT * FROM livebridge_messages WHERE sender_phone=$1 OR recipient_phone=$1 ORDER BY created_at DESC LIMIT 250`,[p]);list=rows.map(lbRow)}
+ else list=liveBridgeMessagesMem.filter(m=>m.senderPhone===p||m.recipientPhone===p).sort((a,b)=>b.createdAt-a.createdAt).slice(0,250);
+ const seen=new Set(),recents=[];for(const m of list){const peer=m.senderPhone===p?m.recipientPhone:m.senderPhone;if(!peer||seen.has(peer))continue;seen.add(peer);
+ const u=await liveBridgeStore.findUserByPhoneKeys(liveBridgePhoneKeys(peer));recents.push({peerPhone:peer,peerName:u?.name||peer,peerOnline:liveBridgeUserOnline(u),
+ lastKind:m.kind,lastText:m.kind==="file"?`📎 ${m.fileName}`:(m.translatedText||m.originalText||"Mesaj"),updatedAt:m.createdAt});if(recents.length>=20)break}
+ res.json({ok:true,recents});}catch(e){console.error("chat/recent",e);res.status(500).json({error:"Son görüşmeler alınamadı."});}
+});
 app.post("/livebridge/call/start", async (req, res) => {
   try {
     await liveBridgeStore.cleanExpiredCalls();
@@ -948,7 +1014,7 @@ app.post("/call/translate", async (req, res) => {
     const to = String(req.body?.to || "English").trim();
     const rawContext = Array.isArray(req.body?.context) ? req.body.context : [];
     const context = rawContext
-      .slice(-8)
+      .slice(-12)
       .map(item => ({
         role: String(item?.role || "speaker").trim().slice(0, 20),
         source: String(item?.source || "").trim().slice(0, 1200),
@@ -979,7 +1045,7 @@ app.post("/call/translate", async (req, res) => {
       instructions:
         "You are LiveBridge, a professional real-time human interpreter. " +
         `Translate ONLY the CURRENT utterance from ${from} to ${to}. ` +
-        "The dialogue history may contain both speakers. Use it only to resolve pronouns, references, names, terminology, register and implied subjects. " +
+        "The dialogue history may contain both speakers. Use it to resolve pronouns, references, names, terminology, register and implied subjects. Keep names and terminology consistent across turns unless the speaker clearly changes them. " +
         "Do not translate previous turns again. Do not answer either speaker. " +
         "Never add facts, explanations, summaries, politeness, completions, diagnoses, advice or guesses. " +
         "Preserve names, numbers, units, dates, negation, uncertainty, question form and professional terminology exactly in meaning. " +
@@ -994,7 +1060,7 @@ app.post("/call/translate", async (req, res) => {
         "non-standard grammar, slang, or spoken-language shortcuts. Render this in equally informal, everyday spoken language " +
         "in the target language — the kind an ordinary villager or non-literate speaker would actually use in daily life. " +
         "NEVER upgrade informal speech into formal, literary, official, or textbook-correct language. Match the register down, not up. " +
-        "Return ONLY the translation of CURRENT_UTTERANCE.",
+        "If source language is Auto, infer it silently from the utterance and context. Never mix languages except proper names, genuine acronyms or unavoidable quoted terms. " + "Return ONLY the translation of CURRENT_UTTERANCE.",
       input:
         `PREVIOUS_CONTEXT:\n${contextText}\n\n` +
         `CURRENT_UTTERANCE:\n${message}`,

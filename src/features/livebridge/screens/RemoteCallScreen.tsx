@@ -131,26 +131,9 @@ type TranslationEntry = {
 };
 
 type LiveBridgeAttachment = {
-  id: string;
-  side: "local" | "remote";
-  name: string;
-  mimeType: string;
-  localPath: string;
-  size: number;
-  createdAt: number;
+  id:string;side:"local"|"remote";name:string;mimeType:string;localPath:string;remoteUrl?:string;size:number;createdAt:number;
 };
-
-type LiveBridgeFilePacket =
-  | {
-      type: "aytalk-file-meta";
-      id: string;
-      name: string;
-      mimeType: string;
-      size: number;
-      createdAt: number;
-    }
-  | {type: "aytalk-file-chunk"; id: string; data: string}
-  | {type: "aytalk-file-end"; id: string};
+type LiveBridgeRecentConversation={peerPhone:string;peerName:string;peerOnline?:boolean;lastKind:"text"|"file";lastText:string;updatedAt:number};
 
 type AyPdfModule = {
   createConversationPdf(title: string, lines: string[]): Promise<string>;
@@ -379,6 +362,8 @@ function RoomView({
   callMode,
   bridgeDistance,
   remoteVoiceGender,
+  ownerPhone,
+  peerPhone,
   onChangeSourceLanguage,
   onChangeTargetLanguage,
 }: {
@@ -393,6 +378,8 @@ function RoomView({
     secondCountry: string;
   } | null;
   remoteVoiceGender: "male" | "female";
+  ownerPhone:string;
+  peerPhone:string;
   onChangeSourceLanguage: (language: CallLanguage) => void;
   onChangeTargetLanguage: (language: CallLanguage) => void;
 }) {
@@ -440,20 +427,6 @@ function RoomView({
   const [localPreviewPosition, setLocalPreviewPosition] = useState({x: 0, y: 0});
   const localPreviewDragStart = useRef({x: 0, y: 0});
   const subtitleScrollRef = useRef<ScrollView | null>(null);
-  const incomingFilesRef = useRef<
-    Map<
-      string,
-      {
-        path: string;
-        name: string;
-        mimeType: string;
-        size: number;
-        received: number;
-        createdAt: number;
-      }
-    >
-  >(new Map());
-  const incomingFileQueuesRef = useRef<Map<string, Promise<void>>>(new Map());
 
   const remoteTrack = tracks.find(track => !track.participant.isLocal);
   const localCameraPublication = localParticipant.getTrackPublication(
@@ -709,125 +682,16 @@ function RoomView({
     };
   }, [callMode]);
 
-  useEffect(() => {
-    const finishIncomingFile = async (id: string) => {
-      const queued = incomingFileQueuesRef.current.get(id);
-      if (queued) {
-        try {
-          await queued;
-        } catch {}
-      }
-
-      const incoming = incomingFilesRef.current.get(id);
-      if (!incoming) return;
-
-      incomingFilesRef.current.delete(id);
-      incomingFileQueuesRef.current.delete(id);
-      setAttachments(current => [
-        ...current,
-        {
-          id,
-          side: "remote",
-          name: incoming.name,
-          mimeType: incoming.mimeType,
-          localPath: incoming.path,
-          size: incoming.received || incoming.size,
-          createdAt: incoming.createdAt,
-        },
-      ]);
-    };
-
-    const handleFilePacket = (packet: LiveBridgeFilePacket) => {
-      if (packet.type === "aytalk-file-meta") {
-        const safeName = String(packet.name || `dosya-${Date.now()}`)
-          .replace(/[^a-zA-Z0-9._-]/g, "_");
-        const path = `${RNFS.CachesDirectoryPath}/${Date.now()}-${safeName}`;
-        incomingFilesRef.current.set(packet.id, {
-          path,
-          name: safeName,
-          mimeType: packet.mimeType || "application/octet-stream",
-          size: Number(packet.size || 0),
-          received: 0,
-          createdAt: Number(packet.createdAt || Date.now()),
-        });
-        incomingFileQueuesRef.current.set(
-          packet.id,
-          RNFS.writeFile(path, "", "base64"),
-        );
-        return;
-      }
-
-      if (packet.type === "aytalk-file-chunk") {
-        const incoming = incomingFilesRef.current.get(packet.id);
-        if (!incoming) return;
-        const previous = incomingFileQueuesRef.current.get(packet.id) ?? Promise.resolve();
-        const next = previous.then(async () => {
-          await RNFS.appendFile(incoming.path, packet.data, "base64");
-          incoming.received += Buffer.from(packet.data, "base64").length;
-        });
-        incomingFileQueuesRef.current.set(packet.id, next);
-        return;
-      }
-
-      if (packet.type === "aytalk-file-end") {
-        void finishIncomingFile(packet.id);
-      }
-    };
-
-    const handleDataReceived = (
-      payload: Uint8Array,
-      _participant?: unknown,
-      _kind?: unknown,
-      topic?: string,
-    ) => {
-      try {
-        const decoded = Buffer.from(payload).toString("utf8");
-        const parsed = JSON.parse(decoded) as
-          | TranslationPacket
-          | LiveBridgeFilePacket;
-
-        if (
-          topic === FILE_STREAM_TOPIC ||
-          parsed.type === "aytalk-file-meta" ||
-          parsed.type === "aytalk-file-chunk" ||
-          parsed.type === "aytalk-file-end"
-        ) {
-          handleFilePacket(parsed as LiveBridgeFilePacket);
-          return;
-        }
-
-        if (topic && topic !== "aytalk.translation") {
-          return;
-        }
-
-        const packet = parsed as TranslationPacket;
-        if (packet.type !== "aytalk-translation") return;
-
-        setRemoteOriginal(packet.original);
-        setRemoteTranslated(packet.translated);
-        setBridgeActivated(true);
-        addTranslationEntry({
-          id: `${packet.createdAt}-remote`,
-          side: "remote",
-          original: packet.original,
-          translated: packet.translated,
-          senderName: packet.senderName || "Karşı taraf",
-          createdAt: packet.createdAt,
-        });
-        void speakTranslation(
-          packet.translated,
-          packet.toLocale || targetLanguage.locale,
-        );
-      } catch (error) {
-        console.log("LiveBridge veri paketi:", error);
-      }
-    };
-
-    room.on(RoomEvent.DataReceived, handleDataReceived);
-    return () => {
-      room.off(RoomEvent.DataReceived, handleDataReceived);
-    };
-  }, [room, targetLanguage.locale]);
+  useEffect(()=>{
+    const h=(payload:Uint8Array,_p?:unknown,_k?:unknown,topic?:string)=>{
+      if(topic&&topic!=="aytalk.translation")return;
+      try{const packet=JSON.parse(Buffer.from(payload).toString("utf8")) as TranslationPacket;if(packet.type!=="aytalk-translation")return;
+      setRemoteOriginal(packet.original);setRemoteTranslated(packet.translated);setBridgeActivated(true);
+      setTranslationHistory(cur=>[...cur,{id:`remote-${packet.createdAt}`,side:"remote",original:packet.original,translated:packet.translated,
+      senderName:packet.senderName||"Karşı taraf",createdAt:packet.createdAt}].slice(-120));
+      if(voiceTranslationEnabled)void speakTranslation(packet.translated,packet.toLocale||targetLanguage.locale);}catch{}
+    };room.on(RoomEvent.DataReceived,h);return()=>room.off(RoomEvent.DataReceived,h);
+  },[room,voiceTranslationEnabled,targetLanguage.locale]);
 
   const restoreCallMicrophone = async () => {
     try {
@@ -1181,95 +1045,18 @@ function RoomView({
   };
 
 
-  const publishFilePacket = async (packet: LiveBridgeFilePacket) => {
-    const payload = Buffer.from(JSON.stringify(packet), "utf8");
-    await room.localParticipant.publishData(payload, {
-      reliable: true,
-      topic: FILE_STREAM_TOPIC,
-    });
-  };
-
-  const sendLocalFile = async ({
-    localPath,
-    name,
-    mimeType,
-  }: {
-    localPath: string;
-    name: string;
-    mimeType: string;
-  }) => {
-    const cleanPath = localPath.replace(/^file:\/\//, "");
-    const stat = await RNFS.stat(cleanPath);
-    const size = Number(stat.size);
-
-    if (size > 20 * 1024 * 1024) {
-      throw new Error("LiveBridge dosya sınırı 20 MB.");
-    }
-
-    setAttachmentBusy(true);
-    setAttachmentProgress(0);
-
-    const transferId = `file-${Date.now()}-${Math.random()
-      .toString(36)
-      .slice(2, 9)}`;
-
-    try {
-      await publishFilePacket({
-        type: "aytalk-file-meta",
-        id: transferId,
-        name,
-        mimeType,
-        size,
-        createdAt: Date.now(),
-      });
-
-      // publishData LiveBridge çevirisinde zaten stabil çalışıyor. Dosyayı da
-      // küçük güvenilir paketlere bölerek aynı kanaldan gönderiyoruz. Böylece
-      // video açıkken stream writer/native bellek çökmesine girmiyoruz.
-      const chunkSize = 8 * 1024;
-      let position = 0;
-      let chunkIndex = 0;
-
-      while (position < size) {
-        const length = Math.min(chunkSize, size - position);
-        const chunkBase64 = await RNFS.read(
-          cleanPath,
-          length,
-          position,
-          "base64",
-        );
-        await publishFilePacket({
-          type: "aytalk-file-chunk",
-          id: transferId,
-          data: chunkBase64,
-        });
-        position += length;
-        chunkIndex += 1;
-        setAttachmentProgress(size > 0 ? Math.min(1, position / size) : 1);
-
-        if (chunkIndex % 16 === 0) {
-          await new Promise<void>(resolve => setTimeout(resolve, 8));
-        }
-      }
-
-      await publishFilePacket({type: "aytalk-file-end", id: transferId});
-
-      setAttachments(current => [
-        ...current,
-        {
-          id: transferId,
-          side: "local",
-          name,
-          mimeType,
-          localPath: cleanPath,
-          size,
-          createdAt: Date.now(),
-        },
-      ]);
-    } finally {
-      setAttachmentBusy(false);
-      setAttachmentProgress(0);
-    }
+  const sendLocalFile=async({localPath,name,mimeType}:{localPath:string;name:string;mimeType:string})=>{
+    if(!ownerPhone||!peerPhone)throw new Error("Aktif kişi bulunamadı.");
+    const cleanPath=localPath.replace(/^file:\/\//,""),stat=await RNFS.stat(cleanPath),size=Number(stat.size);
+    if(size<=0)throw new Error("Dosya boş.");if(size>6*1024*1024)throw new Error("Dosya sınırı 6 MB.");
+    setAttachmentBusy(true);setAttachmentProgress(.1);
+    try{const dataBase64=await RNFS.readFile(cleanPath,"base64");setAttachmentProgress(.45);
+      const data=await fetchJson<any>("/livebridge/chat/file",{method:"POST",body:JSON.stringify({
+        senderPhone:ownerPhone,recipientPhone:peerPhone,senderName:participantName,fileName:name,mimeType,dataBase64})},30000);
+      setAttachments(cur=>[...cur,{id:data.message.id,side:"local",name:data.message.fileName||name,mimeType:data.message.mimeType||mimeType,
+        localPath:cleanPath,remoteUrl:data.message.url||"",size:Number(data.message.fileSize||size),createdAt:Number(data.message.createdAt||Date.now())}]);
+      setAttachmentProgress(1);
+    }finally{setAttachmentBusy(false);setTimeout(()=>setAttachmentProgress(0),300);}
   };
 
   const runWithVideoPickerPause = async <T,>(task: () => Promise<T>) => {
@@ -1305,9 +1092,9 @@ function RoomView({
         launchImageLibrary({
           mediaType: "photo",
           selectionLimit: 1,
-          quality: 0.72,
-          maxWidth: 1600,
-          maxHeight: 1600,
+          quality: 0.62,
+          maxWidth: 1280,
+          maxHeight: 1280,
         }),
       );
 
@@ -1409,9 +1196,7 @@ function RoomView({
   const shareAttachment = async (
     attachment: LiveBridgeAttachment,
   ) => {
-    const uri = attachment.localPath.startsWith("file://")
-      ? attachment.localPath
-      : `file://${attachment.localPath}`;
+    const uri=attachment.remoteUrl?attachment.remoteUrl:(attachment.localPath.startsWith("file://")?attachment.localPath:`file://${attachment.localPath}`);
 
     await RNShare.open({
       url: uri,
@@ -2367,6 +2152,8 @@ export default function RemoteCallScreen({
     useState<"male" | "female">("female");
   const [activeCallMode, setActiveCallMode] = useState<LiveBridgeCallMode>("video");
   const [contactsPermissionDenied, setContactsPermissionDenied] = useState(false);
+  const [recentConversations,setRecentConversations]=useState<LiveBridgeRecentConversation[]>([]);
+  const [recentLoading,setRecentLoading]=useState(false);
   const [selectedDirectoryUser, setSelectedDirectoryUser] =
     useState<LiveBridgeDirectoryUser | null>(null);
   const [sourceLanguageIndex, setSourceLanguageIndex] = useState(
@@ -2531,6 +2318,12 @@ export default function RemoteCallScreen({
       return false;
     }
   }, [directoryPhone, name, sourceCallLanguage.name, voiceGender]);
+
+  const loadRecentConversations=useCallback(async()=>{
+    if(!directoryProfileReady||!directoryPhone)return;
+    try{setRecentLoading(true);const d=await fetchJson<any>(`/livebridge/chat/recent?phone=${encodeURIComponent(directoryPhone)}`,{method:"GET"},12000);
+    setRecentConversations(Array.isArray(d?.recents)?d.recents:[]);}catch{setRecentConversations([]);}finally{setRecentLoading(false);}
+  },[directoryPhone,directoryProfileReady]);
 
   const syncLiveBridgeContacts = useCallback(async () => {
     if (!directoryProfileReady || !directoryPhone) return;
@@ -3090,6 +2883,8 @@ export default function RemoteCallScreen({
             callMode={activeCallMode}
             bridgeDistance={activeBridgeDistance}
             remoteVoiceGender={activeRemoteVoiceGender}
+            ownerPhone={directoryPhone}
+            peerPhone={outgoingCall?.calleePhone || incomingCall?.callerPhone || ""}
             onChangeSourceLanguage={language => {
               const index = CALL_LANGUAGES.findIndex(
                 item => item.locale === language.locale,
@@ -3130,6 +2925,14 @@ export default function RemoteCallScreen({
             contentContainerStyle={styles.content}
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator={false}>
+            {directoryProfileReady ? (
+              <View style={styles.liveBridgeTopMenu}>
+                <TouchableOpacity style={styles.liveBridgeTopMenuActive} onPress={()=>void syncLiveBridgeContacts()}><Text style={styles.liveBridgeTopMenuTextActive}>Kişiler</Text></TouchableOpacity>
+                <TouchableOpacity style={styles.liveBridgeTopMenuButton} onPress={showQrInvite}><Text style={styles.liveBridgeTopMenuText}>Davetler</Text></TouchableOpacity>
+                <TouchableOpacity style={styles.liveBridgeTopMenuButton} onPress={()=>void loadRecentConversations()}><Text style={styles.liveBridgeTopMenuText}>Sohbetler</Text></TouchableOpacity>
+              </View>
+            ):null}
+
             {!directoryProfileReady ? (
               <View style={styles.directorySetupCard}>
                 <Text style={styles.directorySetupEyebrow}>LIVEBRIDGE KİŞİLER</Text>
@@ -3241,6 +3044,25 @@ export default function RemoteCallScreen({
                 )}
               </>
             )}
+
+            {directoryProfileReady?(
+              <View style={styles.recentSection}>
+                <View style={styles.directoryHeaderRow}><View><Text style={styles.directoryTitle}>Son Görüşmeler</Text>
+                <Text style={styles.directorySubtitle}>Yazışmalar · çeviriler · dosyalar</Text></View>
+                <TouchableOpacity style={styles.directorySyncButton} onPress={()=>void loadRecentConversations()}>
+                {recentLoading?<ActivityIndicator size="small" color="#4BC6FF"/>:<CallControlIcon name="loading" size={22}/>}</TouchableOpacity></View>
+                {recentConversations.length?(
+                  <View style={styles.directoryListCard}>{recentConversations.slice(0,8).map(item=>(
+                    <TouchableOpacity key={item.peerPhone} style={styles.directoryUserRow} onPress={()=>setSelectedDirectoryUser({
+                      phone:item.peerPhone,name:item.peerName,online:Boolean(item.peerOnline),lastSeen:item.updatedAt})}>
+                      <View style={styles.directoryAvatar}><Text style={styles.directoryAvatarText}>{(item.peerName||"?").slice(0,1).toUpperCase()}</Text></View>
+                      <View style={styles.directoryUserInfo}><Text style={styles.directoryUserName}>{item.peerName}</Text>
+                      <Text style={styles.directoryUserPresence} numberOfLines={1}>{item.lastText}</Text></View><Text style={styles.directoryChevronText}>›</Text>
+                    </TouchableOpacity>))}</View>
+                ):<View style={styles.directoryEmptyCard}><Text style={styles.directoryEmptyTitle}>Henüz görüşme yok</Text>
+                <Text style={styles.directoryEmptyText}>İlk çeviri veya dosya paylaşımından sonra burada görünecek.</Text></View>}
+              </View>
+            ):null}
 
             <View style={styles.directoryFallbackDivider}>
               <View style={styles.advancedDividerLine} />
@@ -3907,6 +3729,12 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     textAlign: "center",
   },
+  liveBridgeTopMenu:{flexDirection:"row",gap:8,marginBottom:16,padding:4,borderRadius:18,backgroundColor:"#08162B",borderWidth:1,borderColor:"#16345A"},
+  liveBridgeTopMenuButton:{flex:1,minHeight:42,borderRadius:14,alignItems:"center",justifyContent:"center"},
+  liveBridgeTopMenuActive:{flex:1,minHeight:42,borderRadius:14,alignItems:"center",justifyContent:"center",backgroundColor:"#123B68"},
+  liveBridgeTopMenuText:{color:"#7892B1",fontWeight:"800",fontSize:12},
+  liveBridgeTopMenuTextActive:{color:"#FFFFFF",fontWeight:"900",fontSize:12},
+  recentSection:{marginTop:18,marginBottom:12},
   directorySetupCard: {borderRadius: 22,padding: 17,marginBottom: 16,backgroundColor: "#0B1730",borderWidth: 1,borderColor: "#315FA8"},
   directorySetupEyebrow: {color: "#4BC6FF",fontSize: 9,fontWeight: "900",letterSpacing: 1.3},
   directorySetupTitle: {color: "#FFFFFF",fontSize: 19,lineHeight: 24,fontWeight: "900",marginTop: 6},
