@@ -118,6 +118,7 @@ type TranslationPacket = {
   toLanguage: string;
   toLocale: string;
   senderName: string;
+  voiceGender?: "male" | "female";
   createdAt: number;
 };
 
@@ -413,6 +414,9 @@ function RoomView({
 
   const translationRequestRef = useRef(false);
   const microphoneWasEnabledRef = useRef(true);
+  const autoTranslationEnabledRef = useRef(false);
+  const autoTranslationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoTranslationRunIdRef = useRef(0);
 
   const [microphoneEnabled, setMicrophoneEnabled] = useState(true);
   const [cameraEnabled, setCameraEnabled] = useState(true);
@@ -422,6 +426,7 @@ function RoomView({
   const [controlBusy, setControlBusy] = useState(false);
   const [translationListening, setTranslationListening] = useState(false);
   const [translationBusy, setTranslationBusy] = useState(false);
+  const [autoTranslationEnabled, setAutoTranslationEnabled] = useState(false);
   const [localOriginal, setLocalOriginal] = useState("");
   const [localTranslated, setLocalTranslated] = useState("");
   const [remoteOriginal, setRemoteOriginal] = useState("");
@@ -433,6 +438,28 @@ function RoomView({
   const [voiceTranslationEnabled, setVoiceTranslationEnabled] = useState(true);
   const [translationVoiceGender, setTranslationVoiceGender] =
     useState<"male" | "female">(remoteVoiceGender);
+  const translationVoiceGenderRef = useRef<"male" | "female">(remoteVoiceGender);
+  const translationVoiceGenderTouchedRef = useRef(false);
+  const cloudTranslationSoundRef = useRef<Sound | null>(null);
+
+  const changeTranslationVoiceGender = useCallback((gender:"male"|"female")=>{
+    translationVoiceGenderTouchedRef.current = true;
+    translationVoiceGenderRef.current = gender;
+    setTranslationVoiceGender(gender);
+
+    // Eski cinsiyetle çalmakta olan TTS varsa anında durdur.
+    const currentSound = cloudTranslationSoundRef.current;
+    cloudTranslationSoundRef.current = null;
+    if (currentSound) {
+      try {
+        currentSound.stop(() => {
+          try { currentSound.release(); } catch {}
+        });
+      } catch {
+        try { currentSound.release(); } catch {}
+      }
+    }
+  },[]);
   const [profanityMode, setProfanityMode] =
     useState<ProfanityMode>("soften");
   const [inCallLanguagePicker, setInCallLanguagePicker] = useState<
@@ -456,6 +483,9 @@ function RoomView({
   const cameraRecoveryDoneRef = useRef(false);
 
   useEffect(() => {
+    // Profil cinsiyeti yalnız kullanıcı görüşme içinde manuel seçim yapmadıysa başlangıç değeri olur.
+    if (translationVoiceGenderTouchedRef.current) return;
+    translationVoiceGenderRef.current = remoteVoiceGender;
     setTranslationVoiceGender(remoteVoiceGender);
   }, [remoteVoiceGender]);
 
@@ -599,9 +629,26 @@ function RoomView({
 
   useEffect(() => {
     return () => {
+      autoTranslationEnabledRef.current = false;
+      autoTranslationRunIdRef.current += 1;
+      if (autoTranslationTimerRef.current) {
+        clearTimeout(autoTranslationTimerRef.current);
+        autoTranslationTimerRef.current = null;
+      }
       try {
         AySpeech?.cancel();
       } catch {}
+      const currentSound = cloudTranslationSoundRef.current;
+      cloudTranslationSoundRef.current = null;
+      if (currentSound) {
+        try {
+          currentSound.stop(() => {
+            try { currentSound.release(); } catch {}
+          });
+        } catch {
+          try { currentSound.release(); } catch {}
+        }
+      }
     };
   }, []);
 
@@ -684,8 +731,12 @@ function RoomView({
     await new Promise<void>((resolve, reject) => {
       const sound = new Sound(filePath, "", error => {
         if (error) return reject(error);
+        cloudTranslationSoundRef.current = sound;
         sound.setVolume(1);
         sound.play(ok => {
+          if (cloudTranslationSoundRef.current === sound) {
+            cloudTranslationSoundRef.current = null;
+          }
           sound.release();
           void RNFS.unlink(filePath).catch(() => undefined);
           ok ? resolve() : reject(new Error("Ses oynatılamadı."));
@@ -694,36 +745,70 @@ function RoomView({
     });
   };
 
-  const speakTranslation = async (translated: string, locale: string) => {
+  const speakTranslation = async (
+    translated: string,
+    locale: string,
+    explicitGender?: "male" | "female",
+  ) => {
     if (!voiceTranslationEnabled || !translated.trim()) return;
-    const languageName = CALL_LANGUAGES.find(item => item.locale === locale)?.name || locale;
-    const remoteGender: "male" | "female" = translationVoiceGender;
+
+    const languageName =
+      CALL_LANGUAGES.find(item => item.locale === locale)?.name || locale;
+    const selectedGender: "male" | "female" =
+      explicitGender || translationVoiceGenderRef.current;
+
     try {
       await Tts.stop();
-      const voices = await Tts.voices();
-      const prepared = prepareSpeech({text: translated, locale, voices});
 
-      // Kadın/Erkek seçiminin gerçekten duyulması için bulut TTS ana yoldur.
-      // Android'in yerel TTS motoru çoğu cihazda cinsiyet seçimini güvenilir biçimde uygulamaz.
-      try {
-        await playCloudTranslation(prepared.speechText, languageName, remoteGender);
-        return;
-      } catch {
-        // İnternet/bulut TTS geçici olarak başarısızsa görüşme sessiz kalmasın:
-        // cihazdaki uygun dil sesi yedek olarak kullanılır.
+      const currentSound = cloudTranslationSoundRef.current;
+      cloudTranslationSoundRef.current = null;
+      if (currentSound) {
+        try {
+          currentSound.stop(() => {
+            try { currentSound.release(); } catch {}
+          });
+        } catch {
+          try { currentSound.release(); } catch {}
+        }
       }
 
-      if (prepared.selectedVoiceId) await Tts.setDefaultVoice(prepared.selectedVoiceId);
-      else await Tts.setDefaultLanguage(prepared.selectedLocale);
-      await Tts.speak(prepared.speechText, {
-        iosVoiceId: prepared.selectedVoiceId || "", rate: 0.48,
-        androidParams: {KEY_PARAM_PAN:0, KEY_PARAM_VOLUME:1.0, KEY_PARAM_STREAM:"STREAM_MUSIC"},
+      const voices = await Tts.voices();
+      const prepared = prepareSpeech({
+        text: translated,
+        locale,
+        voices,
       });
-    } catch {
-      try {
-        const prepared = prepareSpeech({text: translated, locale, voices: []});
-        await playCloudTranslation(prepared.speechText, languageName, remoteGender);
-      } catch {}
+
+      // Cinsiyet seçimi kesin olmalı. Yerel Android TTS cinsiyeti garanti etmediği için
+      // burada kontrolsüz local fallback kullanılmaz.
+      let lastError: unknown = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          await playCloudTranslation(
+            prepared.speechText,
+            languageName,
+            selectedGender,
+          );
+          return;
+        } catch (error) {
+          lastError = error;
+          if (attempt === 0) {
+            await new Promise<void>(resolve => setTimeout(resolve, 220));
+          }
+        }
+      }
+
+      console.warn(
+        "LiveBridge TTS seçilen cinsiyetle üretilemedi:",
+        selectedGender,
+        lastError,
+      );
+    } catch (error) {
+      console.warn(
+        "LiveBridge TTS hatası:",
+        selectedGender,
+        error,
+      );
     }
   };
 
@@ -759,7 +844,11 @@ function RoomView({
       setRemoteOriginal(packet.original);setRemoteTranslated(packet.translated);setBridgeActivated(true);
       setTranslationHistory(cur=>[...cur,{id:`remote-${packet.createdAt}`,side:"remote",original:packet.original,translated:packet.translated,
       senderName:packet.senderName||"Karşı taraf",createdAt:packet.createdAt}].slice(-120));
-      if(voiceTranslationEnabled)void speakTranslation(packet.translated,packet.toLocale||targetLanguage.locale);}catch{}
+      if(voiceTranslationEnabled)void speakTranslation(
+        packet.translated,
+        packet.toLocale||targetLanguage.locale,
+        packet.voiceGender === "male" ? "male" : "female",
+      );}catch{}
     };room.on(RoomEvent.DataReceived,h);return()=>room.off(RoomEvent.DataReceived,h);
   },[room,voiceTranslationEnabled,targetLanguage.locale]);
 
@@ -848,6 +937,7 @@ function RoomView({
       toLanguage: targetLanguage.name,
       toLocale: targetLanguage.locale,
       senderName: participantName,
+      voiceGender: translationVoiceGenderRef.current,
       createdAt: Date.now(),
     };
 
@@ -924,8 +1014,38 @@ function RoomView({
 
 
 
-  const startPushToTranslate = async () => {
-    if (translationListening || translationBusy) {
+  const stopAutomaticTranslation = useCallback(async () => {
+    autoTranslationEnabledRef.current = false;
+    autoTranslationRunIdRef.current += 1;
+
+    if (autoTranslationTimerRef.current) {
+      clearTimeout(autoTranslationTimerRef.current);
+      autoTranslationTimerRef.current = null;
+    }
+
+    try {
+      AySpeech?.cancel();
+    } catch {}
+
+    setTranslationListening(false);
+    setAutoTranslationEnabled(false);
+    await restoreCallMicrophone();
+  }, []);
+
+  const startPushToTranslate = async (automatic = false, runId?: number) => {
+    if (automatic) {
+      if (
+        !autoTranslationEnabledRef.current ||
+        runId !== autoTranslationRunIdRef.current
+      ) {
+        return;
+      }
+
+      // Otomatik döngü hiçbir zaman ikinci bir capture'ı üst üste başlatmaz.
+      if (translationRequestRef.current || translationListening || translationBusy) {
+        return;
+      }
+    } else if (translationListening || translationBusy) {
       try {
         AySpeech?.cancel();
       } catch {}
@@ -936,10 +1056,12 @@ function RoomView({
     }
 
     if (!AySpeech) {
-      Alert.alert(
-        "Ses kayıt modülü bulunamadı",
-        "AyTalk yerel ses kayıt modülü yüklenmemiş.",
-      );
+      if (!automatic) {
+        Alert.alert(
+          "Ses kayıt modülü bulunamadı",
+          "AyTalk yerel ses kayıt modülü yüklenmemiş.",
+        );
+      }
       return;
     }
 
@@ -950,8 +1072,8 @@ function RoomView({
       microphoneWasEnabledRef.current =
         localParticipant.isMicrophoneEnabled;
 
-      // WebRTC odası açık kalır; yalnızca yerel mikrofon capture
-      // kısa süreli serbest bırakılır. Google SpeechRecognizer yoktur.
+      // WebRTC odası açık kalır; çeviri capture sırasında yalnız yerel mikrofon
+      // kısa süreli serbest bırakılır.
       const microphonePublication =
         localParticipant.getTrackPublication(
           Track.Source.Microphone,
@@ -967,11 +1089,21 @@ function RoomView({
       }
 
       await new Promise<void>(resolve => {
-        setTimeout(() => resolve(), 350);
+        setTimeout(() => resolve(), 260);
       });
+
+      if (
+        automatic &&
+        (!autoTranslationEnabledRef.current ||
+          runId !== autoTranslationRunIdRef.current)
+      ) {
+        return;
+      }
 
       setTranslationListening(true);
 
+      // AySpeech kendi sessizlik algılamasıyla konuşma bittiğinde erken döner;
+      // 9 sn yalnızca üst sınırdır.
       const captured = await AySpeech.capture(9000);
       setTranslationListening(false);
 
@@ -980,7 +1112,10 @@ function RoomView({
       ).trim();
 
       if (!audioBase64) {
-        throw new Error("Ses kaydı boş geldi.");
+        if (!automatic) {
+          throw new Error("Ses kaydı boş geldi.");
+        }
+        return;
       }
 
       const data = await fetchJson<{text?: string}>(
@@ -1002,7 +1137,10 @@ function RoomView({
       ).trim();
 
       if (!recognized) {
-        throw new Error("Konuşma algılanmadı.");
+        if (!automatic) {
+          throw new Error("Konuşma algılanmadı.");
+        }
+        return;
       }
 
       setLocalOriginal(recognized);
@@ -1015,19 +1153,115 @@ function RoomView({
           ? speechError.message
           : "Ses algılanamadı.";
 
-      if (
-        !message.toLowerCase().includes("iptal") &&
-        !message.toLowerCase().includes("cancel")
-      ) {
+      // Hands-free modda ortam sessizliği / no-speech normaldir.
+      // Sadece gerçek ağ/sistem hatalarını kullanıcıya göster.
+      const harmless =
+        message.toLowerCase().includes("iptal") ||
+        message.toLowerCase().includes("cancel") ||
+        message.toLowerCase().includes("algılanmadı") ||
+        message.toLowerCase().includes("boş geldi") ||
+        message.toLowerCase().includes("sessiz");
+
+      if (!automatic && !harmless) {
         Alert.alert(
           "Konuşma algılama hatası",
           message,
         );
+      } else if (!automatic && harmless) {
+        Alert.alert(
+          "Konuşma algılama",
+          message,
+        );
+      } else if (automatic && !harmless) {
+        console.warn("Otomatik çeviri capture:", message);
       }
     } finally {
       await restoreCallMicrophone();
+
+      if (
+        automatic &&
+        autoTranslationEnabledRef.current &&
+        runId === autoTranslationRunIdRef.current
+      ) {
+        if (autoTranslationTimerRef.current) {
+          clearTimeout(autoTranslationTimerRef.current);
+        }
+
+        autoTranslationTimerRef.current = setTimeout(() => {
+          autoTranslationTimerRef.current = null;
+          if (
+            autoTranslationEnabledRef.current &&
+            runId === autoTranslationRunIdRef.current
+          ) {
+            void startPushToTranslate(true, runId);
+          }
+        }, 360);
+      }
     }
   };
+
+  const toggleAutomaticTranslation = useCallback(() => {
+    if (autoTranslationEnabledRef.current) {
+      void stopAutomaticTranslation();
+      return;
+    }
+
+    autoTranslationRunIdRef.current += 1;
+    const runId = autoTranslationRunIdRef.current;
+    autoTranslationEnabledRef.current = true;
+    setAutoTranslationEnabled(true);
+    setBridgeActivated(true);
+
+    if (autoTranslationTimerRef.current) {
+      clearTimeout(autoTranslationTimerRef.current);
+    }
+
+    autoTranslationTimerRef.current = setTimeout(() => {
+      autoTranslationTimerRef.current = null;
+      if (
+        autoTranslationEnabledRef.current &&
+        runId === autoTranslationRunIdRef.current
+      ) {
+        void startPushToTranslate(true, runId);
+      }
+    }, 180);
+  }, [stopAutomaticTranslation]);
+
+
+  useEffect(() => {
+    if (!autoTranslationEnabledRef.current) return;
+
+    // Dil görüşme sırasında değişirse eski dil ile süren capture iptal edilir.
+    // Yeni render'daki startPushToTranslate fonksiyonu ile döngü yeniden başlar.
+    const nextRunId = autoTranslationRunIdRef.current + 1;
+    autoTranslationRunIdRef.current = nextRunId;
+
+    if (autoTranslationTimerRef.current) {
+      clearTimeout(autoTranslationTimerRef.current);
+      autoTranslationTimerRef.current = null;
+    }
+
+    try {
+      AySpeech?.cancel();
+    } catch {}
+
+    autoTranslationTimerRef.current = setTimeout(() => {
+      autoTranslationTimerRef.current = null;
+      if (
+        autoTranslationEnabledRef.current &&
+        nextRunId === autoTranslationRunIdRef.current
+      ) {
+        void startPushToTranslate(true, nextRunId);
+      }
+    }, 320);
+
+    return () => {
+      if (autoTranslationTimerRef.current) {
+        clearTimeout(autoTranslationTimerRef.current);
+        autoTranslationTimerRef.current = null;
+      }
+    };
+  }, [sourceLanguage.locale, targetLanguage.locale]);
 
   const toggleMicrophone = async () => {
     if (controlBusy) return;
@@ -1459,8 +1693,8 @@ function RoomView({
               <View style={styles.audioConversationEmpty}>
                 <Text style={styles.audioConversationEmptyTitle}>Konuşmaya başlayın</Text>
                 <Text style={styles.audioConversationEmptyText}>
-                  Çeviri düğmesiyle konuşabilir veya aşağıdan mesaj yazabilirsiniz.
-                  Görüşmedeki çeviriler bu alanda kayıtlı kalır.
+                  Çeviri düğmesine bir kez dokunarak Otomatik modu açın.
+                  AyTalk konuşma bittiğinde kendisi çevirir; görüşme sırasında dilleri değiştirebilirsiniz.
                 </Text>
               </View>
             ) : (
@@ -1826,14 +2060,22 @@ function RoomView({
           <TouchableOpacity
             style={[
               styles.railControlButton,
-              (translationListening || translationBusy) && styles.railControlTranslateActive,
+              autoTranslationEnabled && styles.railControlTranslateActive,
             ]}
-            onPress={() => void startPushToTranslate()}>
+            onPress={toggleAutomaticTranslation}>
             <CallControlIcon
-              name={translationListening ? "stop" : translationBusy ? "loading" : "translate"}
+              name={
+                translationBusy
+                  ? "loading"
+                  : autoTranslationEnabled
+                    ? "stop"
+                    : "translate"
+              }
               size={25}
             />
-            <Text style={styles.railControlTranslateLabel}>Çeviri</Text>
+            <Text style={styles.railControlTranslateLabel}>
+              {autoTranslationEnabled ? "Otomatik" : "Çeviri"}
+            </Text>
           </TouchableOpacity>
 
           <TouchableOpacity
@@ -1859,12 +2101,14 @@ function RoomView({
               <View style={styles.bottomStatusDot} />
               <Text style={styles.bottomStatusText}>
                 {translationListening
-                  ? "Dinliyor"
+                  ? "Konuşmanı dinliyor"
                   : translationBusy
                     ? "Çeviriyor"
-                    : bridgeActivated
-                      ? "Dil köprüsü aktif"
-                      : "Hazır"}
+                    : autoTranslationEnabled
+                      ? "Otomatik çeviri açık"
+                      : bridgeActivated
+                        ? "Dil köprüsü hazır"
+                        : "Hazır"}
               </Text>
             </View>
             {bridgeDistance ? (
@@ -2160,6 +2404,28 @@ function RoomView({
                 </View>
               </TouchableOpacity>
 
+              <TouchableOpacity
+                style={[
+                  styles.moreMenuItem,
+                  autoTranslationEnabled && styles.moreMenuVoiceButtonActive,
+                ]}
+                onPress={() => {
+                  setMoreMenuVisible(false);
+                  toggleAutomaticTranslation();
+                }}>
+                <CallControlIcon name="translate" size={22} />
+                <View style={styles.moreMenuItemTextWrap}>
+                  <Text style={styles.moreMenuItemTitle}>
+                    Otomatik Çeviri
+                  </Text>
+                  <Text style={styles.moreMenuItemSub}>
+                    {autoTranslationEnabled
+                      ? "Açık · konuş ve AyTalk kendisi çevirsin"
+                      : "Kapalı · açmak için dokun"}
+                  </Text>
+                </View>
+              </TouchableOpacity>
+
               <View style={styles.moreMenuVoiceSection}>
                 <Text style={styles.moreMenuLanguageLabel}>Çeviri sesi</Text>
                 <View style={styles.moreMenuVoiceRow}>
@@ -2169,7 +2435,7 @@ function RoomView({
                       translationVoiceGender === "female" &&
                         styles.moreMenuVoiceButtonActive,
                     ]}
-                    onPress={() => setTranslationVoiceGender("female")}>
+                    onPress={() => changeTranslationVoiceGender("female")}>
                     <Text style={styles.moreMenuVoiceText}>👩 Kadın</Text>
                   </TouchableOpacity>
                   <TouchableOpacity
@@ -2178,7 +2444,7 @@ function RoomView({
                       translationVoiceGender === "male" &&
                         styles.moreMenuVoiceButtonActive,
                     ]}
-                    onPress={() => setTranslationVoiceGender("male")}>
+                    onPress={() => changeTranslationVoiceGender("male")}>
                     <Text style={styles.moreMenuVoiceText}>👨 Erkek</Text>
                   </TouchableOpacity>
                 </View>
@@ -2339,6 +2605,8 @@ export default function RemoteCallScreen({
   const [historyMessages, setHistoryMessages] =
     useState<LiveBridgeStoredMessage[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [chatInput, setChatInput] = useState("");
+  const [chatSending, setChatSending] = useState(false);
   const [contactsPermissionDenied, setContactsPermissionDenied] = useState(false);
   const [recentConversations,setRecentConversations]=useState<LiveBridgeRecentConversation[]>([]);
   const [recentLoading,setRecentLoading]=useState(false);
@@ -2516,32 +2784,258 @@ export default function RemoteCallScreen({
     setRecentConversations(Array.isArray(d?.recents)?d.recents:[]);}catch{setRecentConversations([]);}finally{setRecentLoading(false);}
   },[directoryPhone,directoryProfileReady]);
 
-  const openConversationHistory = useCallback(
-    async (item: LiveBridgeRecentConversation) => {
-      if (!directoryPhone) return;
-      setHistoryPeer(item);
-      setHistoryMessages([]);
-      setHistoryLoading(true);
+  const loadConversationMessages = useCallback(
+    async (peerPhone: string, showSpinner = false) => {
+      if (!directoryPhone || !peerPhone) return;
+      if (showSpinner) setHistoryLoading(true);
       try {
         const data = await fetchJson<{messages?: LiveBridgeStoredMessage[]}>(
           `/livebridge/chat/history?phone=${encodeURIComponent(
             directoryPhone,
-          )}&peerPhone=${encodeURIComponent(item.peerPhone)}`,
+          )}&peerPhone=${encodeURIComponent(peerPhone)}`,
           {method: "GET"},
           15000,
         );
         setHistoryMessages(Array.isArray(data?.messages) ? data.messages : []);
       } catch (error) {
-        Alert.alert(
-          "Sohbet geçmişi",
-          error instanceof Error ? error.message : "Geçmiş yüklenemedi.",
-        );
+        if (showSpinner) {
+          Alert.alert(
+            "Sohbet geçmişi",
+            error instanceof Error ? error.message : "Geçmiş yüklenemedi.",
+          );
+        }
       } finally {
-        setHistoryLoading(false);
+        if (showSpinner) setHistoryLoading(false);
       }
     },
     [directoryPhone],
   );
+
+  const openConversationHistory = useCallback(
+    async (item: LiveBridgeRecentConversation) => {
+      if (!directoryPhone) return;
+      setHistoryPeer(item);
+      setHistoryMessages([]);
+      setChatInput("");
+      await loadConversationMessages(item.peerPhone, true);
+    },
+    [directoryPhone, loadConversationMessages],
+  );
+
+  const openDirectoryChat = useCallback(
+    async (user: LiveBridgeDirectoryUser) => {
+      await openConversationHistory({
+        peerPhone: user.phone,
+        peerName: user.name,
+        peerOnline: user.online,
+        lastKind: "text",
+        lastText: user.online ? "Çevrimiçi" : formatPresence(user.lastSeen),
+        updatedAt: Number(user.lastSeen || Date.now()),
+      });
+    },
+    [openConversationHistory],
+  );
+
+  const historyPeerAsDirectoryUser = useMemo<LiveBridgeDirectoryUser | null>(
+    () =>
+      historyPeer
+        ? {
+            phone: historyPeer.peerPhone,
+            name: historyPeer.peerName,
+            online: Boolean(historyPeer.peerOnline),
+            lastSeen: historyPeer.updatedAt,
+          }
+        : null,
+    [historyPeer],
+  );
+
+  const sendPersistentChatText = useCallback(async () => {
+    const body = chatInput.trim();
+    if (!body || !historyPeer || !directoryPhone || chatSending) return;
+
+    try {
+      setChatSending(true);
+      setChatInput("");
+
+      await fetchJson(
+        "/livebridge/chat/text",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            senderPhone: directoryPhone,
+            recipientPhone: historyPeer.peerPhone,
+            senderName: name.trim() || "AyTalk Kullanıcısı",
+            originalText: body,
+            translatedText: body,
+          }),
+        },
+        12000,
+      );
+
+      await loadConversationMessages(historyPeer.peerPhone);
+      void loadRecentConversations();
+    } catch (error) {
+      setChatInput(body);
+      Alert.alert(
+        "Mesaj gönderilemedi",
+        error instanceof Error ? error.message : "Mesaj gönderilemedi.",
+      );
+    } finally {
+      setChatSending(false);
+    }
+  }, [
+    chatInput,
+    chatSending,
+    directoryPhone,
+    historyPeer,
+    loadConversationMessages,
+    loadRecentConversations,
+    name,
+  ]);
+
+  const uploadPersistentChatFile = useCallback(
+    async ({
+      localPath,
+      fileName,
+      mimeType,
+    }: {
+      localPath: string;
+      fileName: string;
+      mimeType: string;
+    }) => {
+      if (!historyPeer || !directoryPhone || chatSending) return;
+
+      const cleanPath = localPath.replace(/^file:\/\//, "");
+      const stat = await RNFS.stat(cleanPath);
+      const size = Number(stat.size || 0);
+
+      if (size <= 0) {
+        throw new Error("Dosya boş.");
+      }
+      if (size > 6 * 1024 * 1024) {
+        throw new Error("Sohbet dosyası en fazla 6 MB olabilir.");
+      }
+
+      setChatSending(true);
+      try {
+        const dataBase64 = await RNFS.readFile(cleanPath, "base64");
+        await fetchJson(
+          "/livebridge/chat/file",
+          {
+            method: "POST",
+            body: JSON.stringify({
+              senderPhone: directoryPhone,
+              recipientPhone: historyPeer.peerPhone,
+              senderName: name.trim() || "AyTalk Kullanıcısı",
+              fileName,
+              mimeType,
+              dataBase64,
+            }),
+          },
+          30000,
+        );
+
+        await loadConversationMessages(historyPeer.peerPhone);
+        void loadRecentConversations();
+      } finally {
+        setChatSending(false);
+      }
+    },
+    [
+      chatSending,
+      directoryPhone,
+      historyPeer,
+      loadConversationMessages,
+      loadRecentConversations,
+      name,
+    ],
+  );
+
+  const choosePersistentChatImage = useCallback(async () => {
+    try {
+      const response = await launchImageLibrary({
+        mediaType: "photo",
+        selectionLimit: 1,
+        quality: 0.65,
+        maxWidth: 1280,
+        maxHeight: 1280,
+      });
+      if (response.didCancel || !response.assets?.[0]?.uri) return;
+      const asset = response.assets[0];
+      await uploadPersistentChatFile({
+        localPath: asset.uri,
+        fileName: asset.fileName || `aytalk-${Date.now()}.jpg`,
+        mimeType: asset.type || "image/jpeg",
+      });
+    } catch (error) {
+      Alert.alert(
+        "Fotoğraf gönderilemedi",
+        error instanceof Error ? error.message : "Fotoğraf gönderilemedi.",
+      );
+    }
+  }, [uploadPersistentChatFile]);
+
+  const choosePersistentChatDocument = useCallback(async () => {
+    try {
+      const picked = await pick({
+        type: [types.allFiles],
+        allowMultiSelection: false,
+      });
+      const first = Array.isArray(picked) ? picked[0] : picked;
+      if (!first?.uri) return;
+
+      let localPath = first.uri;
+      try {
+        const copies = await keepLocalCopy({
+          files: [
+            {
+              uri: first.uri,
+              fileName: first.name || `dosya-${Date.now()}`,
+            },
+          ],
+          destination: "cachesDirectory",
+        });
+        const copied = copies?.[0];
+        if (copied?.status === "success" && copied.localUri) {
+          localPath = copied.localUri;
+        }
+      } catch {}
+
+      await uploadPersistentChatFile({
+        localPath,
+        fileName: first.name || `dosya-${Date.now()}`,
+        mimeType: first.type || "application/octet-stream",
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || "");
+      if (!/cancel/i.test(message)) {
+        Alert.alert("Dosya gönderilemedi", message || "Dosya gönderilemedi.");
+      }
+    }
+  }, [uploadPersistentChatFile]);
+
+  const openChatAttachmentMenu = useCallback(() => {
+    Alert.alert(
+      "Gönder",
+      "Sohbete ne eklemek istiyorsun?",
+      [
+        {text: "Fotoğraf", onPress: () => void choosePersistentChatImage()},
+        {text: "Dosya", onPress: () => void choosePersistentChatDocument()},
+        {text: "Vazgeç", style: "cancel"},
+      ],
+    );
+  }, [choosePersistentChatDocument, choosePersistentChatImage]);
+
+
+  useEffect(() => {
+    if (!historyPeer?.peerPhone || !directoryPhone) return;
+
+    const timer = setInterval(() => {
+      void loadConversationMessages(historyPeer.peerPhone);
+    }, 3000);
+
+    return () => clearInterval(timer);
+  }, [directoryPhone, historyPeer?.peerPhone, loadConversationMessages]);
 
   const syncLiveBridgeContacts = useCallback(async () => {
     if (!directoryProfileReady || !directoryPhone) return;
@@ -3110,7 +3604,7 @@ export default function RemoteCallScreen({
             participantName={name.trim() || "LiveBridge Kullanıcısı"}
             callMode={activeCallMode}
             bridgeDistance={activeBridgeDistance}
-            remoteVoiceGender={activeRemoteVoiceGender}
+            remoteVoiceGender={voiceGender}
             ownerPhone={directoryPhone}
             peerPhone={activePeerPhone}
             onChangeSourceLanguage={language => {
@@ -3257,7 +3751,7 @@ export default function RemoteCallScreen({
                         key={user.phone}
                         activeOpacity={0.88}
                         style={styles.directoryUserRow}
-                        onPress={() => setSelectedDirectoryUser(user)}>
+                        onPress={() => void openDirectoryChat(user)}>
                         <View style={styles.directoryAvatar}>
                           <Text style={styles.directoryAvatarText}>
                             {(user.name || "?").slice(0,1).toUpperCase()}
@@ -3494,28 +3988,70 @@ export default function RemoteCallScreen({
 
       <Modal
         visible={historyPeer !== null}
-        transparent
         animationType="slide"
         onRequestClose={() => setHistoryPeer(null)}>
-        <View style={styles.contactActionBackdrop}>
-          <View style={styles.chatHistoryCard}>
-            <View style={styles.chatHistoryHeader}>
-              <View>
-                <Text style={styles.chatHistoryTitle}>
-                  {historyPeer?.peerName || "Sohbet"}
-                </Text>
-                <Text style={styles.chatHistorySubtitle}>
-                  Kalıcı LiveBridge geçmişi
-                </Text>
-              </View>
-              <TouchableOpacity onPress={() => setHistoryPeer(null)}>
-                <Text style={styles.chatHistoryClose}>✕</Text>
-              </TouchableOpacity>
+        <SafeAreaViewSafe style={styles.chatScreenSafe}>
+          <View style={styles.chatScreenHeader}>
+            <TouchableOpacity
+              style={styles.chatHeaderBack}
+              onPress={() => setHistoryPeer(null)}>
+              <Text style={styles.chatHeaderBackText}>‹</Text>
+            </TouchableOpacity>
+
+            <View style={styles.chatHeaderAvatar}>
+              <Text style={styles.chatHeaderAvatarText}>
+                {(historyPeer?.peerName || "?").slice(0, 1).toUpperCase()}
+              </Text>
             </View>
+
+            <View style={styles.chatHeaderIdentity}>
+              <Text style={styles.chatHeaderName} numberOfLines={1}>
+                {historyPeer?.peerName || "LiveBridge"}
+              </Text>
+              <Text style={styles.chatHeaderPresence}>
+                {historyPeer?.peerOnline ? "Çevrimiçi" : "LiveBridge sohbeti"}
+              </Text>
+            </View>
+
+            <TouchableOpacity
+              style={styles.chatHeaderAction}
+              disabled={!historyPeerAsDirectoryUser}
+              onPress={() => {
+                if (!historyPeerAsDirectoryUser) return;
+                void startDirectCall(historyPeerAsDirectoryUser, "audio");
+              }}>
+              <CallControlIcon name="speaker" size={24} />
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.chatHeaderAction}
+              disabled={!historyPeerAsDirectoryUser}
+              onPress={() => {
+                if (!historyPeerAsDirectoryUser) return;
+                void startDirectCall(historyPeerAsDirectoryUser, "video");
+              }}>
+              <CallControlIcon name="camera" size={24} />
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.chatHeaderAction}
+              onPress={() =>
+                historyPeerAsDirectoryUser &&
+                setSelectedDirectoryUser(historyPeerAsDirectoryUser)
+              }>
+              <Text style={styles.chatHeaderMore}>⋮</Text>
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.chatScreenBody}>
             {historyLoading ? (
-              <ActivityIndicator size="large" color="#4BC6FF" />
+              <View style={styles.chatScreenLoading}>
+                <ActivityIndicator size="large" color="#4BC6FF" />
+              </View>
             ) : (
-              <ScrollView style={styles.chatHistoryScroll}>
+              <ScrollView
+                style={styles.chatHistoryScroll}
+                contentContainerStyle={styles.chatHistoryContent}>
                 {historyMessages.map(message => {
                   const mine = message.senderPhone === directoryPhone;
                   return (
@@ -3529,6 +4065,13 @@ export default function RemoteCallScreen({
                       ]}>
                       {message.kind === "file" ? (
                         <>
+                          {message.mimeType?.startsWith("image/") && message.url ? (
+                            <Image
+                              source={{uri: message.url}}
+                              style={styles.chatMessageImage}
+                              resizeMode="cover"
+                            />
+                          ) : null}
                           <Text style={styles.chatHistoryFile}>
                             📎 {message.fileName || "Dosya"}
                           </Text>
@@ -3554,7 +4097,9 @@ export default function RemoteCallScreen({
                         </>
                       ) : (
                         <>
-                          {message.originalText ? (
+                          {message.originalText &&
+                          message.translatedText &&
+                          message.originalText !== message.translatedText ? (
                             <Text style={styles.chatHistoryOriginal}>
                               {message.originalText}
                             </Text>
@@ -3564,18 +4109,65 @@ export default function RemoteCallScreen({
                           </Text>
                         </>
                       )}
+
+                      <Text style={styles.chatMessageTime}>
+                        {new Date(message.createdAt).toLocaleTimeString("tr-TR", {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })}
+                      </Text>
                     </View>
                   );
                 })}
+
                 {!historyLoading && historyMessages.length === 0 ? (
-                  <Text style={styles.chatHistoryEmpty}>
-                    Bu kişiyle henüz kayıtlı mesaj yok.
-                  </Text>
+                  <View style={styles.chatWelcomeCard}>
+                    <Text style={styles.chatWelcomeTitle}>
+                      {historyPeer?.peerName || "LiveBridge"} ile sohbet
+                    </Text>
+                    <Text style={styles.chatWelcomeText}>
+                      Mesajlar, görüşmede yapılan çeviriler ve paylaşılan dosyalar burada kalır.
+                    </Text>
+                  </View>
                 ) : null}
               </ScrollView>
             )}
           </View>
-        </View>
+
+          <View style={styles.chatComposer}>
+            <TouchableOpacity
+              style={styles.chatComposerAttach}
+              disabled={chatSending}
+              onPress={openChatAttachmentMenu}>
+              <Text style={styles.chatComposerAttachText}>＋</Text>
+            </TouchableOpacity>
+
+            <TextInput
+              style={styles.chatComposerInput}
+              value={chatInput}
+              onChangeText={setChatInput}
+              placeholder="Mesaj"
+              placeholderTextColor="#6F8AA8"
+              multiline
+              maxLength={5000}
+            />
+
+            <TouchableOpacity
+              style={[
+                styles.chatComposerSend,
+                (!chatInput.trim() || chatSending) &&
+                  styles.chatComposerSendDisabled,
+              ]}
+              disabled={!chatInput.trim() || chatSending}
+              onPress={() => void sendPersistentChatText()}>
+              {chatSending ? (
+                <ActivityIndicator size="small" color="#FFFFFF" />
+              ) : (
+                <Text style={styles.chatComposerSendText}>➤</Text>
+              )}
+            </TouchableOpacity>
+          </View>
+        </SafeAreaViewSafe>
       </Modal>
 
       <Modal
@@ -3602,24 +4194,6 @@ export default function RemoteCallScreen({
             </Text>
 
             <View style={styles.contactActionButtons}>
-              <TouchableOpacity
-                style={styles.contactActionButton}
-                onPress={() =>
-                  selectedDirectoryUser &&
-                  void startDirectCall(
-                    selectedDirectoryUser,
-                    "chat",
-                  )
-                }>
-                <CallControlIcon name="message" size={30} />
-                <Text style={styles.contactActionButtonTitle}>
-                  Mesaj
-                </Text>
-                <Text style={styles.contactActionButtonSub}>
-                  Çeviri + dosya
-                </Text>
-              </TouchableOpacity>
-
               <TouchableOpacity
                 style={styles.contactActionButton}
                 onPress={() =>
@@ -4078,6 +4652,172 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: "700",
     textAlign: "center",
+  },
+  chatScreenSafe: {
+    flex: 1,
+    backgroundColor: "#061326",
+  },
+  chatScreenHeader: {
+    minHeight: 62,
+    paddingHorizontal: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: "#0A1D35",
+    borderBottomWidth: 1,
+    borderBottomColor: "#173A60",
+  },
+  chatHeaderBack: {
+    width: 34,
+    height: 44,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  chatHeaderBackText: {
+    color: "#FFFFFF",
+    fontSize: 38,
+    lineHeight: 40,
+    fontWeight: "300",
+  },
+  chatHeaderAvatar: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#163D67",
+  },
+  chatHeaderAvatarText: {
+    color: "#FFFFFF",
+    fontSize: 16,
+    fontWeight: "900",
+  },
+  chatHeaderIdentity: {
+    flex: 1,
+    minWidth: 0,
+  },
+  chatHeaderName: {
+    color: "#FFFFFF",
+    fontSize: 16,
+    fontWeight: "900",
+  },
+  chatHeaderPresence: {
+    color: "#86A6C8",
+    fontSize: 10,
+    marginTop: 2,
+  },
+  chatHeaderAction: {
+    width: 38,
+    height: 42,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 14,
+  },
+  chatHeaderMore: {
+    color: "#FFFFFF",
+    fontSize: 28,
+    lineHeight: 30,
+    fontWeight: "800",
+  },
+  chatScreenBody: {
+    flex: 1,
+    backgroundColor: "#07172A",
+  },
+  chatScreenLoading: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  chatHistoryContent: {
+    padding: 14,
+    paddingBottom: 24,
+  },
+  chatMessageImage: {
+    width: 210,
+    height: 160,
+    borderRadius: 12,
+    marginBottom: 8,
+    backgroundColor: "#0B213D",
+  },
+  chatMessageTime: {
+    color: "#7893AF",
+    fontSize: 9,
+    alignSelf: "flex-end",
+    marginTop: 5,
+  },
+  chatWelcomeCard: {
+    marginTop: 30,
+    alignSelf: "center",
+    maxWidth: 300,
+    borderRadius: 18,
+    padding: 16,
+    backgroundColor: "#0C213B",
+    borderWidth: 1,
+    borderColor: "#173E67",
+  },
+  chatWelcomeTitle: {
+    color: "#FFFFFF",
+    textAlign: "center",
+    fontWeight: "900",
+    fontSize: 15,
+  },
+  chatWelcomeText: {
+    color: "#86A6C8",
+    textAlign: "center",
+    fontSize: 11,
+    lineHeight: 17,
+    marginTop: 6,
+  },
+  chatComposer: {
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    flexDirection: "row",
+    alignItems: "flex-end",
+    gap: 8,
+    backgroundColor: "#091A30",
+    borderTopWidth: 1,
+    borderTopColor: "#173A60",
+  },
+  chatComposerAttach: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#14375E",
+  },
+  chatComposerAttachText: {
+    color: "#FFFFFF",
+    fontSize: 28,
+    lineHeight: 30,
+    fontWeight: "400",
+  },
+  chatComposerInput: {
+    flex: 1,
+    maxHeight: 110,
+    minHeight: 42,
+    borderRadius: 21,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    backgroundColor: "#102640",
+    color: "#FFFFFF",
+    fontSize: 14,
+  },
+  chatComposerSend: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#1687C9",
+  },
+  chatComposerSendDisabled: {
+    opacity: 0.4,
+  },
+  chatComposerSendText: {
+    color: "#FFFFFF",
+    fontSize: 20,
+    fontWeight: "900",
   },
   chatHistoryCard: {
     width: "92%",
