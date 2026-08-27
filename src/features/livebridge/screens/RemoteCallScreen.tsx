@@ -90,9 +90,6 @@ type LiveBridgeIncomingCall = {
   mode: LiveBridgeCallMode;
   status: "ringing" | "accepted" | "rejected" | "expired";
   createdAt: number;
-  callerProvince?: string;
-  calleeProvince?: string;
-  distanceKm?: number | null;
 };
 type LiveBridgeOutgoingCall = {
   id: string;
@@ -102,9 +99,6 @@ type LiveBridgeOutgoingCall = {
   calleeGender?: "male" | "female";
   mode: LiveBridgeCallMode;
   status: "ringing" | "accepted" | "rejected" | "expired";
-  callerProvince?: string;
-  calleeProvince?: string;
-  distanceKm?: number | null;
 };
 const LIVEBRIDGE_PROFILE_KEY = "livebridge_demo_profile_v1";
 const DEMO_VIP_VIDEO_UNLOCKED = true;
@@ -401,8 +395,8 @@ function RoomView({
   callMode: LiveBridgeCallMode;
   bridgeDistance?: {
     km: number;
-    firstProvince: string;
-    secondProvince: string;
+    firstCountry: string;
+    secondCountry: string;
   } | null;
   remoteVoiceGender: "male" | "female";
   ownerPhone:string;
@@ -708,10 +702,17 @@ function RoomView({
       await Tts.stop();
       const voices = await Tts.voices();
       const prepared = prepareSpeech({text: translated, locale, voices});
-      if (!prepared.hasCompatibleLocalVoice) {
+
+      // Kadın/Erkek seçiminin gerçekten duyulması için bulut TTS ana yoldur.
+      // Android'in yerel TTS motoru çoğu cihazda cinsiyet seçimini güvenilir biçimde uygulamaz.
+      try {
         await playCloudTranslation(prepared.speechText, languageName, remoteGender);
         return;
+      } catch {
+        // İnternet/bulut TTS geçici olarak başarısızsa görüşme sessiz kalmasın:
+        // cihazdaki uygun dil sesi yedek olarak kullanılır.
       }
+
       if (prepared.selectedVoiceId) await Tts.setDefaultVoice(prepared.selectedVoiceId);
       else await Tts.setDefaultLanguage(prepared.selectedLocale);
       await Tts.speak(prepared.speechText, {
@@ -1559,7 +1560,7 @@ function RoomView({
     }
 
     if (remoteTrack && isTrackReference(remoteTrack)) {
-      return <VideoTrack trackRef={remoteTrack} style={styles.remoteVideo} />;
+      return <VideoTrack trackRef={remoteTrack} style={styles.remoteVideo} objectFit="contain" />;
     }
 
     return (
@@ -1868,7 +1869,8 @@ function RoomView({
             </View>
             {bridgeDistance ? (
               <Text style={styles.bottomDistanceText}>
-                📍 {bridgeDistance.firstProvince} ↔ {bridgeDistance.secondProvince} · {bridgeDistance.km.toLocaleString("tr-TR")} km
+                {bridgeDistance.firstCountry} ↔ {bridgeDistance.secondCountry}
+                {"\n"}≈ {bridgeDistance.km.toLocaleString("tr-TR")} km
               </Text>
             ) : null}
           </View>
@@ -2330,9 +2332,6 @@ export default function RemoteCallScreen({
   const [activeCallMode, setActiveCallMode] = useState<LiveBridgeCallMode>("video");
   const [activePeerPhone, setActivePeerPhone] = useState("");
   const [activePeerName, setActivePeerName] = useState("");
-  const [activeProvinceDistance,setActiveProvinceDistance]=useState<{
-    km:number;firstProvince:string;secondProvince:string;
-  }|null>(null);
   const [liveBridgeHomeTab, setLiveBridgeHomeTab] =
     useState<"contacts" | "invites" | "chats">("contacts");
   const [historyPeer, setHistoryPeer] =
@@ -2404,7 +2403,10 @@ export default function RemoteCallScreen({
   const sourceCallLanguage = CALL_LANGUAGES[sourceLanguageIndex];
   const targetCallLanguage = CALL_LANGUAGES[targetLanguageIndex];
 
-  const activeBridgeDistance = activeProvinceDistance;
+  const activeBridgeDistance = useMemo(() => {
+    const peerPhone = outgoingCall?.calleePhone || incomingCall?.callerPhone || "";
+    return bridgeDistanceKm(directoryPhone, peerPhone);
+  }, [directoryPhone, incomingCall?.callerPhone, outgoingCall?.calleePhone]);
 
   const filteredCallLanguages = useMemo(() => {
     const query = languageSearch.trim().toLocaleLowerCase("tr-TR");
@@ -2954,22 +2956,12 @@ export default function RemoteCallScreen({
         10000,
       );
       setActiveRemoteVoiceGender(data.call.calleeGender === "male" ? "male" : "female");
-      if(data.call.callerProvince && data.call.calleeProvince && Number(data.call.distanceKm)>0){
-        setActiveProvinceDistance({
-          firstProvince:data.call.callerProvince,
-          secondProvince:data.call.calleeProvince,
-          km:Number(data.call.distanceKm),
-        });
-      } else setActiveProvinceDistance(null);
       setOutgoingCall({
         id: data.call.id,
         roomName: data.call.roomName,
         calleePhone: user.phone,
         calleeName: user.name,
         calleeGender: data.call.calleeGender === "male" ? "male" : "female",
-        callerProvince:data.call.callerProvince,
-        calleeProvince:data.call.calleeProvince,
-        distanceKm:data.call.distanceKm,
         mode,
         status: "ringing",
       });
@@ -2984,13 +2976,6 @@ export default function RemoteCallScreen({
     if (accepted) {
       setActivePeerPhone(current.callerPhone);
       setActivePeerName(current.callerName);
-      if(current.callerProvince && current.calleeProvince && Number(current.distanceKm)>0){
-        setActiveProvinceDistance({
-          firstProvince:current.callerProvince,
-          secondProvince:current.calleeProvince,
-          km:Number(current.distanceKm),
-        });
-      } else setActiveProvinceDistance(null);
     }
     setIncomingCall(null);
     void notifee.cancelNotification(current.id).catch(() => undefined);
@@ -3117,7 +3102,6 @@ export default function RemoteCallScreen({
             setCredentials(null);
             setActivePeerPhone("");
             setActivePeerName("");
-            setActiveProvinceDistance(null);
             void AudioSession.stopAudioSession();
           }}>
           <RoomView
