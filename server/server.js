@@ -90,6 +90,9 @@ async function initDb() {
     ALTER TABLE livebridge_users ADD COLUMN IF NOT EXISTS fcm_token TEXT NOT NULL DEFAULT '';
   `);
   await dbPool.query(`
+    ALTER TABLE livebridge_users ADD COLUMN IF NOT EXISTS province TEXT NOT NULL DEFAULT '';
+  `);
+  await dbPool.query(`
     CREATE INDEX IF NOT EXISTS idx_livebridge_users_phone_keys
       ON livebridge_users USING GIN (phone_keys);
   `);
@@ -114,6 +117,8 @@ async function initDb() {
   await dbPool.query(`
     ALTER TABLE livebridge_calls ADD COLUMN IF NOT EXISTS callee_gender TEXT NOT NULL DEFAULT 'female';
   `);
+  await dbPool.query(`ALTER TABLE livebridge_calls ADD COLUMN IF NOT EXISTS caller_province TEXT NOT NULL DEFAULT '';`);
+  await dbPool.query(`ALTER TABLE livebridge_calls ADD COLUMN IF NOT EXISTS callee_province TEXT NOT NULL DEFAULT '';`);
   await dbPool.query(`
     CREATE TABLE IF NOT EXISTS livebridge_messages (
       id TEXT PRIMARY KEY,sender_phone TEXT NOT NULL,recipient_phone TEXT NOT NULL,
@@ -244,6 +249,42 @@ function liveBridgePhoneKeys(value, suppliedKeys = []) {
   return Array.from(keys).filter(key => key.length >= 8);
 }
 
+const TURKEY_PROVINCE_CENTERS = {"Adana": [37.0, 35.3213], "Adıyaman": [37.7648, 38.2786], "Afyonkarahisar": [38.7507, 30.5567], "Ağrı": [39.7191, 43.0503], "Aksaray": [38.3687, 34.037], "Amasya": [40.6499, 35.8353], "Ankara": [39.9334, 32.8597], "Antalya": [36.8969, 30.7133], "Ardahan": [41.1105, 42.7022], "Artvin": [41.1828, 41.8183], "Aydın": [37.856, 27.8416], "Balıkesir": [39.6484, 27.8826], "Bartın": [41.6344, 32.3375], "Batman": [37.8812, 41.1351], "Bayburt": [40.2552, 40.2249], "Bilecik": [40.1501, 29.9831], "Bingöl": [38.8854, 40.4966], "Bitlis": [38.4006, 42.1095], "Bolu": [40.7395, 31.6116], "Burdur": [37.7203, 30.2908], "Bursa": [40.195, 29.06], "Çanakkale": [40.1553, 26.4142], "Çankırı": [40.6013, 33.6134], "Çorum": [40.5506, 34.9556], "Denizli": [37.7765, 29.0864], "Diyarbakır": [37.9144, 40.2306], "Düzce": [40.8438, 31.1565], "Edirne": [41.6771, 26.5557], "Elazığ": [38.681, 39.2264], "Erzincan": [39.75, 39.5], "Erzurum": [39.9, 41.27], "Eskişehir": [39.7767, 30.5206], "Gaziantep": [37.0662, 37.3833], "Giresun": [40.9128, 38.3895], "Gümüşhane": [40.4603, 39.4814], "Hakkari": [37.5744, 43.7408], "Hatay": [36.2021, 36.16], "Iğdır": [39.9167, 44.0333], "Isparta": [37.7648, 30.5566], "İstanbul": [41.0082, 28.9784], "İzmir": [38.4237, 27.1428], "Kahramanmaraş": [37.5753, 36.9228], "Karabük": [41.2061, 32.6204], "Karaman": [37.1759, 33.2287], "Kars": [40.6013, 43.0975], "Kastamonu": [41.3887, 33.7827], "Kayseri": [38.7312, 35.4787], "Kırıkkale": [39.8468, 33.5153], "Kırklareli": [41.7351, 27.2252], "Kırşehir": [39.1425, 34.1709], "Kilis": [36.7184, 37.1212], "Kocaeli": [40.8533, 29.8815], "Konya": [37.8746, 32.4932], "Kütahya": [39.4167, 29.9833], "Malatya": [38.3552, 38.3095], "Manisa": [38.6191, 27.4289], "Mardin": [37.3212, 40.7245], "Mersin": [36.8121, 34.6415], "Muğla": [37.2153, 28.3636], "Muş": [38.9462, 41.7539], "Nevşehir": [38.6244, 34.7239], "Niğde": [37.9667, 34.6833], "Ordu": [40.9839, 37.8764], "Osmaniye": [37.0742, 36.2478], "Rize": [41.0201, 40.5234], "Sakarya": [40.7569, 30.3783], "Samsun": [41.2867, 36.33], "Siirt": [37.9333, 41.95], "Sinop": [42.0231, 35.1531], "Sivas": [39.7477, 37.0179], "Şanlıurfa": [37.1674, 38.7955], "Şırnak": [37.4187, 42.4918], "Tekirdağ": [40.978, 27.511], "Tokat": [40.3167, 36.55], "Trabzon": [41.0015, 39.7178], "Tunceli": [39.1079, 39.5401], "Uşak": [38.6823, 29.4082], "Van": [38.4891, 43.4089], "Yalova": [40.65, 29.2667], "Yozgat": [39.8181, 34.8147], "Zonguldak": [41.4564, 31.7987]};
+
+function normalizeTurkeyProvince(value) {
+  const raw=String(value||"").trim();
+  if(!raw)return "";
+  const low=raw.toLocaleLowerCase("tr-TR");
+  return Object.keys(TURKEY_PROVINCE_CENTERS).find(x=>x.toLocaleLowerCase("tr-TR")===low)||"";
+}
+function provinceDistanceKm(a,b){
+  const p=TURKEY_PROVINCE_CENTERS[a],q=TURKEY_PROVINCE_CENTERS[b];
+  if(!p||!q)return null;
+  const r=x=>x*Math.PI/180,dLat=r(q[0]-p[0]),dLon=r(q[1]-p[1]),la1=r(p[0]),la2=r(q[0]);
+  const h=Math.sin(dLat/2)**2+Math.cos(la1)*Math.cos(la2)*Math.sin(dLon/2)**2;
+  return Math.round(6371*2*Math.atan2(Math.sqrt(h),Math.sqrt(1-h)));
+}
+function requestClientIp(req){
+  const forwarded=String(req.headers["x-forwarded-for"]||"").split(",")[0].trim();
+  return forwarded || String(req.ip||"").replace(/^::ffff:/,"");
+}
+async function detectProvinceFromRequest(req){
+  const direct=normalizeTurkeyProvince(req.headers["x-aytalk-province"]);
+  if(direct)return direct;
+  const ip=requestClientIp(req);
+  if(!ip || ip==="127.0.0.1" || ip==="::1")return "";
+  try{
+    const controller=new AbortController();
+    const timer=setTimeout(()=>controller.abort(),1800);
+    const response=await fetch(`https://ipwho.is/${encodeURIComponent(ip)}?fields=success,country_code,region,city`,{signal:controller.signal});
+    clearTimeout(timer);
+    if(!response.ok)return "";
+    const data=await response.json();
+    if(!data?.success || data?.country_code!=="TR")return "";
+    return normalizeTurkeyProvince(data.region)||normalizeTurkeyProvince(data.city);
+  }catch{return "";}
+}
+
 function rowToUser(row) {
   if (!row) return null;
   return {
@@ -253,6 +294,7 @@ function rowToUser(row) {
     language: row.language || "",
     gender: row.gender === "male" ? "male" : "female",
     fcmToken: String(row.fcm_token || ""),
+    province: String(row.province || ""),
     lastSeen: Number(row.last_seen || 0),
   };
 }
@@ -267,6 +309,9 @@ function rowToCall(row) {
     callerGender: row.caller_gender === "male" ? "male" : "female",
     calleePhone: row.callee_phone,
     calleeGender: row.callee_gender === "male" ? "male" : "female",
+    callerProvince: String(row.caller_province || ""),
+    calleeProvince: String(row.callee_province || ""),
+    distanceKm: provinceDistanceKm(String(row.caller_province || ""), String(row.callee_province || "")),
     mode: row.mode,
     status: row.status,
     createdAt: Number(row.created_at),
@@ -289,16 +334,17 @@ const liveBridgeStore = {
   async saveUser(user) {
     if (dbPool) {
       await dbPool.query(
-        `INSERT INTO livebridge_users (phone, phone_keys, name, language, gender, fcm_token, last_seen)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `INSERT INTO livebridge_users (phone, phone_keys, name, language, gender, fcm_token, province, last_seen)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (phone) DO UPDATE SET
            phone_keys = EXCLUDED.phone_keys,
            name = EXCLUDED.name,
            language = EXCLUDED.language,
            gender = EXCLUDED.gender,
            fcm_token = CASE WHEN EXCLUDED.fcm_token <> '' THEN EXCLUDED.fcm_token ELSE livebridge_users.fcm_token END,
+           province = CASE WHEN EXCLUDED.province <> '' THEN EXCLUDED.province ELSE livebridge_users.province END,
            last_seen = EXCLUDED.last_seen`,
-        [user.phone, user.phoneKeys, user.name, user.language, user.gender === "male" ? "male" : "female", String(user.fcmToken || ""), user.lastSeen],
+        [user.phone, user.phoneKeys, user.name, user.language, user.gender === "male" ? "male" : "female", String(user.fcmToken || ""), String(user.province || ""), user.lastSeen],
       );
       return user;
     }
@@ -346,8 +392,8 @@ const liveBridgeStore = {
     if (dbPool) {
       await dbPool.query(
         `INSERT INTO livebridge_calls
-           (id, room_name, caller_phone, caller_name, caller_gender, callee_phone, callee_gender, mode, status, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+           (id, room_name, caller_phone, caller_name, caller_gender, callee_phone, callee_gender, mode, status, created_at, updated_at, caller_province, callee_province)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
          ON CONFLICT (id) DO UPDATE SET
            status = EXCLUDED.status,
            updated_at = EXCLUDED.updated_at`,
@@ -357,6 +403,7 @@ const liveBridgeStore = {
           call.calleePhone,
           call.calleeGender === "male" ? "male" : "female",
           call.mode, call.status, call.createdAt, call.updatedAt,
+          String(call.callerProvince || ""), String(call.calleeProvince || ""),
         ],
       );
       return call;
@@ -427,6 +474,7 @@ app.post("/livebridge/profile/register", async (req, res) => {
     const gender = req.body?.gender === "male" ? "male" : "female";
     if (phone.length < 7 || !name) return res.status(400).json({error: "Telefon ve isim gerekli."});
     const existing = await liveBridgeStore.getUser(phone);
+    const detectedProvince = await detectProvinceFromRequest(req);
     const user = {
       ...(existing || {}),
       phone,
@@ -435,6 +483,7 @@ app.post("/livebridge/profile/register", async (req, res) => {
       language,
       gender,
       fcmToken: String(req.body?.fcmToken || existing?.fcmToken || "").trim().slice(0, 4096),
+      province: detectedProvince || existing?.province || "",
       lastSeen: liveBridgeNow(),
     };
     await liveBridgeStore.saveUser(user);
@@ -450,6 +499,7 @@ app.post("/livebridge/presence", async (req, res) => {
     const phone = normalizeLiveBridgePhone(req.body?.phone);
     if (phone.length < 7) return res.status(400).json({error: "Telefon gerekli."});
     const old = (await liveBridgeStore.getUser(phone)) || {};
+    const detectedProvince = old.province || await detectProvinceFromRequest(req);
     const user = {
       ...old,
       phone,
@@ -458,6 +508,7 @@ app.post("/livebridge/presence", async (req, res) => {
       language: String(req.body?.language || old.language || "").slice(0, 80),
       gender: req.body?.gender === "male" || req.body?.gender === "female" ? req.body.gender : (old.gender || "female"),
       fcmToken: String(req.body?.fcmToken || old.fcmToken || "").trim().slice(0, 4096),
+      province: detectedProvince || "",
       lastSeen: liveBridgeNow(),
     };
     await liveBridgeStore.saveUser(user);
@@ -649,6 +700,7 @@ app.post("/livebridge/call/start", async (req, res) => {
         language: "",
         gender: "female",
         fcmToken: "",
+        province: await detectProvinceFromRequest(req),
         lastSeen: liveBridgeNow(),
       };
       await liveBridgeStore.saveUser(callerUser);
@@ -656,6 +708,7 @@ app.post("/livebridge/call/start", async (req, res) => {
       callerUser = {
         ...callerUser,
         name: String(req.body?.callerName || callerUser.name || "LiveBridge Kullanıcısı").slice(0, 80),
+        province: callerUser.province || await detectProvinceFromRequest(req),
         lastSeen: liveBridgeNow(),
       };
       await liveBridgeStore.saveUser(callerUser);
@@ -669,6 +722,9 @@ app.post("/livebridge/call/start", async (req, res) => {
       callerGender: callerUser?.gender === "male" ? "male" : "female",
       calleePhone: resolvedCalleePhone,
       calleeGender: calleeUser.gender === "male" ? "male" : "female",
+      callerProvince: String(callerUser?.province || ""),
+      calleeProvince: String(calleeUser?.province || ""),
+      distanceKm: provinceDistanceKm(String(callerUser?.province || ""), String(calleeUser?.province || "")),
       mode: req.body?.mode === "chat" ? "chat" : req.body?.mode === "audio" ? "audio" : "video",
       status: "ringing", createdAt: liveBridgeNow(), updatedAt: liveBridgeNow(),
     };
