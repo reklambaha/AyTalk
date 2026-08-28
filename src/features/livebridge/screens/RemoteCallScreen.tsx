@@ -446,6 +446,10 @@ function RoomView({
     translationVoiceGenderTouchedRef.current = true;
     translationVoiceGenderRef.current = gender;
     setTranslationVoiceGender(gender);
+    void AsyncStorage.setItem(
+      "livebridge_translation_voice_gender",
+      gender,
+    ).catch(() => undefined);
 
     // Eski cinsiyetle çalmakta olan TTS varsa anında durdur.
     const currentSound = cloudTranslationSoundRef.current;
@@ -488,6 +492,22 @@ function RoomView({
     translationVoiceGenderRef.current = remoteVoiceGender;
     setTranslationVoiceGender(remoteVoiceGender);
   }, [remoteVoiceGender]);
+
+  useEffect(() => {
+    let mounted = true;
+    AsyncStorage.getItem("livebridge_translation_voice_gender")
+      .then(saved => {
+        if (!mounted) return;
+        if (saved !== "male" && saved !== "female") return;
+        translationVoiceGenderTouchedRef.current = true;
+        translationVoiceGenderRef.current = saved;
+        setTranslationVoiceGender(saved);
+      })
+      .catch(() => undefined);
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (
@@ -847,7 +867,7 @@ function RoomView({
       if(voiceTranslationEnabled)void speakTranslation(
         packet.translated,
         packet.toLocale||targetLanguage.locale,
-        packet.voiceGender === "male" ? "male" : "female",
+        translationVoiceGenderRef.current,
       );}catch{}
     };room.on(RoomEvent.DataReceived,h);return()=>room.off(RoomEvent.DataReceived,h);
   },[room,voiceTranslationEnabled,targetLanguage.locale]);
@@ -2599,7 +2619,7 @@ export default function RemoteCallScreen({
   const [activePeerPhone, setActivePeerPhone] = useState("");
   const [activePeerName, setActivePeerName] = useState("");
   const [liveBridgeHomeTab, setLiveBridgeHomeTab] =
-    useState<"contacts" | "invites" | "chats">("contacts");
+    useState<"contacts" | "invites" | "chats">("chats");
   const [historyPeer, setHistoryPeer] =
     useState<LiveBridgeRecentConversation | null>(null);
   const [historyMessages, setHistoryMessages] =
@@ -3650,11 +3670,18 @@ export default function RemoteCallScreen({
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator={false}>
             {directoryProfileReady ? (
-              <View style={styles.liveBridgeTopMenu}>
+              <>
+                <View style={styles.liveBridgeHubIntro}>
+                  <Text style={styles.liveBridgeHubIntroTitle}>LiveBridge</Text>
+                  <Text style={styles.liveBridgeHubIntroText}>
+                    Sohbet · Sesli arama · Görüntülü arama · Canlı çeviri
+                  </Text>
+                </View>
+                <View style={styles.liveBridgeTopMenu}>
                 {([
+                  ["chats", "Sohbetler"],
                   ["contacts", "Kişiler"],
                   ["invites", "Davetler"],
-                  ["chats", "Sohbetler"],
                 ] as const).map(([tab, label]) => {
                   const selected = liveBridgeHomeTab === tab;
                   return (
@@ -3679,7 +3706,8 @@ export default function RemoteCallScreen({
                     </TouchableOpacity>
                   );
                 })}
-              </View>
+                </View>
+              </>
             ) : null}
 
             {!directoryProfileReady ? (
@@ -3777,8 +3805,31 @@ export default function RemoteCallScreen({
                           </Text>
                         </View>
 
-                        <View style={styles.directoryChevron}>
-                          <Text style={styles.directoryChevronText}>›</Text>
+                        <View style={styles.directoryQuickActions}>
+                          <TouchableOpacity
+                            style={styles.directoryQuickAction}
+                            onPress={event => {
+                              event.stopPropagation();
+                              void openDirectoryChat(user);
+                            }}>
+                            <CallControlIcon name="message" size={18} />
+                          </TouchableOpacity>
+                          <TouchableOpacity
+                            style={styles.directoryQuickAction}
+                            onPress={event => {
+                              event.stopPropagation();
+                              void startDirectCall(user, "audio");
+                            }}>
+                            <CallControlIcon name="speaker" size={18} />
+                          </TouchableOpacity>
+                          <TouchableOpacity
+                            style={styles.directoryQuickAction}
+                            onPress={event => {
+                              event.stopPropagation();
+                              void startDirectCall(user, "video");
+                            }}>
+                            <CallControlIcon name="camera" size={18} />
+                          </TouchableOpacity>
                         </View>
                       </TouchableOpacity>
                     ))}
@@ -3794,14 +3845,13 @@ export default function RemoteCallScreen({
               </>
             ) : null}
 
-            {directoryProfileReady &&
-            (liveBridgeHomeTab === "contacts" || liveBridgeHomeTab === "chats") ? (
+            {directoryProfileReady && liveBridgeHomeTab === "chats" ? (
               <View style={styles.recentSection}>
                 <View style={styles.directoryHeaderRow}><View><Text style={styles.directoryTitle}>
-                  {liveBridgeHomeTab === "chats" ? "Sohbetler" : "Son Görüşmeler"}
+                  Sohbetler
                 </Text>
                 <Text style={styles.directorySubtitle}>
-                  Yazışmalar · çeviriler · dosyalar
+                  Kalıcı mesajlar · çeviriler · dosyalar
                 </Text></View>
                 <TouchableOpacity style={styles.directorySyncButton} onPress={()=>void loadRecentConversations()}>
                 {recentLoading?<ActivityIndicator size="small" color="#4BC6FF"/>:<CallControlIcon name="loading" size={22}/>}</TouchableOpacity></View>
@@ -3809,8 +3859,44 @@ export default function RemoteCallScreen({
                   <View style={styles.directoryListCard}>{recentConversations.slice(0,8).map(item=>(
                     <TouchableOpacity key={item.peerPhone} style={styles.directoryUserRow} onPress={() => void openConversationHistory(item)}>
                       <View style={styles.directoryAvatar}><Text style={styles.directoryAvatarText}>{(item.peerName||"?").slice(0,1).toUpperCase()}</Text></View>
-                      <View style={styles.directoryUserInfo}><Text style={styles.directoryUserName}>{item.peerName}</Text>
-                      <Text style={styles.directoryUserPresence} numberOfLines={1}>{item.lastText}</Text></View><Text style={styles.directoryChevronText}>›</Text>
+                      <View style={styles.directoryUserInfo}>
+                        <Text style={styles.directoryUserName}>{item.peerName}</Text>
+                        <Text style={styles.directoryUserPresence} numberOfLines={1}>{item.lastText}</Text>
+                      </View>
+                      <View style={styles.directoryQuickActions}>
+                        <TouchableOpacity
+                          style={styles.directoryQuickAction}
+                          onPress={event => {
+                            event.stopPropagation();
+                            void startDirectCall(
+                              {
+                                phone:item.peerPhone,
+                                name:item.peerName,
+                                online:Boolean(item.peerOnline),
+                                lastSeen:item.updatedAt,
+                              },
+                              "audio",
+                            );
+                          }}>
+                          <CallControlIcon name="speaker" size={18} />
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={styles.directoryQuickAction}
+                          onPress={event => {
+                            event.stopPropagation();
+                            void startDirectCall(
+                              {
+                                phone:item.peerPhone,
+                                name:item.peerName,
+                                online:Boolean(item.peerOnline),
+                                lastSeen:item.updatedAt,
+                              },
+                              "video",
+                            );
+                          }}>
+                          <CallControlIcon name="camera" size={18} />
+                        </TouchableOpacity>
+                      </View>
                     </TouchableOpacity>))}</View>
                 ):<View style={styles.directoryEmptyCard}><Text style={styles.directoryEmptyTitle}>Henüz görüşme yok</Text>
                 <Text style={styles.directoryEmptyText}>İlk çeviri veya dosya paylaşımından sonra burada görünecek.</Text></View>}
@@ -4884,7 +4970,11 @@ const styles = StyleSheet.create({
     backgroundColor: "#123B68",
     borderColor: "#4BC6FF",
   },
+  moreMenuVoiceStatus:{color:"#4BC6FF",fontSize:10,fontWeight:"900",marginTop:3,marginBottom:7},
   moreMenuVoiceText: {color: "#FFFFFF", fontSize: 12, fontWeight: "800"},
+  liveBridgeHubIntro:{marginBottom:12,paddingHorizontal:2},
+  liveBridgeHubIntroTitle:{color:"#FFFFFF",fontSize:24,fontWeight:"900",letterSpacing:-0.4},
+  liveBridgeHubIntroText:{color:"#7897B8",fontSize:10,marginTop:3},
   liveBridgeTopMenu:{flexDirection:"row",gap:8,marginBottom:16,padding:4,borderRadius:18,backgroundColor:"#08162B",borderWidth:1,borderColor:"#16345A"},
   liveBridgeTopMenuButton:{flex:1,minHeight:42,borderRadius:14,alignItems:"center",justifyContent:"center"},
   liveBridgeTopMenuActive:{flex:1,minHeight:42,borderRadius:14,alignItems:"center",justifyContent:"center",backgroundColor:"#123B68"},
@@ -4968,6 +5058,8 @@ const styles = StyleSheet.create({
   contactActionCloseText: {
     color: "#A7BCD4", fontSize: 11, fontWeight: "900",
   },
+  directoryQuickActions:{flexDirection:"row",alignItems:"center",gap:5,marginLeft:8},
+  directoryQuickAction:{width:32,height:32,borderRadius:16,alignItems:"center",justifyContent:"center",backgroundColor:"#12385C"},
   directoryChevron: {
     width: 34, height: 34, borderRadius: 17,
     alignItems: "center", justifyContent: "center",
