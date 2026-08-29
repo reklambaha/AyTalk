@@ -1,6 +1,7 @@
 require("dotenv").config();
 
 const express = require("express");
+const crypto = require("crypto");
 const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
@@ -40,14 +41,47 @@ try {
     serviceAccount.private_key = String(serviceAccount.private_key).replace(/\\n/g, "\n");
   }
   if (serviceAccount && getApps().length === 0) {
-    const storageBucket=String(process.env.FIREBASE_STORAGE_BUCKET||"").trim()||
-      (serviceAccount.project_id?`${serviceAccount.project_id}.firebasestorage.app`:undefined);
-    initializeApp({credential:cert(serviceAccount),...(storageBucket?{storageBucket}:{})});
+    initializeApp({credential:cert(serviceAccount)});
   }
   if (getApps().length > 0) {
     firebaseMessaging = getMessaging();
-    try { firebaseStorageBucket=getStorage().bucket(); console.log("Firebase push + Storage hazır."); }
-    catch(e){ console.warn("Firebase Storage hazır değil:",e?.message||e); }
+
+    // Firebase projelerinde Storage bucket adı proje yaşına göre
+    // project.appspot.com veya project.firebasestorage.app olabilir.
+    // Eski kod ikinci biçimi zorladığı için var olmayan bucket'a yazabiliyordu.
+    const explicitBucket = String(process.env.FIREBASE_STORAGE_BUCKET || "")
+      .trim()
+      .replace(/^gs:\/\//, "");
+    const projectId = String(serviceAccount?.project_id || "").trim();
+    const candidates = Array.from(
+      new Set(
+        [
+          explicitBucket,
+          projectId ? `${projectId}.appspot.com` : "",
+          projectId ? `${projectId}.firebasestorage.app` : "",
+        ].filter(Boolean),
+      ),
+    );
+
+    for (const bucketName of candidates) {
+      try {
+        const candidate = getStorage().bucket(bucketName);
+        // getMetadata kontrolü aşağıdaki hazır olma Promise'ında yapılır; burada aday seçilir.
+        firebaseStorageBucket = candidate;
+        console.log(`Firebase Storage bucket adayı: ${bucketName}`);
+        break;
+      } catch (bucketError) {
+        console.warn(
+          `Firebase Storage bucket bulunamadı/erişilemiyor: ${bucketName}`,
+          bucketError?.message || bucketError,
+        );
+      }
+    }
+    if (!firebaseStorageBucket) {
+      console.warn(
+        "Firebase Storage bucket bulunamadı. Dosyalar Postgres BYTEA yedeğine kaydedilecek.",
+      );
+    }
   } else {
     console.warn("UYARI: Firebase service account yok. Kapalı uygulama arama push'u devre dışı.");
   }
@@ -125,6 +159,19 @@ async function initDb() {
     );
   `);
   await dbPool.query(`CREATE INDEX IF NOT EXISTS idx_livebridge_messages_pair ON livebridge_messages(sender_phone,recipient_phone,created_at DESC);`);
+  await dbPool.query(`ALTER TABLE livebridge_messages ADD COLUMN IF NOT EXISTS file_data BYTEA;`);
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS livebridge_contacts (
+      owner_phone TEXT NOT NULL,
+      peer_phone TEXT NOT NULL,
+      display_name TEXT NOT NULL DEFAULT '',
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL,
+      PRIMARY KEY(owner_phone, peer_phone)
+    );
+  `);
+  await dbPool.query(`CREATE INDEX IF NOT EXISTS idx_livebridge_contacts_owner ON livebridge_contacts(owner_phone,updated_at DESC);`);
+
   console.log("Veritabanı tabloları hazır.");
 }
 
@@ -201,7 +248,13 @@ app.use(generalLimiter);
 
 // Sağlık kontrolü hariç tüm uçlar paylaşımlı anahtar ister.
 app.use((req, res, next) => {
-  if (req.path === "/" || req.path === "/health") return next();
+  if (
+    req.path === "/" ||
+    req.path === "/health" ||
+    req.path.startsWith("/livebridge/chat/file/content/")
+  ) {
+    return next();
+  }
   return requireAppKey(req, res, next);
 });
 
@@ -209,6 +262,7 @@ app.use((req, res, next) => {
 const liveBridgeUsersMem = new Map();
 const liveBridgeCallsMem = new Map();
 const liveBridgeMessagesMem=[];
+const liveBridgeContactsMem=new Map();
 const normalizeLiveBridgePhone = value =>
   String(value || "").replace(/[^0-9]/g, "").slice(0, 18);
 
@@ -419,14 +473,139 @@ const liveBridgeStore = {
 const liveBridgeNow = () => Date.now();
 const liveBridgeUserOnline = user =>
   Boolean(user && liveBridgeNow() - Number(user.lastSeen || 0) < 45000);
+
+async function saveLiveBridgeContact(ownerPhone, peerPhone, displayName) {
+  const owner = normalizeLiveBridgePhone(ownerPhone);
+  const peer = normalizeLiveBridgePhone(peerPhone);
+  if (owner.length < 7 || peer.length < 7 || owner === peer) return false;
+  const now = liveBridgeNow();
+  if (dbPool) {
+    await dbPool.query(
+      `INSERT INTO livebridge_contacts(owner_phone,peer_phone,display_name,created_at,updated_at)
+       VALUES($1,$2,$3,$4,$4)
+       ON CONFLICT(owner_phone,peer_phone) DO UPDATE
+       SET display_name=EXCLUDED.display_name,updated_at=EXCLUDED.updated_at`,
+      [owner, peer, String(displayName || "").slice(0, 100), now],
+    );
+  } else {
+    const key = `${owner}:${peer}`;
+    liveBridgeContactsMem.set(key, {
+      ownerPhone: owner,
+      peerPhone: peer,
+      displayName: String(displayName || "").slice(0, 100),
+      createdAt: liveBridgeContactsMem.get(key)?.createdAt || now,
+      updatedAt: now,
+    });
+  }
+  return true;
+}
+
+async function hasLiveBridgeContact(ownerPhone, peerPhone) {
+  const owner = normalizeLiveBridgePhone(ownerPhone);
+  const peer = normalizeLiveBridgePhone(peerPhone);
+  if (owner.length < 7 || peer.length < 7 || owner === peer) return false;
+  if (dbPool) {
+    const {rows} = await dbPool.query(
+      `SELECT 1 FROM livebridge_contacts WHERE owner_phone=$1 AND peer_phone=$2 LIMIT 1`,
+      [owner, peer],
+    );
+    return rows.length > 0;
+  }
+  return liveBridgeContactsMem.has(`${owner}:${peer}`);
+}
+
+async function getSavedLiveBridgeContacts(ownerPhone) {
+  const owner = normalizeLiveBridgePhone(ownerPhone);
+  if (owner.length < 7) return [];
+  let rows = [];
+  if (dbPool) {
+    const result = await dbPool.query(
+      `SELECT peer_phone,display_name,updated_at FROM livebridge_contacts
+       WHERE owner_phone=$1 ORDER BY updated_at DESC LIMIT 500`,
+      [owner],
+    );
+    rows = result.rows.map(row => ({
+      peerPhone: row.peer_phone,
+      displayName: row.display_name,
+      updatedAt: Number(row.updated_at || 0),
+    }));
+  } else {
+    rows = Array.from(liveBridgeContactsMem.values())
+      .filter(item => item.ownerPhone === owner)
+      .sort((a,b) => b.updatedAt - a.updatedAt);
+  }
+
+  const users = [];
+  for (const row of rows) {
+    const user = await liveBridgeStore.findUserByPhoneKeys(
+      liveBridgePhoneKeys(row.peerPhone),
+    );
+    if (!user) continue;
+    users.push({
+      phone: user.phone,
+      name: String(row.displayName || user.name || user.phone).slice(0,100),
+      language: user.language || "",
+      gender: user.gender === "male" ? "male" : "female",
+      online: liveBridgeUserOnline(user),
+      lastSeen: user.lastSeen || row.updatedAt || 0,
+    });
+  }
+  return users;
+}
+
+async function assertLiveBridgeContact(ownerPhone, peerPhone) {
+  const allowed = await hasLiveBridgeContact(ownerPhone, peerPhone);
+  if (!allowed) {
+    const error = new Error(
+      "Bu numara kayıtlı LiveBridge kişilerinizde değil. Önce Kişiler sekmesinden eşleştirin.",
+    );
+    error.statusCode = 403;
+    throw error;
+  }
+}
+
 app.post("/livebridge/profile/register", async (req, res) => {
   try {
     const phone = normalizeLiveBridgePhone(req.body?.phone);
     const name = String(req.body?.name || "").trim().slice(0, 80);
     const language = String(req.body?.language || "").trim().slice(0, 80);
     const gender = req.body?.gender === "male" ? "male" : "female";
+    const incomingFcmToken = String(req.body?.fcmToken || "").trim().slice(0, 4096);
     if (phone.length < 7 || !name) return res.status(400).json({error: "Telefon ve isim gerekli."});
+    if (!incomingFcmToken) {
+      return res.status(400).json({error: "Bu cihaz doğrulanamadı. Bildirim/Firebase bağlantısını kontrol edin."});
+    }
+
+    // Aynı cihaz tokenının her açılışta başka bir telefon numarasına yazılmasını engelle.
+    if (dbPool) {
+      const {rows: boundRows} = await dbPool.query(
+        `SELECT phone FROM livebridge_users WHERE fcm_token=$1 AND phone<>$2 LIMIT 1`,
+        [incomingFcmToken, phone],
+      );
+      if (boundRows.length) {
+        return res.status(409).json({
+          error: "Bu cihaz başka bir LiveBridge numarasına bağlı. Numara değişikliği için hesap doğrulaması gerekir.",
+        });
+      }
+    } else {
+      const bound = Array.from(liveBridgeUsersMem.values()).find(
+        user => user.fcmToken === incomingFcmToken && user.phone !== phone,
+      );
+      if (bound) {
+        return res.status(409).json({error: "Bu cihaz başka bir LiveBridge numarasına bağlı."});
+      }
+    }
+
     const existing = await liveBridgeStore.getUser(phone);
+    if (
+      existing?.fcmToken &&
+      existing.fcmToken !== incomingFcmToken &&
+      liveBridgeUserOnline(existing)
+    ) {
+      return res.status(409).json({
+        error: "Bu LiveBridge numarası başka bir aktif cihazda kullanılıyor.",
+      });
+    }
     const user = {
       ...(existing || {}),
       phone,
@@ -434,7 +613,7 @@ app.post("/livebridge/profile/register", async (req, res) => {
       name,
       language,
       gender,
-      fcmToken: String(req.body?.fcmToken || existing?.fcmToken || "").trim().slice(0, 4096),
+      fcmToken: incomingFcmToken,
       lastSeen: liveBridgeNow(),
     };
     await liveBridgeStore.saveUser(user);
@@ -519,7 +698,15 @@ app.post("/livebridge/contacts/match", async (req, res) => {
         ? String(a.name).localeCompare(String(b.name), "tr")
         : a.online ? -1 : 1,
     );
-    res.json({ok: true, users});
+
+    for (const user of users) {
+      await saveLiveBridgeContact(ownerPhone, user.phone, user.name);
+    }
+
+    // Her taramada sadece o an bulunanları dönmek yerine kalıcı AyTalk kişi
+    // listesini döndür. Uygulama yeniden açılınca kişilerin kaybolmasını önler.
+    const savedUsers = await getSavedLiveBridgeContacts(ownerPhone);
+    res.json({ok: true, users: savedUsers});
   } catch (error) {
     console.error("contacts/match hatası:", error);
     res.status(500).json({error: "Kişiler eşleştirilemedi."});
@@ -527,13 +714,27 @@ app.post("/livebridge/contacts/match", async (req, res) => {
 });
 
 
+app.get("/livebridge/contacts/saved", async (req, res) => {
+  try {
+    const ownerPhone = normalizeLiveBridgePhone(req.query?.ownerPhone);
+    if (ownerPhone.length < 7) {
+      return res.status(400).json({error: "Telefon gerekli."});
+    }
+    const users = await getSavedLiveBridgeContacts(ownerPhone);
+    res.json({ok: true, users});
+  } catch (error) {
+    console.error("contacts/saved hatası:", error);
+    res.status(500).json({error: "Kaydedilmiş kişiler alınamadı."});
+  }
+});
+
 async function lbSaveMessage(m){
   if(dbPool){
     await dbPool.query(`INSERT INTO livebridge_messages
-      (id,sender_phone,recipient_phone,sender_name,kind,original_text,translated_text,file_name,mime_type,storage_path,file_size,created_at)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(id) DO NOTHING`,
+      (id,sender_phone,recipient_phone,sender_name,kind,original_text,translated_text,file_name,mime_type,storage_path,file_size,created_at,file_data)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT(id) DO NOTHING`,
       [m.id,m.senderPhone,m.recipientPhone,m.senderName||"",m.kind,m.originalText||"",m.translatedText||"",
-       m.fileName||"",m.mimeType||"",m.storagePath||"",Number(m.fileSize||0),Number(m.createdAt||Date.now())]);
+       m.fileName||"",m.mimeType||"",m.storagePath||"",Number(m.fileSize||0),Number(m.createdAt||Date.now()),m.fileData||null]);
   } else { liveBridgeMessagesMem.push(m); if(liveBridgeMessagesMem.length>1000)liveBridgeMessagesMem.shift(); }
 }
 async function lbSigned(path){
@@ -544,6 +745,74 @@ function lbRow(r){return{id:r.id,senderPhone:r.sender_phone??r.senderPhone,recip
  senderName:r.sender_name??r.senderName??"",kind:r.kind,originalText:r.original_text??r.originalText??"",
  translatedText:r.translated_text??r.translatedText??"",fileName:r.file_name??r.fileName??"",mimeType:r.mime_type??r.mimeType??"",
  storagePath:r.storage_path??r.storagePath??"",fileSize:Number(r.file_size??r.fileSize??0),createdAt:Number(r.created_at??r.createdAt??0)}}
+
+const LIVEBRIDGE_FILE_SECRET = String(
+  process.env.LIVEBRIDGE_FILE_SECRET ||
+  APP_SHARED_KEY ||
+  process.env.LIVEKIT_API_SECRET ||
+  "aytalk-file-fallback",
+);
+function liveBridgeFileSignature(id, expires) {
+  return crypto
+    .createHmac("sha256", LIVEBRIDGE_FILE_SECRET)
+    .update(`${id}:${expires}`)
+    .digest("hex");
+}
+function liveBridgeDbFileUrl(req, id) {
+  const expires = Date.now() + 7 * 86400000;
+  const sig = liveBridgeFileSignature(id, expires);
+  const forwardedProto = String(req.get("x-forwarded-proto") || "")
+    .split(",")[0]
+    .trim();
+  const protocol = forwardedProto || req.protocol || "https";
+  return `${protocol}://${req.get("host")}/livebridge/chat/file/content/${encodeURIComponent(id)}?expires=${expires}&sig=${sig}`;
+}
+
+app.get("/livebridge/chat/file/content/:id", async (req, res) => {
+  try {
+    const id = String(req.params?.id || "").slice(0, 180);
+    const expires = Number(req.query?.expires || 0);
+    const sig = String(req.query?.sig || "");
+    const expected = liveBridgeFileSignature(id, expires);
+    if (
+      !id ||
+      !expires ||
+      expires < Date.now() ||
+      sig.length !== expected.length ||
+      !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))
+    ) {
+      return res.status(403).send("Dosya bağlantısı geçersiz veya süresi dolmuş.");
+    }
+
+    let file = null;
+    if (dbPool) {
+      const {rows} = await dbPool.query(
+        `SELECT file_name,mime_type,file_data FROM livebridge_messages WHERE id=$1 AND kind='file' LIMIT 1`,
+        [id],
+      );
+      file = rows[0] || null;
+    } else {
+      const memory = liveBridgeMessagesMem.find(m => m.id === id && m.kind === "file");
+      if (memory) {
+        file = {
+          file_name: memory.fileName,
+          mime_type: memory.mimeType,
+          file_data: memory.fileData,
+        };
+      }
+    }
+    if (!file?.file_data) return res.status(404).send("Dosya bulunamadı.");
+    const safeName = String(file.file_name || "aytalk-dosya").replace(/[\r\n"]/g, "_");
+    res.setHeader("Content-Type", file.mime_type || "application/octet-stream");
+    res.setHeader("Content-Disposition", `inline; filename="${safeName}"`);
+    res.setHeader("Cache-Control", "private, max-age=3600");
+    res.send(file.file_data);
+  } catch (error) {
+    console.error("chat/file/content", error);
+    res.status(500).send("Dosya açılamadı.");
+  }
+});
+
 async function sendLiveBridgeIncomingCallPush(call, calleeUser) {
   const token = String(calleeUser?.fcmToken || "").trim();
   if (!firebaseMessaging || !token) return false;
@@ -604,29 +873,66 @@ async function sendLiveBridgeChatPush(recipientPhone, payload) {
 app.post("/livebridge/chat/text",async(req,res)=>{
  try{const s=normalizeLiveBridgePhone(req.body?.senderPhone),r=normalizeLiveBridgePhone(req.body?.recipientPhone);
  if(s.length<7||r.length<7)return res.status(400).json({error:"Telefon gerekli."});
+ await assertLiveBridgeContact(s,r);
  const m={id:`LBM-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,senderPhone:s,recipientPhone:r,
  senderName:String(req.body?.senderName||"").slice(0,80),kind:"text",originalText:String(req.body?.originalText||"").slice(0,5000),
  translatedText:String(req.body?.translatedText||"").slice(0,5000),createdAt:Date.now()};
  await lbSaveMessage(m);
  void sendLiveBridgeChatPush(r,{senderPhone:s,senderName:m.senderName,kind:"text",preview:m.translatedText||m.originalText});
  res.json({ok:true,message:m});
- }catch(e){console.error("chat/text",e);res.status(500).json({error:"Mesaj kaydedilemedi."});}
+ }catch(e){console.error("chat/text",e);res.status(e?.statusCode||500).json({error:e?.message||"Mesaj kaydedilemedi."});}
 });
 app.post("/livebridge/chat/file",async(req,res)=>{
- try{if(!firebaseStorageBucket)return res.status(503).json({error:"Firebase Storage hazır değil."});
- const s=normalizeLiveBridgePhone(req.body?.senderPhone),r=normalizeLiveBridgePhone(req.body?.recipientPhone);
- const name=String(req.body?.fileName||`dosya-${Date.now()}`).replace(/[^a-zA-Z0-9._-]/g,"_").slice(0,180);
- const mime=String(req.body?.mimeType||"application/octet-stream").slice(0,120),b64=String(req.body?.dataBase64||"");
- const buf=Buffer.from(b64,"base64");if(s.length<7||r.length<7||!b64)return res.status(400).json({error:"Dosya bilgisi eksik."});
- if(buf.length<=0||buf.length>6*1024*1024)return res.status(400).json({error:"Dosya en fazla 6 MB olabilir."});
- const id=`LBF-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,path=`livebridge/${s}/${r}/${id}-${name}`;
- await firebaseStorageBucket.file(path).save(buf,{resumable:false,contentType:mime,metadata:{cacheControl:"private,max-age=3600"}});
- const m={id,senderPhone:s,recipientPhone:r,senderName:String(req.body?.senderName||"").slice(0,80),kind:"file",
- fileName:name,mimeType:mime,storagePath:path,fileSize:buf.length,createdAt:Date.now()};
- await lbSaveMessage(m);
- void sendLiveBridgeChatPush(r,{senderPhone:s,senderName:m.senderName,kind:"file",preview:`📎 ${name}`});
- res.json({ok:true,message:{...m,url:await lbSigned(path)}});}catch(e){console.error("chat/file",e);res.status(500).json({error:e?.message||"Dosya gönderilemedi."});}
+ try{
+   const s=normalizeLiveBridgePhone(req.body?.senderPhone),r=normalizeLiveBridgePhone(req.body?.recipientPhone);
+   await assertLiveBridgeContact(s,r);
+   const name=String(req.body?.fileName||`dosya-${Date.now()}`).replace(/[^a-zA-Z0-9._-]/g,"_").slice(0,180);
+   const mime=String(req.body?.mimeType||"application/octet-stream").slice(0,120),b64=String(req.body?.dataBase64||"");
+   const buf=Buffer.from(b64,"base64");
+   if(s.length<7||r.length<7||!b64)return res.status(400).json({error:"Dosya bilgisi eksik."});
+   if(buf.length<=0||buf.length>6*1024*1024)return res.status(400).json({error:"Dosya en fazla 6 MB olabilir."});
+
+   const id=`LBF-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+   let storagePath="";
+   let fileData=null;
+   let url="";
+
+   // Önce Firebase Storage denenir. Bucket yanlış/kapalıysa mesajı çöpe atmak
+   // yerine Postgres BYTEA'ya düşer; bu screenshot'taki bucket hatasını keser.
+   if(firebaseStorageBucket){
+     try{
+       const path=`livebridge/${s}/${r}/${id}-${name}`;
+       await firebaseStorageBucket.file(path).save(buf,{resumable:false,contentType:mime,metadata:{cacheControl:"private,max-age=3600"}});
+       storagePath=path;
+       url=await lbSigned(path);
+     }catch(storageError){
+       console.error("Firebase Storage upload başarısız; Postgres yedeği kullanılacak:",storageError?.message||storageError);
+       firebaseStorageBucket=null;
+     }
+   }
+
+   if(!storagePath){
+     if(!dbPool){
+       return res.status(503).json({
+         error:"Dosya depolama hazır değil. Firebase Storage bucket bulunamadı ve Postgres yedeği yok.",
+       });
+     }
+     storagePath=`db:${id}`;
+     fileData=buf;
+   }
+
+   const m={id,senderPhone:s,recipientPhone:r,senderName:String(req.body?.senderName||"").slice(0,80),kind:"file",
+     fileName:name,mimeType:mime,storagePath,fileSize:buf.length,fileData,createdAt:Date.now()};
+   await lbSaveMessage(m);
+   if(storagePath.startsWith("db:"))url=liveBridgeDbFileUrl(req,id);
+   void sendLiveBridgeChatPush(r,{senderPhone:s,senderName:m.senderName,kind:"file",preview:`📎 ${name}`});
+   res.json({ok:true,message:{...m,fileData:undefined,url},storage:storagePath.startsWith("db:")?"postgres":"firebase"});
+ }catch(e){
+   console.error("chat/file",e);
+   res.status(e?.statusCode||500).json({error:e?.message||"Dosya gönderilemedi."});
+ }
 });
+
 app.get("/livebridge/chat/history",async(req,res)=>{
  try{
   const p=normalizeLiveBridgePhone(req.query?.phone),peer=normalizeLiveBridgePhone(req.query?.peerPhone);
@@ -641,7 +947,14 @@ app.get("/livebridge/chat/history",async(req,res)=>{
     list=liveBridgeMessagesMem.filter(m=>(m.senderPhone===p&&m.recipientPhone===peer)||(m.senderPhone===peer&&m.recipientPhone===p))
       .sort((a,b)=>a.createdAt-b.createdAt).slice(-160);
   }
-  const messages=await Promise.all(list.map(async m=>({...m,url:m.kind==="file"?await lbSigned(m.storagePath):""})));
+  const messages=await Promise.all(list.map(async m=>({
+    ...m,
+    url:m.kind!=="file"
+      ?""
+      :String(m.storagePath||"").startsWith("db:")
+        ?liveBridgeDbFileUrl(req,m.id)
+        :await lbSigned(m.storagePath),
+  })));
   res.json({ok:true,messages});
  }catch(e){console.error("chat/history",e);res.status(500).json({error:"Sohbet geçmişi alınamadı."});}
 });
@@ -666,32 +979,24 @@ app.post("/livebridge/call/start", async (req, res) => {
     const calleeUser = await liveBridgeStore.findUserByPhoneKeys(liveBridgePhoneKeys(calleePhone));
     if (!calleeUser) return res.status(404).json({error: "Kişi LiveBridge'de bulunamadı."});
     const resolvedCalleePhone = calleeUser.phone;
-    let callerUser = await liveBridgeStore.findUserByPhoneKeys(
+    const callerUser = await liveBridgeStore.findUserByPhoneKeys(
       liveBridgePhoneKeys(callerPhone),
     );
-
-    // Eski APK/yerel kayıt Postgres'e henüz senkron olmadıysa bile arama yapan
-    // kişiyi anında directory'ye yaz. Bir sonraki uygulama açılışında FCM tokenı
-    // ayrıca istemciden güncellenir.
     if (!callerUser) {
-      callerUser = {
-        phone: callerPhone,
-        phoneKeys: liveBridgePhoneKeys(callerPhone),
-        name: String(req.body?.callerName || "LiveBridge Kullanıcısı").slice(0, 80),
-        language: "",
-        gender: "female",
-        fcmToken: "",
-        lastSeen: liveBridgeNow(),
-      };
-      await liveBridgeStore.saveUser(callerUser);
-    } else {
-      callerUser = {
-        ...callerUser,
-        name: String(req.body?.callerName || callerUser.name || "LiveBridge Kullanıcısı").slice(0, 80),
-        lastSeen: liveBridgeNow(),
-      };
-      await liveBridgeStore.saveUser(callerUser);
+      return res.status(403).json({
+        error: "Arama yapan LiveBridge profili doğrulanamadı.",
+      });
     }
+    if (!(await hasLiveBridgeContact(callerUser.phone, resolvedCalleePhone))) {
+      return res.status(403).json({
+        error: "Bu numara LiveBridge kişilerinizde kayıtlı değil. Rastgele numaraya doğrudan bağlantı engellendi.",
+      });
+    }
+    callerUser.name = String(
+      req.body?.callerName || callerUser.name || "LiveBridge Kullanıcısı",
+    ).slice(0, 80);
+    callerUser.lastSeen = liveBridgeNow();
+    await liveBridgeStore.saveUser(callerUser);
 
     const id = `LBC-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
     const roomName = `LB-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
@@ -713,7 +1018,7 @@ app.post("/livebridge/call/start", async (req, res) => {
     res.json({ok: true, call, pushSent});
   } catch (error) {
     console.error("call/start hatası:", error);
-    res.status(500).json({error: "Arama başlatılamadı."});
+    res.status(error?.statusCode || 500).json({error: error?.message || "Arama başlatılamadı."});
   }
 });
 
@@ -738,6 +1043,11 @@ app.post("/livebridge/call/respond", async (req, res) => {
     if (!call || call.calleePhone !== phone) return res.status(404).json({error: "Arama bulunamadı."});
     const updated = {...call, status: req.body?.accepted ? "accepted" : "rejected", updatedAt: liveBridgeNow()};
     await liveBridgeStore.saveCall(updated);
+    if (req.body?.accepted) {
+      await saveLiveBridgeContact(call.calleePhone, call.callerPhone, call.callerName);
+      const calleeUser = await liveBridgeStore.findUserByPhoneKeys(liveBridgePhoneKeys(call.calleePhone));
+      await saveLiveBridgeContact(call.callerPhone, call.calleePhone, calleeUser?.name || call.calleePhone);
+    }
     res.json({ok: true, call: updated});
   } catch (error) {
     console.error("call/respond hatası:", error);

@@ -101,6 +101,7 @@ type LiveBridgeOutgoingCall = {
   status: "ringing" | "accepted" | "rejected" | "expired";
 };
 const LIVEBRIDGE_PROFILE_KEY = "livebridge_demo_profile_v1";
+const LIVEBRIDGE_CONTACTS_KEY_PREFIX = "livebridge_saved_contacts_v2:";
 const DEMO_VIP_VIDEO_UNLOCKED = true;
 
 type CallLanguage = {
@@ -329,6 +330,38 @@ function formatPresence(lastSeen?: number): string {
   if (seconds < 86400) return `${Math.floor(seconds / 3600)} sa önce`;
   return "Çevrimdışı";
 }
+function liveBridgeContactsStorageKey(ownerPhone: string): string {
+  return `${LIVEBRIDGE_CONTACTS_KEY_PREFIX}${normalizeLiveBridgePhone(ownerPhone)}`;
+}
+
+function mergeLiveBridgeUsers(
+  ...groups: Array<LiveBridgeDirectoryUser[] | undefined>
+): LiveBridgeDirectoryUser[] {
+  const byPhone = new Map<string, LiveBridgeDirectoryUser>();
+  for (const group of groups) {
+    for (const user of group || []) {
+      const phone = normalizeLiveBridgePhone(user?.phone || "");
+      if (phone.length < 7) continue;
+      const old = byPhone.get(phone);
+      byPhone.set(phone, {
+        ...(old || {}),
+        ...user,
+        phone,
+        name: String(user?.name || old?.name || phone),
+        online: Boolean(user?.online),
+        lastSeen: Number(user?.lastSeen || old?.lastSeen || 0),
+      });
+    }
+  }
+  return Array.from(byPhone.values()).sort((a, b) =>
+    a.online === b.online
+      ? String(a.name).localeCompare(String(b.name), "tr")
+      : a.online
+        ? -1
+        : 1,
+  );
+}
+
 function normalizeRoomCode(value: string): string {
   return value
     .toUpperCase()
@@ -2790,13 +2823,17 @@ export default function RemoteCallScreen({
       );
       setDirectoryPhone(cleanPhone);
       setDirectoryProfileReady(true);
-      await AsyncStorage.setItem(LIVEBRIDGE_PROFILE_KEY, JSON.stringify({phone: cleanPhone, gender: voiceGender}));
+      await AsyncStorage.setItem(
+        LIVEBRIDGE_PROFILE_KEY,
+        JSON.stringify({phone: cleanPhone, gender: voiceGender}),
+      );
+      void loadSavedLiveBridgeContacts(cleanPhone);
       return true;
     } catch (error) {
       Alert.alert("LiveBridge kayıt hatası", error instanceof Error ? error.message : "Profil kaydedilemedi.");
       return false;
     }
-  }, [directoryPhone, name, sourceCallLanguage.name, voiceGender]);
+  }, [directoryPhone, loadSavedLiveBridgeContacts, name, sourceCallLanguage.name, voiceGender]);
 
   const loadRecentConversations=useCallback(async()=>{
     if(!directoryProfileReady||!directoryPhone)return;
@@ -3057,38 +3094,89 @@ export default function RemoteCallScreen({
     return () => clearInterval(timer);
   }, [directoryPhone, historyPeer?.peerPhone, loadConversationMessages]);
 
+  const loadSavedLiveBridgeContacts = useCallback(
+    async (ownerOverride?: string) => {
+      const owner = normalizeLiveBridgePhone(ownerOverride || directoryPhone);
+      if (owner.length < 7) return [] as LiveBridgeDirectoryUser[];
+
+      let localUsers: LiveBridgeDirectoryUser[] = [];
+      try {
+        const raw = await AsyncStorage.getItem(liveBridgeContactsStorageKey(owner));
+        const parsed = raw ? JSON.parse(raw) : [];
+        localUsers = Array.isArray(parsed) ? parsed : [];
+        if (localUsers.length) {
+          setDirectoryUsers(current => mergeLiveBridgeUsers(current, localUsers));
+        }
+      } catch {}
+
+      try {
+        const data = await fetchJson<{users?: LiveBridgeDirectoryUser[]}>(
+          `/livebridge/contacts/saved?ownerPhone=${encodeURIComponent(owner)}`,
+          {method: "GET"},
+          12000,
+        );
+        const serverUsers = Array.isArray(data?.users) ? data.users : [];
+        const merged = mergeLiveBridgeUsers(localUsers, serverUsers);
+        setDirectoryUsers(merged);
+        await AsyncStorage.setItem(
+          liveBridgeContactsStorageKey(owner),
+          JSON.stringify(merged),
+        );
+        return merged;
+      } catch {
+        return localUsers;
+      }
+    },
+    [directoryPhone],
+  );
+
   const syncLiveBridgeContacts = useCallback(async () => {
     if (!directoryProfileReady || !directoryPhone) return;
     try {
       setDirectoryLoading(true);
       setContactsPermissionDenied(false);
+
+      // Önce daha önce kaydedilmiş AyTalk kişilerini göster. Telefon rehberi
+      // izni kapalı olsa bile bunlar artık kaybolmaz.
+      const savedBeforeScan = await loadSavedLiveBridgeContacts(directoryPhone);
+
       if (Platform.OS === "android") {
         const permission = await PermissionsAndroid.request(
           PermissionsAndroid.PERMISSIONS.READ_CONTACTS,
           {
             title: "LiveBridge Kişiler",
-            message: "Rehberindeki hangi kişilerin LiveBridge kullandığını göstermek için kişi izni gerekiyor.",
+            message:
+              "Rehberindeki hangi kişilerin LiveBridge kullandığını göstermek için kişi izni gerekiyor.",
             buttonPositive: "İzin Ver",
             buttonNegative: "Şimdi Değil",
           },
         );
         if (permission !== PermissionsAndroid.RESULTS.GRANTED) {
           setContactsPermissionDenied(true);
+          setDirectoryUsers(savedBeforeScan);
           return;
         }
       }
+
       const contacts = await Contacts.getAll();
       const raw = contacts.flatMap(contact =>
         (contact.phoneNumbers || []).map(phoneNumber => ({
           phone: normalizeLiveBridgePhone(phoneNumber.number),
           keys: liveBridgePhoneKeys(phoneNumber.number),
-          name: `${contact.givenName || ""} ${contact.familyName || ""}`.trim()
-            || contact.displayName || "Kişi",
+          name:
+            `${contact.givenName || ""} ${contact.familyName || ""}`.trim() ||
+            contact.displayName ||
+            "Kişi",
         })),
       );
-      const deduped = Array.from(new Map(
-        raw.filter(item => item.phone.length >= 7).map(item => [item.phone, item]),
-      ).values());
+      const deduped = Array.from(
+        new Map(
+          raw
+            .filter(item => item.phone.length >= 7)
+            .map(item => [item.phone, item]),
+        ).values(),
+      );
+
       const data = await fetchJson<{users?: LiveBridgeDirectoryUser[]}>(
         "/livebridge/contacts/match",
         {
@@ -3100,13 +3188,30 @@ export default function RemoteCallScreen({
         },
         15000,
       );
-      setDirectoryUsers(Array.isArray(data?.users) ? data.users : []);
+
+      // Sunucu bu noktadan sonra sadece o an eşleşenleri değil, sahibin daha
+      // önce kaydedilmiş AyTalk kişilerini de döndürür.
+      const matched = Array.isArray(data?.users) ? data.users : [];
+      const merged = mergeLiveBridgeUsers(savedBeforeScan, matched);
+      setDirectoryUsers(merged);
+      await AsyncStorage.setItem(
+        liveBridgeContactsStorageKey(directoryPhone),
+        JSON.stringify(merged),
+      );
     } catch (error) {
-      Alert.alert("Kişiler yüklenemedi", error instanceof Error ? error.message : "Telefon rehberi okunamadı.");
+      // Ağ hatasında mevcut kişileri silme. Eski kod burada listeyi boşaltabiliyordu.
+      Alert.alert(
+        "Kişiler yüklenemedi",
+        error instanceof Error ? error.message : "Telefon rehberi okunamadı.",
+      );
     } finally {
       setDirectoryLoading(false);
     }
-  }, [directoryPhone, directoryProfileReady]);
+  }, [
+    directoryPhone,
+    directoryProfileReady,
+    loadSavedLiveBridgeContacts,
+  ]);
 
   useEffect(() => {
     if (!visible) return;
@@ -3121,13 +3226,14 @@ export default function RemoteCallScreen({
         if (phone.length >= 7) {
           setDirectoryPhone(phone);
           setDirectoryProfileReady(true);
+          void loadSavedLiveBridgeContacts(phone);
           setTimeout(() => void registerDirectoryProfile(phone), 100);
         }
       } catch {}
     };
     void load();
     return () => { cancelled = true; };
-  }, [registerDirectoryProfile, visible]);
+  }, [loadSavedLiveBridgeContacts, registerDirectoryProfile, visible]);
 
   useEffect(() => {
     // FCM token zaman içinde değişebilir. Değiştiğinde aynı LiveBridge profiline
@@ -3715,7 +3821,7 @@ export default function RemoteCallScreen({
                 <Text style={styles.directorySetupEyebrow}>LIVEBRIDGE KİŞİLER</Text>
                 <Text style={styles.directorySetupTitle}>Rehberindeki LiveBridge kullanıcılarını bul</Text>
                 <Text style={styles.directorySetupText}>
-                  Demo için numaranı ülke koduyla kaydet.
+                  Numaranı ülke koduyla kaydet. Bu cihaz bir LiveBridge numarasına bağlanır; rastgele numaralarla kişilere doğrudan arama açılamaz.
                 </Text>
                 <TextInput
                   style={styles.directoryPhoneInput}
@@ -3743,7 +3849,11 @@ export default function RemoteCallScreen({
                 <View style={styles.directoryHeaderRow}>
                   <View>
                     <Text style={styles.directoryTitle}>Kişiler</Text>
-                    <Text style={styles.directorySubtitle}>LiveBridge kullanan rehber kişilerin</Text>
+                    <Text style={styles.directorySubtitle}>
+                      {contactsPermissionDenied
+                        ? "Kaydedilmiş AyTalk kişilerin · rehber izni kapalı"
+                        : "Kalıcı AyTalk kişilerin"}
+                    </Text>
                   </View>
                   <TouchableOpacity style={styles.directorySyncButton}
                     onPress={() => void syncLiveBridgeContacts()}>
@@ -3767,12 +3877,7 @@ export default function RemoteCallScreen({
                   </View>
                 </View>
 
-                {contactsPermissionDenied ? (
-                  <View style={styles.directoryEmptyCard}>
-                    <Text style={styles.directoryEmptyTitle}>Kişi izni kapalı</Text>
-                    <Text style={styles.directoryEmptyText}>LiveBridge kullanıcılarını bulmak için kişi iznini aç.</Text>
-                  </View>
-                ) : directoryUsers.length > 0 ? (
+                {directoryUsers.length > 0 ? (
                   <View style={styles.directoryListCard}>
                     {directoryUsers.map(user => (
                       <TouchableOpacity
