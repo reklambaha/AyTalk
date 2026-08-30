@@ -540,14 +540,16 @@ async function getSavedLiveBridgeContacts(ownerPhone) {
     const user = await liveBridgeStore.findUserByPhoneKeys(
       liveBridgePhoneKeys(row.peerPhone),
     );
-    if (!user) continue;
+
+    // Kişi satırı Postgres'te kayıtlıysa, kullanıcı profili geçici olarak
+    // bulunamasa bile listeyi silme. Rehber kalıcılığı kişi tablosuna dayanır.
     users.push({
-      phone: user.phone,
-      name: String(row.displayName || user.name || user.phone).slice(0,100),
-      language: user.language || "",
-      gender: user.gender === "male" ? "male" : "female",
+      phone: user?.phone || row.peerPhone,
+      name: String(row.displayName || user?.name || row.peerPhone).slice(0,100),
+      language: user?.language || "",
+      gender: user?.gender === "male" ? "male" : "female",
       online: liveBridgeUserOnline(user),
-      lastSeen: user.lastSeen || row.updatedAt || 0,
+      lastSeen: user?.lastSeen || row.updatedAt || 0,
     });
   }
   return users;
@@ -650,6 +652,10 @@ app.post("/livebridge/presence", async (req, res) => {
 app.post("/livebridge/contacts/match", async (req, res) => {
   try {
     const ownerPhone = normalizeLiveBridgePhone(req.body?.ownerPhone);
+    if (ownerPhone.length < 7) {
+      return res.status(400).json({error: "LiveBridge sahibi telefon numarası gerekli."});
+    }
+
     const contacts = Array.isArray(req.body?.contacts)
       ? req.body.contacts.slice(0, 3000)
       : [];
@@ -1004,8 +1010,10 @@ app.post("/livebridge/call/start", async (req, res) => {
       id, roomName, callerPhone,
       callerName: String(req.body?.callerName || "LiveBridge Kullanıcısı").slice(0, 80),
       callerGender: callerUser?.gender === "male" ? "male" : "female",
+      callerLanguage: String(callerUser?.language || "").slice(0, 80),
       calleePhone: resolvedCalleePhone,
       calleeGender: calleeUser.gender === "male" ? "male" : "female",
+      calleeLanguage: String(calleeUser?.language || "").slice(0, 80),
       mode: req.body?.mode === "chat" ? "chat" : req.body?.mode === "audio" ? "audio" : "video",
       status: "ringing", createdAt: liveBridgeNow(), updatedAt: liveBridgeNow(),
     };

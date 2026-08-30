@@ -86,7 +86,9 @@ type LiveBridgeIncomingCall = {
   callerPhone: string;
   callerName: string;
   callerGender?: "male" | "female";
+  callerLanguage?: string;
   calleePhone: string;
+  calleeLanguage?: string;
   mode: LiveBridgeCallMode;
   status: "ringing" | "accepted" | "rejected" | "expired";
   createdAt: number;
@@ -97,6 +99,7 @@ type LiveBridgeOutgoingCall = {
   calleePhone: string;
   calleeName: string;
   calleeGender?: "male" | "female";
+  calleeLanguage?: string;
   mode: LiveBridgeCallMode;
   status: "ringing" | "accepted" | "rejected" | "expired";
 };
@@ -409,6 +412,13 @@ function formatCallDuration(totalSeconds: number): string {
   return `${minutes}:${seconds}`;
 }
 
+function formatBytes(size: number): string {
+  const value = Math.max(0, Number(size || 0));
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(value < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(value < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
 function RoomView({
   onLeave,
   sourceLanguage,
@@ -450,6 +460,10 @@ function RoomView({
   const autoTranslationEnabledRef = useRef(false);
   const autoTranslationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoTranslationRunIdRef = useRef(0);
+  const translationCaptureRef = useRef(false);
+  const ttsPlaybackRef = useRef(false);
+  const ttsCooldownUntilRef = useRef(0);
+  const lastRemoteTranslationKeyRef = useRef("");
 
   const [microphoneEnabled, setMicrophoneEnabled] = useState(true);
   const [cameraEnabled, setCameraEnabled] = useState(true);
@@ -810,7 +824,28 @@ function RoomView({
     const selectedGender: "male" | "female" =
       explicitGender || translationVoiceGenderRef.current;
 
+    // AyTalk'ın kendi TTS sesi otomatik çeviri mikrofonuna tekrar girerse
+    // TTS -> STT -> çeviri -> TTS geri besleme döngüsü oluşur.
+    // Bu yüzden TTS başlamadan aktif capture kesin iptal edilir ve görüşme
+    // mikrofonu yalnız oynatma süresince mute edilir. Track odadan sökülmez.
+    const micWasEnabled = localParticipant.isMicrophoneEnabled;
+    ttsPlaybackRef.current = true;
+    ttsCooldownUntilRef.current = Number.MAX_SAFE_INTEGER;
+
     try {
+      try {
+        AySpeech?.cancel();
+      } catch {}
+      translationCaptureRef.current = false;
+      setTranslationListening(false);
+
+      if (micWasEnabled) {
+        try {
+          await localParticipant.setMicrophoneEnabled(false);
+          setMicrophoneEnabled(false);
+        } catch {}
+      }
+
       await Tts.stop();
 
       const currentSound = cloudTranslationSoundRef.current;
@@ -832,8 +867,6 @@ function RoomView({
         voices,
       });
 
-      // Cinsiyet seçimi kesin olmalı. Yerel Android TTS cinsiyeti garanti etmediği için
-      // burada kontrolsüz local fallback kullanılmaz.
       let lastError: unknown = null;
       for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
@@ -862,6 +895,24 @@ function RoomView({
         selectedGender,
         error,
       );
+    } finally {
+      // Hoparlör yankısının son kuyruğu da mikrofona girmesin.
+      ttsPlaybackRef.current = false;
+      ttsCooldownUntilRef.current = Date.now() + 900;
+
+      if (micWasEnabled) {
+        try {
+          await new Promise<void>(resolve => setTimeout(resolve, 220));
+          await localParticipant.setMicrophoneEnabled(true, {
+            echoCancellation: true,
+            noiseSuppression: true,
+            voiceIsolation: true,
+            autoGainControl: false,
+            channelCount: 1,
+          });
+          setMicrophoneEnabled(true);
+        } catch {}
+      }
     }
   };
 
@@ -893,16 +944,34 @@ function RoomView({
   useEffect(()=>{
     const h=(payload:Uint8Array,_p?:unknown,_k?:unknown,topic?:string)=>{
       if(topic&&topic!=="aytalk.translation")return;
-      try{const packet=JSON.parse(Buffer.from(payload).toString("utf8")) as TranslationPacket;if(packet.type!=="aytalk-translation")return;
-      setRemoteOriginal(packet.original);setRemoteTranslated(packet.translated);setBridgeActivated(true);
-      setTranslationHistory(cur=>[...cur,{id:`remote-${packet.createdAt}`,side:"remote",original:packet.original,translated:packet.translated,
-      senderName:packet.senderName||"Karşı taraf",createdAt:packet.createdAt}].slice(-120));
-      if(voiceTranslationEnabled)void speakTranslation(
-        packet.translated,
-        packet.toLocale||targetLanguage.locale,
-        translationVoiceGenderRef.current,
-      );}catch{}
-    };room.on(RoomEvent.DataReceived,h);return()=>room.off(RoomEvent.DataReceived,h);
+      try{
+        const packet=JSON.parse(Buffer.from(payload).toString("utf8")) as TranslationPacket;
+        if(packet.type!=="aytalk-translation")return;
+
+        const packetKey=`${packet.senderName||""}:${packet.createdAt}:${packet.original}:${packet.translated}`;
+        if(lastRemoteTranslationKeyRef.current===packetKey)return;
+        lastRemoteTranslationKeyRef.current=packetKey;
+
+        setRemoteOriginal(packet.original);
+        setRemoteTranslated(packet.translated);
+        setBridgeActivated(true);
+        setTranslationHistory(cur=>[...cur,{id:`remote-${packet.createdAt}`,side:"remote",original:packet.original,translated:packet.translated,
+        senderName:packet.senderName||"Karşı taraf",createdAt:packet.createdAt}].slice(-120));
+
+        if(voiceTranslationEnabled){
+          try{AySpeech?.cancel();}catch{}
+          translationCaptureRef.current=false;
+          setTranslationListening(false);
+          void speakTranslation(
+            packet.translated,
+            packet.toLocale||targetLanguage.locale,
+            translationVoiceGenderRef.current,
+          );
+        }
+      }catch{}
+    };
+    room.on(RoomEvent.DataReceived,h);
+    return()=>room.off(RoomEvent.DataReceived,h);
   },[room,voiceTranslationEnabled,targetLanguage.locale]);
 
   useEffect(() => {
@@ -1094,8 +1163,27 @@ function RoomView({
         return;
       }
 
-      // Otomatik döngü hiçbir zaman ikinci bir capture'ı üst üste başlatmaz.
-      if (translationRequestRef.current || translationListening || translationBusy) {
+      const cooldownLeft = Math.max(0, ttsCooldownUntilRef.current - Date.now());
+      if (
+        ttsPlaybackRef.current ||
+        cooldownLeft > 0 ||
+        translationCaptureRef.current ||
+        translationRequestRef.current ||
+        translationListening ||
+        translationBusy
+      ) {
+        if (autoTranslationTimerRef.current) {
+          clearTimeout(autoTranslationTimerRef.current);
+        }
+        autoTranslationTimerRef.current = setTimeout(() => {
+          autoTranslationTimerRef.current = null;
+          if (
+            autoTranslationEnabledRef.current &&
+            runId === autoTranslationRunIdRef.current
+          ) {
+            void startPushToTranslate(true, runId);
+          }
+        }, Math.max(300, cooldownLeft + 80));
         return;
       }
     } else if (translationListening || translationBusy) {
@@ -1125,24 +1213,18 @@ function RoomView({
       microphoneWasEnabledRef.current =
         localParticipant.isMicrophoneEnabled;
 
-      // WebRTC odası açık kalır; çeviri capture sırasında yalnız yerel mikrofon
-      // kısa süreli serbest bırakılır.
-      const microphonePublication =
-        localParticipant.getTrackPublication(
-          Track.Source.Microphone,
-        );
-      const microphoneTrack = microphonePublication?.track;
-
-      if (microphoneTrack && microphoneWasEnabledRef.current) {
-        await localParticipant.unpublishTrack(
-          microphoneTrack,
-          true,
-        );
-        setMicrophoneEnabled(false);
+      // Çeviri capture sırasında LiveKit mikrofon track'ini ODADAN SÖKME.
+      // Eski unpublishTrack(..., true) çağrısı track'i yok edip bağlantıyı
+      // kararsızlaştırabiliyordu. Yalnızca mute edilir ve aynı track korunur.
+      if (microphoneWasEnabledRef.current) {
+        try {
+          await localParticipant.setMicrophoneEnabled(false);
+          setMicrophoneEnabled(false);
+        } catch {}
       }
 
       await new Promise<void>(resolve => {
-        setTimeout(() => resolve(), 260);
+        setTimeout(() => resolve(), 180);
       });
 
       if (
@@ -1154,10 +1236,12 @@ function RoomView({
       }
 
       setTranslationListening(true);
+      translationCaptureRef.current = true;
 
       // AySpeech kendi sessizlik algılamasıyla konuşma bittiğinde erken döner;
       // 9 sn yalnızca üst sınırdır.
       const captured = await AySpeech.capture(9000);
+      translationCaptureRef.current = false;
       setTranslationListening(false);
 
       const audioBase64 = String(
@@ -1199,6 +1283,7 @@ function RoomView({
       setLocalOriginal(recognized);
       await translateRecognizedText(recognized);
     } catch (speechError) {
+      translationCaptureRef.current = false;
       setTranslationListening(false);
 
       const message =
@@ -1229,6 +1314,7 @@ function RoomView({
         console.warn("Otomatik çeviri capture:", message);
       }
     } finally {
+      translationCaptureRef.current = false;
       await restoreCallMicrophone();
 
       if (
@@ -1969,8 +2055,8 @@ function RoomView({
               <TouchableOpacity
                 style={styles.subtitleVoiceGenderButton}
                 onPress={() =>
-                  setTranslationVoiceGender(value =>
-                    value === "female" ? "male" : "female",
+                  changeTranslationVoiceGender(
+                    translationVoiceGender === "female" ? "male" : "female",
                   )
                 }>
                 <Text style={styles.subtitleVoiceGenderText}>
@@ -2637,7 +2723,7 @@ export default function RemoteCallScreen({
   );
   const defaultTargetLanguageIndex = Math.max(
     0,
-    CALL_LANGUAGES.findIndex(language => language.name === "Khmer"),
+    CALL_LANGUAGES.findIndex(language => language.name === "English"),
   );
 
   const [directoryPhone, setDirectoryPhone] = useState("");
@@ -2677,9 +2763,15 @@ export default function RemoteCallScreen({
   const [languageSearch, setLanguageSearch] = useState("");
   const outgoingRingRef = useRef<Sound | null>(null);
   const incomingRingRef = useRef<Sound | null>(null);
+  const outgoingRingGenerationRef = useRef(0);
+  const incomingRingGenerationRef = useRef(0);
 
   const stopLocalRingSound = useCallback((kind: "incoming" | "outgoing") => {
     const ref = kind === "incoming" ? incomingRingRef : outgoingRingRef;
+    const generationRef =
+      kind === "incoming" ? incomingRingGenerationRef : outgoingRingGenerationRef;
+    generationRef.current += 1;
+
     const sound = ref.current;
     ref.current = null;
     if (!sound) return;
@@ -2694,7 +2786,12 @@ export default function RemoteCallScreen({
 
   const startLocalRingSound = useCallback((kind: "incoming" | "outgoing") => {
     const ref = kind === "incoming" ? incomingRingRef : outgoingRingRef;
+    const generationRef =
+      kind === "incoming" ? incomingRingGenerationRef : outgoingRingGenerationRef;
     if (ref.current) return;
+
+    const generation = generationRef.current + 1;
+    generationRef.current = generation;
 
     try {
       Sound.setCategory?.("Playback");
@@ -2703,7 +2800,11 @@ export default function RemoteCallScreen({
           ? "livebridge_ring.wav"
           : "livebridge_ringback.wav";
       const sound = new Sound(filename, Sound.MAIN_BUNDLE, error => {
-        if (error) {
+        if (
+          error ||
+          ref.current !== sound ||
+          generationRef.current !== generation
+        ) {
           try { sound.release(); } catch {}
           if (ref.current === sound) ref.current = null;
           return;
@@ -2723,6 +2824,18 @@ export default function RemoteCallScreen({
 
   const sourceCallLanguage = CALL_LANGUAGES[sourceLanguageIndex];
   const targetCallLanguage = CALL_LANGUAGES[targetLanguageIndex];
+
+  const usePeerLanguageAsTarget = useCallback((languageName?: string) => {
+    const clean = String(languageName || "").trim();
+    if (!clean) return;
+    const index = CALL_LANGUAGES.findIndex(
+      language =>
+        language.name.toLocaleLowerCase("en-US") === clean.toLocaleLowerCase("en-US") ||
+        language.nativeName.toLocaleLowerCase("tr-TR") === clean.toLocaleLowerCase("tr-TR") ||
+        language.locale.toLocaleLowerCase("en-US") === clean.toLocaleLowerCase("en-US"),
+    );
+    if (index >= 0) setTargetLanguageIndex(index);
+  }, []);
 
   const activeBridgeDistance = useMemo(() => {
     const peerPhone = outgoingCall?.calleePhone || incomingCall?.callerPhone || "";
@@ -2798,6 +2911,42 @@ export default function RemoteCallScreen({
     if (visible) return;
     void AudioSession.stopAudioSession();
   }, [visible]);
+
+  const loadSavedLiveBridgeContacts = useCallback(
+    async (ownerOverride?: string) => {
+      const owner = normalizeLiveBridgePhone(ownerOverride || directoryPhone);
+      if (owner.length < 7) return [] as LiveBridgeDirectoryUser[];
+
+      let localUsers: LiveBridgeDirectoryUser[] = [];
+      try {
+        const raw = await AsyncStorage.getItem(liveBridgeContactsStorageKey(owner));
+        const parsed = raw ? JSON.parse(raw) : [];
+        localUsers = Array.isArray(parsed) ? parsed : [];
+        if (localUsers.length) {
+          setDirectoryUsers(current => mergeLiveBridgeUsers(current, localUsers));
+        }
+      } catch {}
+
+      try {
+        const data = await fetchJson<{users?: LiveBridgeDirectoryUser[]}>(
+          `/livebridge/contacts/saved?ownerPhone=${encodeURIComponent(owner)}`,
+          {method: "GET"},
+          12000,
+        );
+        const serverUsers = Array.isArray(data?.users) ? data.users : [];
+        const merged = mergeLiveBridgeUsers(localUsers, serverUsers);
+        setDirectoryUsers(merged);
+        await AsyncStorage.setItem(
+          liveBridgeContactsStorageKey(owner),
+          JSON.stringify(merged),
+        );
+        return merged;
+      } catch {
+        return localUsers;
+      }
+    },
+    [directoryPhone],
+  );
 
   const registerDirectoryProfile = useCallback(async (phoneOverride?: string) => {
     const cleanPhone = normalizeLiveBridgePhone(phoneOverride ?? directoryPhone);
@@ -3094,41 +3243,7 @@ export default function RemoteCallScreen({
     return () => clearInterval(timer);
   }, [directoryPhone, historyPeer?.peerPhone, loadConversationMessages]);
 
-  const loadSavedLiveBridgeContacts = useCallback(
-    async (ownerOverride?: string) => {
-      const owner = normalizeLiveBridgePhone(ownerOverride || directoryPhone);
-      if (owner.length < 7) return [] as LiveBridgeDirectoryUser[];
 
-      let localUsers: LiveBridgeDirectoryUser[] = [];
-      try {
-        const raw = await AsyncStorage.getItem(liveBridgeContactsStorageKey(owner));
-        const parsed = raw ? JSON.parse(raw) : [];
-        localUsers = Array.isArray(parsed) ? parsed : [];
-        if (localUsers.length) {
-          setDirectoryUsers(current => mergeLiveBridgeUsers(current, localUsers));
-        }
-      } catch {}
-
-      try {
-        const data = await fetchJson<{users?: LiveBridgeDirectoryUser[]}>(
-          `/livebridge/contacts/saved?ownerPhone=${encodeURIComponent(owner)}`,
-          {method: "GET"},
-          12000,
-        );
-        const serverUsers = Array.isArray(data?.users) ? data.users : [];
-        const merged = mergeLiveBridgeUsers(localUsers, serverUsers);
-        setDirectoryUsers(merged);
-        await AsyncStorage.setItem(
-          liveBridgeContactsStorageKey(owner),
-          JSON.stringify(merged),
-        );
-        return merged;
-      } catch {
-        return localUsers;
-      }
-    },
-    [directoryPhone],
-  );
 
   const syncLiveBridgeContacts = useCallback(async () => {
     if (!directoryProfileReady || !directoryPhone) return;
@@ -3506,6 +3621,11 @@ export default function RemoteCallScreen({
   };
 
   const connectToRoom = async (requestedRoom: string, mode: LiveBridgeCallMode) => {
+    // Arama/ringback sesi yalnız arama ekranında kalır; görüşmeye geçmeden
+    // önce iki olası zil de kesin olarak kapatılır.
+    stopLocalRingSound("incoming");
+    stopLocalRingSound("outgoing");
+
     const cleanName = name.trim();
     const cleanRoom = normalizeRoomCode(requestedRoom);
     if (!cleanName || cleanRoom.length < 4) {
@@ -3562,7 +3682,7 @@ export default function RemoteCallScreen({
       return;
     }
     try {
-      const data = await fetchJson<{call: LiveBridgeIncomingCall & {calleeGender?: "male" | "female"}}>(
+      const data = await fetchJson<{call: LiveBridgeIncomingCall & {calleeGender?: "male" | "female"; calleeLanguage?: string}}>(
         "/livebridge/call/start",
         {
           method: "POST",
@@ -3576,12 +3696,14 @@ export default function RemoteCallScreen({
         10000,
       );
       setActiveRemoteVoiceGender(data.call.calleeGender === "male" ? "male" : "female");
+      usePeerLanguageAsTarget(data.call.calleeLanguage || user.language);
       setOutgoingCall({
         id: data.call.id,
         roomName: data.call.roomName,
         calleePhone: user.phone,
         calleeName: user.name,
         calleeGender: data.call.calleeGender === "male" ? "male" : "female",
+        calleeLanguage: data.call.calleeLanguage || user.language,
         mode,
         status: "ringing",
       });
@@ -3614,6 +3736,7 @@ export default function RemoteCallScreen({
       );
       if (accepted) {
         setActiveRemoteVoiceGender(current.callerGender === "male" ? "male" : "female");
+        usePeerLanguageAsTarget(current.callerLanguage);
         await connectToRoom(current.roomName, current.mode);
       }
     } catch (error) {
@@ -3638,7 +3761,9 @@ export default function RemoteCallScreen({
           const accepted = outgoingCall;
           setActivePeerPhone(accepted.calleePhone);
           setActivePeerName(accepted.calleeName);
+          usePeerLanguageAsTarget(accepted.calleeLanguage);
           setOutgoingCall(null);
+          stopLocalRingSound("outgoing");
           void connectToRoom(accepted.roomName, accepted.mode);
         } else if (status === "rejected" || status === "expired") {
           setOutgoingCall(null);
@@ -3695,6 +3820,8 @@ export default function RemoteCallScreen({
             },
           }}
           onConnected={() => {
+            stopLocalRingSound("incoming");
+            stopLocalRingSound("outgoing");
             setConnectionStatus("connected");
             setError("");
           }}
@@ -3750,6 +3877,8 @@ export default function RemoteCallScreen({
               }
             }}
             onLeave={() => {
+              stopLocalRingSound("incoming");
+              stopLocalRingSound("outgoing");
               setConnectionStatus("idle");
               setCredentials(null);
               setActivePeerPhone("");
