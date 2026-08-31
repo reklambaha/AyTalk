@@ -1055,6 +1055,8 @@ function RoomView({
       type: "aytalk-translation",
       original,
       translated,
+      // Paket, gönderen telefonun kendi seçtiği çeviri yönünü taşır.
+      // Alıcı bu dili kendi ayarına göre yeniden yorumlamaz.
       fromLanguage: sourceLanguage.name,
       toLanguage: targetLanguage.name,
       toLocale: targetLanguage.locale,
@@ -1089,6 +1091,8 @@ function RoomView({
           method: "POST",
           body: JSON.stringify({
             message: cleanText,
+            // KRİTİK: Çeviri yönü yalnız bu cihazdaki BEN -> ÇEVİRİ seçimidir.
+            // Karşı tarafın profil/dil tercihi bu isteği değiştiremez.
             from: sourceLanguage.name,
             to: targetLanguage.name,
             profanityMode,
@@ -2825,17 +2829,12 @@ export default function RemoteCallScreen({
   const sourceCallLanguage = CALL_LANGUAGES[sourceLanguageIndex];
   const targetCallLanguage = CALL_LANGUAGES[targetLanguageIndex];
 
-  const usePeerLanguageAsTarget = useCallback((languageName?: string) => {
-    const clean = String(languageName || "").trim();
-    if (!clean) return;
-    const index = CALL_LANGUAGES.findIndex(
-      language =>
-        language.name.toLocaleLowerCase("en-US") === clean.toLocaleLowerCase("en-US") ||
-        language.nativeName.toLocaleLowerCase("tr-TR") === clean.toLocaleLowerCase("tr-TR") ||
-        language.locale.toLocaleLowerCase("en-US") === clean.toLocaleLowerCase("en-US"),
-    );
-    if (index >= 0) setTargetLanguageIndex(index);
-  }, []);
+  // Dil yönü tamamen bu cihazın kullanıcısı tarafından seçilir.
+  // Karşı tarafın profil dili yerel hedef dili ASLA değiştirmez.
+  // Örn. bu telefonda Türkçe -> English seçildiyse, bu telefondan çıkan
+  // konuşma yalnız English'e çevrilir; karşı telefon kendi Türkçe -> Deutsch
+  // seçimini bağımsız olarak korur.
+
 
   const activeBridgeDistance = useMemo(() => {
     const peerPhone = outgoingCall?.calleePhone || incomingCall?.callerPhone || "";
@@ -3696,7 +3695,6 @@ export default function RemoteCallScreen({
         10000,
       );
       setActiveRemoteVoiceGender(data.call.calleeGender === "male" ? "male" : "female");
-      usePeerLanguageAsTarget(data.call.calleeLanguage || user.language);
       setOutgoingCall({
         id: data.call.id,
         roomName: data.call.roomName,
@@ -3736,7 +3734,6 @@ export default function RemoteCallScreen({
       );
       if (accepted) {
         setActiveRemoteVoiceGender(current.callerGender === "male" ? "male" : "female");
-        usePeerLanguageAsTarget(current.callerLanguage);
         await connectToRoom(current.roomName, current.mode);
       }
     } catch (error) {
@@ -3761,7 +3758,6 @@ export default function RemoteCallScreen({
           const accepted = outgoingCall;
           setActivePeerPhone(accepted.calleePhone);
           setActivePeerName(accepted.calleeName);
-          usePeerLanguageAsTarget(accepted.calleeLanguage);
           setOutgoingCall(null);
           stopLocalRingSound("outgoing");
           void connectToRoom(accepted.roomName, accepted.mode);
