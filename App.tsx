@@ -759,6 +759,33 @@ function AyTalkMainApp() {
     } catch {}
   };
 
+  const [feedbackSentFor, setFeedbackSentFor] = useState<string | null>(null);
+
+  const sendTranslationFeedback = async (rating: "good" | "bad") => {
+    const cleanTranslation = translation.trim();
+    if (!cleanTranslation || feedbackSentFor === cleanTranslation) return;
+    setFeedbackSentFor(cleanTranslation);
+    try {
+      await fetchJson(
+        "/feedback/translation",
+        {
+          method: "POST",
+          headers: getApiJsonHeaders(),
+          body: JSON.stringify({
+            from: sourceLanguage.name,
+            to: resultLanguage.name,
+            sourceText: text,
+            translatedText: cleanTranslation,
+            rating,
+          }),
+        },
+        10000,
+      );
+    } catch {
+      // Geri bildirim gönderilemese bile kullanıcı deneyimini bozma — sessizce yut.
+    }
+  };
+
   const speechEmitter = useMemo(() => {
     if (!AySpeech) return null;
     return new NativeEventEmitter(AySpeech);
@@ -3553,6 +3580,20 @@ function AyTalkMainApp() {
                   {translation || (isLoading ? "▍" : "Çeviri burada görünecek.")}
                 </Text>
               </ScrollView>
+              {translation && !isLoading ? (
+                <View style={{flexDirection: "row", justifyContent: "center", gap: 14, marginTop: 8, marginBottom: 4}}>
+                  <TouchableOpacity
+                    onPress={() => void sendTranslationFeedback("good")}
+                    style={{opacity: feedbackSentFor === translation.trim() ? 0.4 : 1}}>
+                    <Text style={{fontSize: 22}}>👍</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    onPress={() => void sendTranslationFeedback("bad")}
+                    style={{opacity: feedbackSentFor === translation.trim() ? 0.4 : 1}}>
+                    <Text style={{fontSize: 22}}>👎</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : null}
             </Animated.View>
           ) : null}
         </ScrollView>

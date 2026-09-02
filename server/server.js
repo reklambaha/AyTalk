@@ -172,6 +172,20 @@ async function initDb() {
   `);
   await dbPool.query(`CREATE INDEX IF NOT EXISTS idx_livebridge_contacts_owner ON livebridge_contacts(owner_phone,updated_at DESC);`);
 
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS translation_feedback (
+      id SERIAL PRIMARY KEY,
+      from_language TEXT NOT NULL,
+      to_language TEXT NOT NULL,
+      source_text TEXT NOT NULL,
+      translated_text TEXT NOT NULL,
+      rating TEXT NOT NULL,
+      note TEXT NOT NULL DEFAULT '',
+      created_at BIGINT NOT NULL
+    );
+  `);
+  await dbPool.query(`CREATE INDEX IF NOT EXISTS idx_translation_feedback_langs ON translation_feedback(from_language, to_language, created_at DESC);`);
+
   console.log("Veritabanı tabloları hazır.");
 }
 
@@ -1431,9 +1445,14 @@ app.post("/call/translate", async (req, res) => {
         "When an address term has a natural target-language equivalent, use that equivalent while preserving relationship, respect and register. " +
         "Do not transliterate ordinary vocabulary when an established target-language translation exists. Preserve proper names and genuine acronyms. " +
         "CRITICAL — register matching: the speaker may use informal, rural, regional, dialectal, or uneducated everyday speech, " +
-        "non-standard grammar, slang, or spoken-language shortcuts. Render this in equally informal, everyday spoken language " +
-        "in the target language — the kind an ordinary villager or non-literate speaker would actually use in daily life. " +
-        "NEVER upgrade informal speech into formal, literary, official, or textbook-correct language. Match the register down, not up. " +
+        "non-standard grammar, slang, or spoken-language shortcuts. Understand and correctly interpret ANY regional dialect, " +
+        "country-specific accent-influenced spelling, or local slang on the input side, no matter which country or region it " +
+        "comes from. Render the MEANING in equally informal, everyday spoken language in the target language, but always in the " +
+        "most widely understood, standard/neutral form of that target language — not a narrow dialect or slang specific to a " +
+        "single country or region — so that a speaker of that language from ANY country or region can understand it. " +
+        "NEVER upgrade informal speech into formal, literary, official, or textbook-correct language, and never narrow it down " +
+        "into a hyper-local regional dialect either. Match the register (formal/informal) down, not up — but keep the dialect " +
+        "choice as the broadest, most globally intelligible standard variety of the target language. " +
         "If source language is Auto, infer it silently from the utterance and context. Never mix languages except proper names, genuine acronyms or unavoidable quoted terms. " + "Return ONLY the translation of CURRENT_UTTERANCE.",
       input:
         `PREVIOUS_CONTEXT:\n${contextText}\n\n` +
@@ -1494,11 +1513,17 @@ app.post("/chat", async (req, res) => {
         "Preserve genuine acronyms, brands, proper names, numbers, punctuation, paragraphs, tone and question form. " +
         "Use the natural target-language equivalent for ordinary vocabulary and address terms. " +
         "CRITICAL — register matching: the speaker may use informal, rural, regional, dialectal, or uneducated everyday speech, " +
-        "non-standard grammar, slang, or spoken-language shortcuts. Render this in equally informal, everyday spoken language " +
-        "in the target language — the kind an ordinary villager or non-literate speaker would actually use in daily life. " +
-        "NEVER upgrade informal speech into formal, literary, official, or textbook-correct language. Match the register down, " +
-        "not up. If the input is broken or ungrammatical because that is how the speaker naturally talks, the translation should " +
-        "sound just as plain and natural — not more polished than the original.",
+        "non-standard grammar, slang, or spoken-language shortcuts. Understand and correctly interpret ANY regional dialect, " +
+        "country-specific accent-influenced spelling, or local slang on the input side, no matter which country or region it " +
+        "comes from. Render the MEANING in equally informal, everyday spoken language in the target language, but always in the " +
+        "most widely understood, standard/neutral form of that target language — not a narrow dialect or slang specific to a " +
+        "single country or region — so that a speaker of that language from ANY country or region can understand it. " +
+        "NEVER upgrade informal speech into formal, literary, official, or textbook-correct language, and never narrow it down " +
+        "into a hyper-local regional dialect either. Match the register (formal/informal) down, not up — but keep the dialect " +
+        "choice as the broadest, most globally intelligible standard variety of the target language. If the input is broken or " +
+        "ungrammatical because that is how the speaker naturally talks, the translation should sound just as plain and natural " +
+        "— not more polished than the original — while still using vocabulary and phrasing any native speaker of that language, " +
+        "anywhere in the world, would immediately recognize.",
 
       input: message,
     });
@@ -1577,10 +1602,14 @@ app.post("/chat-stream", async (req, res) => {
         "Preserve genuine acronyms, brands, proper names, numbers, punctuation, paragraphs, tone and question form. " +
         "Use the natural target-language equivalent for ordinary vocabulary and address terms. " +
         "CRITICAL — register matching: the speaker may use informal, rural, regional, dialectal, or uneducated everyday speech, " +
-        "non-standard grammar, slang, or spoken-language shortcuts. Render this in equally informal, everyday spoken language " +
-        "in the target language — the kind an ordinary villager or non-literate speaker would actually use in daily life. " +
-        "NEVER upgrade informal speech into formal, literary, official, or textbook-correct language. Match the register down, " +
-        "not up.",
+        "non-standard grammar, slang, or spoken-language shortcuts. Understand and correctly interpret ANY regional dialect, " +
+        "country-specific accent-influenced spelling, or local slang on the input side, no matter which country or region it " +
+        "comes from. Render the MEANING in equally informal, everyday spoken language in the target language, but always in the " +
+        "most widely understood, standard/neutral form of that target language — not a narrow dialect or slang specific to a " +
+        "single country or region — so that a speaker of that language from ANY country or region can understand it. " +
+        "NEVER upgrade informal speech into formal, literary, official, or textbook-correct language, and never narrow it down " +
+        "into a hyper-local regional dialect either. Match the register (formal/informal) down, not up — but keep the dialect " +
+        "choice as the broadest, most globally intelligible standard variety of the target language.",
       input: message,
     });
 
@@ -1953,6 +1982,38 @@ app.post("/tts", async (req, res) => {
 });
 
 const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || "destek@aytalk.app";
+
+app.post("/feedback/translation", async (req, res) => {
+  try {
+    const fromLanguage = String(req.body?.from || "").trim().slice(0, 80);
+    const toLanguage = String(req.body?.to || "").trim().slice(0, 80);
+    const sourceText = String(req.body?.sourceText || "").trim().slice(0, 2000);
+    const translatedText = String(req.body?.translatedText || "").trim().slice(0, 2000);
+    const rating = req.body?.rating === "good" ? "good" : "bad";
+    const note = String(req.body?.note || "").trim().slice(0, 500);
+
+    if (!fromLanguage || !toLanguage || !translatedText) {
+      return res.status(400).json({error: "Eksik bilgi."});
+    }
+
+    if (dbPool) {
+      await dbPool.query(
+        `INSERT INTO translation_feedback
+           (from_language, to_language, source_text, translated_text, rating, note, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [fromLanguage, toLanguage, sourceText, translatedText, rating, note, Date.now()],
+      );
+    } else {
+      console.log("[geri bildirim - RAM modu, kalıcı değil]", {fromLanguage, toLanguage, rating, note});
+    }
+
+    res.json({ok: true});
+  } catch (error) {
+    console.error("feedback/translation hatası:", error);
+    if (process.env.SENTRY_DSN) Sentry.captureException(error);
+    res.status(500).json({error: "Geri bildirim kaydedilemedi."});
+  }
+});
 
 app.get("/privacy", (_req, res) => {
   res.set("Content-Type", "text/html; charset=utf-8");
