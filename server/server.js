@@ -12,13 +12,31 @@ const {AccessToken, AgentDispatchClient} = require("livekit-server-sdk");
 const {cert, getApps, initializeApp} = require("firebase-admin/app");
 const {getMessaging} = require("firebase-admin/messaging");
 const {getStorage} = require("firebase-admin/storage");
+const {requireFirebaseAuth} = require("./auth/firebaseAuth");
 
-// Hata takip sistemi (Sentry). SENTRY_DSN tanımlı değilse sessizce devre dışı kalır,
-// hiçbir şeyi bozmaz — sadece hataları uzaktan görme imkanın olmaz.
+// Hata takibi isteğe bağlıdır. SENTRY_DSN yanlışlıkla tanımlansa bile
+// @sentry/node kurulu değilse sunucu hata yakalama yolunda tekrar hata vermez.
+let Sentry = null;
 if (process.env.SENTRY_DSN) {
-console.log("Sentry hata takibi aktif.");
+  try {
+    // eslint-disable-next-line global-require, import/no-extraneous-dependencies
+    Sentry = require("@sentry/node");
+    Sentry.init({dsn: process.env.SENTRY_DSN});
+    console.log("Sentry hata takibi aktif.");
+  } catch (error) {
+    console.warn(
+      "UYARI: SENTRY_DSN tanımlı ancak @sentry/node kurulu değil; yalnız sunucu logları kullanılacak.",
+    );
+    Sentry = null;
+  }
 } else {
   console.warn("UYARI: SENTRY_DSN tanımlı değil. Sunucu hataları uzaktan izlenmiyor.");
+}
+
+function captureServerException(error) {
+  try {
+    Sentry?.captureException?.(error);
+  } catch {}
 }
 
 const app = express();
@@ -172,6 +190,21 @@ async function initDb() {
   `);
   await dbPool.query(`CREATE INDEX IF NOT EXISTS idx_livebridge_contacts_owner ON livebridge_contacts(owner_phone,updated_at DESC);`);
 
+  // Yeni kimlik sistemi mevcut telefon tabanlı LiveBridge tablolarını bozmadan
+  // ayrı tutulur. Mobil OTP akışı devreye alındığında bu tablo ana hesap kaynağı olur.
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS aytalk_accounts (
+      id TEXT PRIMARY KEY,
+      firebase_uid TEXT NOT NULL UNIQUE,
+      phone_e164 TEXT NOT NULL UNIQUE,
+      phone_verified BOOLEAN NOT NULL DEFAULT FALSE,
+      display_name TEXT NOT NULL DEFAULT '',
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL
+    );
+  `);
+  await dbPool.query(`CREATE INDEX IF NOT EXISTS idx_aytalk_accounts_phone ON aytalk_accounts(phone_e164);`);
+
   await dbPool.query(`
     CREATE TABLE IF NOT EXISTS translation_feedback (
       id SERIAL PRIMARY KEY,
@@ -270,6 +303,88 @@ app.use((req, res, next) => {
     return next();
   }
   return requireAppKey(req, res, next);
+});
+
+// Firebase OTP sonrası mobil uygulamanın doğrulanmış kimliği AyTalk hesabına
+// bağlaması için geçiş endpoint'i. Mevcut LiveBridge akışını henüz zorunlu olarak
+// değiştirmez; güvenli migration için ek katman olarak devreye alınır.
+app.post("/auth/session", requireFirebaseAuth, async (req, res) => {
+  try {
+    if (!dbPool) {
+      return res.status(503).json({
+        error: "Kalıcı hesap veritabanı hazır değil.",
+      });
+    }
+
+    const firebaseUser = req.firebaseUser || {};
+    const firebaseUid = String(firebaseUser.uid || "").trim();
+    const phoneE164 = String(firebaseUser.phone_number || "").trim();
+    const displayName = String(req.body?.displayName || "").trim().slice(0, 80);
+
+    if (!firebaseUid || !phoneE164) {
+      return res.status(403).json({
+        error: "Telefon numarası Firebase tarafından doğrulanmamış.",
+      });
+    }
+
+    const now = Date.now();
+    const client = await dbPool.connect();
+    try {
+      await client.query("BEGIN");
+      const existingResult = await client.query(
+        `SELECT id, firebase_uid, phone_e164, phone_verified, display_name, created_at, updated_at
+           FROM aytalk_accounts
+          WHERE firebase_uid=$1 OR phone_e164=$2
+          ORDER BY CASE WHEN firebase_uid=$1 THEN 0 ELSE 1 END
+          LIMIT 1
+          FOR UPDATE`,
+        [firebaseUid, phoneE164],
+      );
+
+      const existing = existingResult.rows[0];
+      const accountId = existing?.id || `usr_${crypto.randomUUID()}`;
+      const createdAt = Number(existing?.created_at || now);
+      const effectiveDisplayName = displayName || existing?.display_name || "";
+
+      const {rows} = await client.query(
+        `INSERT INTO aytalk_accounts
+           (id, firebase_uid, phone_e164, phone_verified, display_name, created_at, updated_at)
+         VALUES ($1,$2,$3,TRUE,$4,$5,$6)
+         ON CONFLICT(id) DO UPDATE SET
+           firebase_uid=EXCLUDED.firebase_uid,
+           phone_e164=EXCLUDED.phone_e164,
+           phone_verified=TRUE,
+           display_name=EXCLUDED.display_name,
+           updated_at=EXCLUDED.updated_at
+         RETURNING id, firebase_uid, phone_e164, phone_verified, display_name, created_at, updated_at`,
+        [accountId, firebaseUid, phoneE164, effectiveDisplayName, createdAt, now],
+      );
+      await client.query("COMMIT");
+
+      const row = rows[0];
+      return res.json({
+        ok: true,
+        account: {
+          id: row.id,
+          firebaseUid: row.firebase_uid,
+          phoneE164: row.phone_e164,
+          phoneVerified: Boolean(row.phone_verified),
+          displayName: row.display_name || "",
+          createdAt: Number(row.created_at || createdAt),
+          updatedAt: Number(row.updated_at || now),
+        },
+      });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error("auth/session hatası:", error);
+    captureServerException(error);
+    return res.status(500).json({error: "Oturum oluşturulamadı."});
+  }
 });
 
 // LiveBridge Contacts Cloud — DATABASE_URL varsa Postgres, yoksa RAM (yedek).
@@ -2010,7 +2125,7 @@ app.post("/feedback/translation", async (req, res) => {
     res.json({ok: true});
   } catch (error) {
     console.error("feedback/translation hatası:", error);
-    if (process.env.SENTRY_DSN) Sentry.captureException(error);
+    captureServerException(error);
     res.status(500).json({error: "Geri bildirim kaydedilemedi."});
   }
 });
@@ -2040,7 +2155,7 @@ app.get("/privacy", (_req, res) => {
 <ul>
   <li><b>Hesap bilgileri:</b> telefon numarası, görünen ad, tercih edilen dil, ses cinsiyeti tercihi (LiveBridge özelliği için)</li>
   <li><b>Çeviri verileri:</b> yazılı/sesli çeviri istekleriniz, konuşma tanıma için gönderilen ses kayıtları (kalıcı olarak saklanmaz, sadece işlenip silinir)</li>
-  <li><b>Rehber eşleştirme:</b> LiveBridge özelliğini kullanırken, rehberinizdeki kişilerin telefon numaraları uygulamamızın kullanıcısı olup olmadığını kontrol etmek için sunucumuza gönderilir (isimleriyle birlikte saklanmaz, sadece eşleştirme için kullanılır)</li>
+  <li><b>Rehber eşleştirme:</b> LiveBridge özelliğini kullanırken, rehberinizdeki kişilerin telefon numaraları uygulamamızın kullanıcısı olup olmadığını kontrol etmek için sunucumuza gönderilir; eşleşen AyTalk kişisinin görünen adı, kalıcı kişi listenizi göstermek için saklanabilir</li>
   <li><b>Görüşme meta verileri:</b> kimin kimi aradığı, görüşme süresi ve durumu (görüşmenin ses/görüntü içeriği kaydedilmez)</li>
   <li><b>Cihaz izinleri:</b> mikrofon, kamera, kişiler — sadece ilgili özellik kullanılırken erişilir</li>
 </ul>
@@ -2053,7 +2168,7 @@ app.get("/privacy", (_req, res) => {
 </ul>
 
 <h2>3. Üçüncü Taraflar</h2>
-<p>Verileriniz aşağıdaki hizmet sağlayıcılarla, yalnızca hizmeti sunmak amacıyla paylaşılır: OpenAI (çeviri/ses işleme), LiveKit (görüşme altyapısı), Render (sunucu barındırma), Supabase (veritabanı barındırma). Bu üçüncü taraflara veri satışı yapılmaz.</p>
+<p>Verileriniz aşağıdaki hizmet sağlayıcılarla, yalnızca hizmeti sunmak amacıyla paylaşılır: OpenAI (çeviri/ses işleme), LiveKit (görüşme altyapısı), Render (sunucu ve PostgreSQL veritabanı barındırma). Bu üçüncü taraflara veri satışı yapılmaz.</p>
 
 <h2>4. Veri Saklama</h2>
 <p>Ses kayıtları işlendikten hemen sonra silinir. LiveBridge profil bilgileri ve arama geçmişi, hesabınızı silene kadar saklanır.</p>
@@ -2119,7 +2234,7 @@ app.use((req, res) => {
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   console.error("Beklenmeyen sunucu hatası:", err);
-  if (process.env.SENTRY_DSN) Sentry.captureException(err);
+  captureServerException(err);
   if (res.headersSent) return;
   res.status(err.message?.startsWith("CORS") ? 403 : 500).json({
     error: err.message?.startsWith("CORS")
@@ -2131,12 +2246,12 @@ app.use((err, req, res, next) => {
 // Beklenmeyen hatalarda sunucunun sessizce çökmesini önler, en azından loglar.
 process.on("uncaughtException", err => {
   console.error("YAKALANMAMIŞ İSTİSNA:", err);
-  if (process.env.SENTRY_DSN) Sentry.captureException(err);
+  captureServerException(err);
 });
 
 process.on("unhandledRejection", reason => {
   console.error("İŞLENMEMİŞ PROMISE REDDİ:", reason);
-  if (process.env.SENTRY_DSN) Sentry.captureException(reason);
+  captureServerException(reason);
 });
 
 initDb()

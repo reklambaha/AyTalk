@@ -57,6 +57,9 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
+      - name: Verify backend syntax
+        run: node --check server/server.js
+
       - name: Make Gradle wrapper executable
         run: chmod +x android/gradlew
 

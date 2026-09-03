@@ -2973,7 +2973,12 @@ export default function RemoteCallScreen({
       setDirectoryProfileReady(true);
       await AsyncStorage.setItem(
         LIVEBRIDGE_PROFILE_KEY,
-        JSON.stringify({phone: cleanPhone, gender: voiceGender}),
+        JSON.stringify({
+          phone: cleanPhone,
+          name: name.trim() || "LiveBridge Kullanıcısı",
+          language: sourceCallLanguage.name,
+          gender: voiceGender,
+        }),
       );
       void loadSavedLiveBridgeContacts(cleanPhone);
       return true;

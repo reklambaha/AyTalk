@@ -42,8 +42,8 @@ const syncSavedLiveBridgeProfile = async tokenOverride => {
         method: "POST",
         body: JSON.stringify({
           phone,
-          name: "",
-          language: "",
+          name: String(saved?.name || "LiveBridge Kullanıcısı").trim().slice(0, 80),
+          language: String(saved?.language || "").trim().slice(0, 80),
           gender: saved?.gender === "male" ? "male" : "female",
           fcmToken: token,
         }),

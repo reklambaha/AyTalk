@@ -1,0 +1,12 @@
+AyTalk Security Baseline v1
+
+Bu paket yalnız değişen dosyaları içerir ve mevcut çalışan akışı kırmadan hazırlanmıştır.
+Klasör yapısını koruyarak proje köküne kopyalayın.
+
+Kontrol:
+  cd server
+  npm install
+  node --check server.js
+
+Bu sürümde Firebase telefon OTP henüz mobilde zorunlu değildir. Backend auth altyapısı eklenmiştir;
+eski LiveBridge akışı kasıtlı olarak çalışmaya devam eder.
