@@ -1,3 +1,5 @@
+export {default as PhoneAuthScreen} from "./screens/PhoneAuthScreen";
+
 export {
   clearPendingPhoneVerification,
   confirmPhoneVerification,
