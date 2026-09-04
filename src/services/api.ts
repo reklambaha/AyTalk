@@ -1,4 +1,5 @@
 import {NativeModules} from "react-native";
+import {getCurrentIdToken} from "../features/auth/services/authService";
 
 export const SERVER_URL = "https://aytalk.onrender.com";
 
@@ -15,6 +16,36 @@ export const getApiJsonHeaders = (): Record<string, string> => ({
 export const getApiAuthHeaders = (): Record<string, string> => ({
   "x-app-key": APP_SHARED_KEY,
 });
+
+const shouldAttachFirebaseAuth = (path: string) =>
+  path === "/auth/session" ||
+  path === "/livekit/token" ||
+  path.startsWith("/livebridge/");
+
+const getFirebaseAuthHeaders = async (
+  path: string,
+): Promise<Record<string, string>> => {
+  if (!shouldAttachFirebaseAuth(path)) {
+    return {};
+  }
+
+  try {
+    const idToken = await getCurrentIdToken();
+
+    if (!idToken) {
+      return {};
+    }
+
+    return {
+      Authorization: `Bearer ${idToken}`,
+    };
+  } catch {
+    // Backend henüz Firebase auth zorunlu hale getirilmeden önce mevcut
+    // LiveBridge akışını bozma. Sunucu auth zorunlu olduğunda eksik/geçersiz
+    // token zaten 401 olarak dönecek.
+    return {};
+  }
+};
 
 export function assertApiConfiguration() {
   if (!APP_SHARED_KEY) {
@@ -34,10 +65,13 @@ export async function fetchJson<T>(
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
+    const firebaseAuthHeaders = await getFirebaseAuthHeaders(path);
+
     const response = await fetch(`${SERVER_URL}${path}`, {
       ...options,
       headers: {
         ...getApiJsonHeaders(),
+        ...firebaseAuthHeaders,
         ...(options.headers || {}),
       },
       signal: controller.signal,
