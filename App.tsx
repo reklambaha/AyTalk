@@ -52,6 +52,8 @@ import {
 } from "./src/constants/languages";
 import AppIntro from "./src/components/AppIntro";
 import {RemoteCallScreen} from "./src/features/livebridge";
+import PhoneAuthScreen from "./src/features/auth/screens/PhoneAuthScreen";
+import {getCurrentAuthSession} from "./src/features/auth/services/authService";
 import VoiceWaveform from "./src/components/VoiceWaveform";
 import VoiceRing from "./src/components/VoiceRing";
 import VoiceStatusCard from "./src/components/VoiceStatusCard";
@@ -174,6 +176,9 @@ function AyTalkMainApp() {
   const [remoteCallRoomCode, setRemoteCallRoomCode] = useState("");
   const [remoteCallDefaultName, setRemoteCallDefaultName] =
     useState("AyTalk Kullanıcısı");
+  const [liveBridgeAuthVisible, setLiveBridgeAuthVisible] = useState(false);
+  const [liveBridgeAuthForPendingCall, setLiveBridgeAuthForPendingCall] =
+    useState(false);
   const [storageReady, setStorageReady] = useState(false);
   const [assistantHistoryReady, setAssistantHistoryReady] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -194,6 +199,7 @@ function AyTalkMainApp() {
   const latestPartialRef = useRef("");
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const finishingRef = useRef(false);
+  const liveBridgeAuthOpeningRef = useRef(false);
   const pageScrollRef = useRef<ScrollView | null>(null);
   const resultAnim = useRef(new Animated.Value(0)).current;
   const micPulseAnim = useRef(new Animated.Value(1)).current;
@@ -2333,14 +2339,66 @@ function AyTalkMainApp() {
     };
   }, [isLoading, loadingAnim]);
 
+  const openLiveBridgeAfterAuthCheck = async (fromPendingCall = false) => {
+    if (liveBridgeAuthOpeningRef.current) return;
+    liveBridgeAuthOpeningRef.current = true;
+
+    try {
+      const session = await getCurrentAuthSession();
+
+      if (!session) {
+        setLiveBridgeAuthForPendingCall(fromPendingCall);
+        setLiveBridgeAuthVisible(true);
+        return;
+      }
+
+      if (fromPendingCall) {
+        await AsyncStorage.removeItem("aytalk_pending_livebridge_call");
+      }
+
+      setLiveBridgeAuthForPendingCall(false);
+      setLiveBridgeAuthVisible(false);
+      setRemoteCallRoomCode("");
+      setRemoteCallDefaultName("AyTalk Kullanıcısı");
+      setRemoteCallOpen(true);
+    } catch (error) {
+      Alert.alert(
+        "LiveBridge doğrulama hatası",
+        error instanceof Error
+          ? error.message
+          : "Kullanıcı oturumu doğrulanamadı. Lütfen tekrar deneyin.",
+      );
+    } finally {
+      liveBridgeAuthOpeningRef.current = false;
+    }
+  };
+
+  const handleLiveBridgeVerified = async () => {
+    if (liveBridgeAuthForPendingCall) {
+      try {
+        await AsyncStorage.removeItem("aytalk_pending_livebridge_call");
+      } catch {}
+    }
+
+    setLiveBridgeAuthForPendingCall(false);
+    setLiveBridgeAuthVisible(false);
+    setRemoteCallRoomCode("");
+    setRemoteCallDefaultName("AyTalk Kullanıcısı");
+    setRemoteCallOpen(true);
+  };
+
+  const cancelLiveBridgeAuth = () => {
+    // Gelen çağrı kaydı burada özellikle silinmez. Kullanıcı doğrulama yapmadan
+    // geri dönerse pending çağrı bilgisi güvenli şekilde korunur.
+    setLiveBridgeAuthForPendingCall(false);
+    setLiveBridgeAuthVisible(false);
+  };
+
   const openPendingLiveBridgeCall = async () => {
     try {
       const pending = await AsyncStorage.getItem("aytalk_pending_livebridge_call");
       if (!pending) return;
-      await AsyncStorage.removeItem("aytalk_pending_livebridge_call");
-      setRemoteCallRoomCode("");
-      setRemoteCallDefaultName("AyTalk Kullanıcısı");
-      setRemoteCallOpen(true);
+      await openLiveBridgeAfterAuthCheck(true);
     } catch {}
   };
 
@@ -2424,9 +2482,7 @@ function AyTalkMainApp() {
 
   const openHomeSection = (section: HomeSection) => {
     if (section === "livebridge") {
-      setRemoteCallRoomCode("");
-      setRemoteCallDefaultName("AyTalk Kullanıcısı");
-      setRemoteCallOpen(true);
+      void openLiveBridgeAfterAuthCheck(false);
       return;
     }
 
@@ -2587,6 +2643,17 @@ function AyTalkMainApp() {
           <ActivityIndicator size="large" color="#2DD4FF" />
         </View>
       </SafeAreaView>
+    );
+  }
+
+  if (liveBridgeAuthVisible) {
+    return (
+      <PhoneAuthScreen
+        onVerified={() => {
+          void handleLiveBridgeVerified();
+        }}
+        onCancel={cancelLiveBridgeAuth}
+      />
     );
   }
 
