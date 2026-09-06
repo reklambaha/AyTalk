@@ -1,7 +1,9 @@
-import React, {useMemo, useState} from "react";
+import React, {useCallback, useEffect, useRef, useState} from "react";
 import {
   ActivityIndicator,
+  AppState,
   KeyboardAvoidingView,
+  Linking,
   Platform,
   SafeAreaView,
   ScrollView,
@@ -15,78 +17,23 @@ import {
 
 import {AyColors, AyRadius, AySpacing} from "../../../shared/theme";
 import {
-  clearPendingPhoneVerification,
-  confirmPhoneVerification,
-  requestPhoneVerification,
-} from "../services/authService";
+  completeSilentNetworkVerification,
+  getSilentNetworkVerificationStatus,
+  startSilentNetworkVerification,
+} from "../services/silentNetworkAuthService";
 import type {AuthSession} from "../types/auth.types";
 
-type CountryOption = {
-  code: "TR" | "KH" | "SY";
-  name: string;
-  dialCode: string;
-  flag: string;
-  placeholder: string;
-};
+type FlowState = "idle" | "browser" | "checking" | "complete";
 
-const COUNTRIES: CountryOption[] = [
-  {
-    code: "TR",
-    name: "Türkiye",
-    dialCode: "+90",
-    flag: "🇹🇷",
-    placeholder: "5xx xxx xx xx",
-  },
-  {
-    code: "KH",
-    name: "Kamboçya",
-    dialCode: "+855",
-    flag: "🇰🇭",
-    placeholder: "xx xxx xxx",
-  },
-  {
-    code: "SY",
-    name: "Suriye",
-    dialCode: "+963",
-    flag: "🇸🇾",
-    placeholder: "9xx xxx xxx",
-  },
-];
+const SANDBOX_PHONE = "+990100000001";
 
-const RESEND_SECONDS = 45;
-
-const onlyDigits = (value: string) => value.replace(/\D/g, "");
-
-const buildE164PhoneNumber = (country: CountryOption, localNumber: string) => {
-  const digits = onlyDigits(localNumber).replace(/^0+/, "");
-  return `${country.dialCode}${digits}`;
-};
-
-const friendlyAuthError = (error: unknown) => {
-  const code = String((error as {code?: string})?.code || "");
-
-  if (code.includes("invalid-phone-number")) {
-    return "Telefon numarası geçerli görünmüyor. Ülke kodunu ve numarayı kontrol edin.";
-  }
-  if (code.includes("too-many-requests")) {
-    return "Çok fazla doğrulama isteği gönderildi. Bir süre bekleyip yeniden deneyin.";
-  }
-  if (code.includes("quota-exceeded")) {
-    return "SMS gönderim kotası doldu. Daha sonra yeniden deneyin.";
-  }
-  if (code.includes("invalid-verification-code")) {
-    return "SMS doğrulama kodu hatalı. Kodu kontrol edip yeniden deneyin.";
-  }
-  if (code.includes("session-expired")) {
-    return "Doğrulama süresi doldu. Yeni bir SMS kodu isteyin.";
-  }
-  if (code.includes("network-request-failed")) {
-    return "İnternet bağlantısı kurulamadı. Bağlantınızı kontrol edip yeniden deneyin.";
-  }
-
-  return error instanceof Error
-    ? error.message
-    : "Telefon doğrulaması sırasında beklenmeyen bir hata oluştu.";
+const normalizeInput = (value: string) => {
+  const clean = value.replace(/[^\d+]/g, "");
+  if (!clean) return "";
+  const withoutExtraPlus = clean.startsWith("+")
+    ? `+${clean.slice(1).replace(/\+/g, "")}`
+    : clean.replace(/\+/g, "");
+  return withoutExtraPlus.slice(0, 16);
 };
 
 export default function PhoneAuthScreen({
@@ -96,77 +43,114 @@ export default function PhoneAuthScreen({
   onVerified: (session: AuthSession) => void;
   onCancel?: () => void;
 }) {
-  const [country, setCountry] = useState<CountryOption>(COUNTRIES[0]);
-  const [localNumber, setLocalNumber] = useState("");
-  const [verificationCode, setVerificationCode] = useState("");
-  const [step, setStep] = useState<"phone" | "code">("phone");
-  const [isBusy, setIsBusy] = useState(false);
+  const [phoneNumber, setPhoneNumber] = useState(SANDBOX_PHONE);
+  const [verificationId, setVerificationId] = useState("");
+  const [flowState, setFlowState] = useState<FlowState>("idle");
+  const [message, setMessage] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
-  const [verifiedPhone, setVerifiedPhone] = useState("");
-  const [resendSeconds, setResendSeconds] = useState(0);
+  const busyRef = useRef(false);
 
-  React.useEffect(() => {
-    if (resendSeconds <= 0) return;
-    const timer = setTimeout(
-      () => setResendSeconds(previous => Math.max(0, previous - 1)),
-      1000,
-    );
-    return () => clearTimeout(timer);
-  }, [resendSeconds]);
+  const canStart = /^\+[1-9]\d{7,14}$/.test(phoneNumber);
 
-  React.useEffect(() => {
-    return () => clearPendingPhoneVerification();
-  }, []);
-
-  const normalizedPhone = useMemo(
-    () => buildE164PhoneNumber(country, localNumber),
-    [country, localNumber],
-  );
-
-  const canRequestCode = onlyDigits(localNumber).replace(/^0+/, "").length >= 7;
-  const canVerifyCode = /^\d{6}$/.test(verificationCode);
-
-  const requestCode = async () => {
-    if (!canRequestCode || isBusy) return;
+  const finishVerifiedSession = useCallback(async () => {
+    if (!verificationId || busyRef.current) return;
 
     try {
-      setIsBusy(true);
+      busyRef.current = true;
+      setFlowState("checking");
       setErrorMessage("");
-      const result = await requestPhoneVerification(normalizedPhone);
-      setVerifiedPhone(result.phoneNumber);
-      setVerificationCode("");
-      setStep("code");
-      setResendSeconds(RESEND_SECONDS);
-    } catch (error) {
-      setErrorMessage(friendlyAuthError(error));
-    } finally {
-      setIsBusy(false);
-    }
-  };
+      setMessage("Doğrulama sonucu kontrol ediliyor...");
 
-  const verifyCode = async () => {
-    if (!canVerifyCode || isBusy) return;
+      const status = await getSilentNetworkVerificationStatus(verificationId);
 
-    try {
-      setIsBusy(true);
-      setErrorMessage("");
-      const session = await confirmPhoneVerification(verificationCode);
+      if (!status.verified || status.status !== "verified") {
+        setFlowState("browser");
+        setMessage(
+          status.status === "failed"
+            ? "Doğrulama başarısız oldu. Yeniden deneyin."
+            : "Doğrulama henüz tamamlanmadı. Tarayıcıdaki işlemi bitirip AyTalk'a dönün.",
+        );
+        return;
+      }
+
+      if (status.sessionIssued) {
+        throw new Error(
+          "Bu doğrulama daha önce kullanılmış. Güvenlik için yeni bir doğrulama başlatın.",
+        );
+      }
+
+      setMessage("Güvenli AyTalk oturumu oluşturuluyor...");
+      const session = await completeSilentNetworkVerification(verificationId);
+      setFlowState("complete");
+      setMessage("Telefon doğrulandı.");
       onVerified(session);
     } catch (error) {
-      setErrorMessage(friendlyAuthError(error));
+      setFlowState("browser");
+      setErrorMessage(
+        error instanceof Error
+          ? error.message
+          : "Sessiz doğrulama tamamlanamadı.",
+      );
     } finally {
-      setIsBusy(false);
+      busyRef.current = false;
+    }
+  }, [onVerified, verificationId]);
+
+  useEffect(() => {
+    if (!verificationId) return;
+
+    const subscription = AppState.addEventListener("change", nextState => {
+      if (nextState === "active" && flowState === "browser") {
+        setTimeout(() => void finishVerifiedSession(), 500);
+      }
+    });
+
+    return () => subscription.remove();
+  }, [finishVerifiedSession, flowState, verificationId]);
+
+  const startVerification = async () => {
+    if (!canStart || busyRef.current) return;
+
+    try {
+      busyRef.current = true;
+      setErrorMessage("");
+      setMessage("Sessiz doğrulama hazırlanıyor...");
+      setFlowState("checking");
+
+      const result = await startSilentNetworkVerification(phoneNumber);
+      setVerificationId(result.verificationId);
+      setFlowState("browser");
+      setMessage(
+        "Operatör doğrulama ekranı açılıyor. İşlemi tamamlayıp AyTalk'a geri dönün.",
+      );
+
+      const supported = await Linking.canOpenURL(result.authorizationUrl);
+      if (!supported) {
+        throw new Error("Doğrulama bağlantısı bu cihazda açılamadı.");
+      }
+
+      await Linking.openURL(result.authorizationUrl);
+    } catch (error) {
+      setFlowState("idle");
+      setErrorMessage(
+        error instanceof Error
+          ? error.message
+          : "Sessiz doğrulama başlatılamadı.",
+      );
+    } finally {
+      busyRef.current = false;
     }
   };
 
-  const editPhoneNumber = () => {
-    clearPendingPhoneVerification();
-    setStep("phone");
-    setVerificationCode("");
-    setVerifiedPhone("");
+  const resetFlow = () => {
+    if (busyRef.current) return;
+    setVerificationId("");
+    setFlowState("idle");
+    setMessage("");
     setErrorMessage("");
-    setResendSeconds(0);
   };
+
+  const isBusy = flowState === "checking";
 
   return (
     <SafeAreaView style={styles.screen}>
@@ -184,149 +168,80 @@ export default function PhoneAuthScreen({
             </View>
             <View>
               <Text style={styles.brand}>AYTALK</Text>
-              <Text style={styles.brandSubtitle}>Secure LiveBridge</Text>
+              <Text style={styles.brandSubtitle}>Global Secure Auth</Text>
             </View>
           </View>
 
           <View style={styles.card}>
             <View style={styles.securityBadge}>
-              <Text style={styles.securityBadgeText}>🔒 TELEFON DOĞRULAMA</Text>
+              <Text style={styles.securityBadgeText}>⚡ SESSİZ TELEFON DOĞRULAMA</Text>
             </View>
 
-            <Text style={styles.title}>
-              {step === "phone" ? "Numaranızı doğrulayın" : "SMS kodunu girin"}
-            </Text>
+            <Text style={styles.title}>SMS kodu olmadan doğrulayın</Text>
             <Text style={styles.description}>
-              {step === "phone"
-                ? "LiveBridge hesabınız yalnızca size ait doğrulanmış telefon numarasıyla kullanılacak."
-                : `${verifiedPhone} numarasına gönderilen 6 haneli doğrulama kodunu girin.`}
+              AyTalk önce operatör / SIM tabanlı Number Verification kullanır. SMS yalnızca ileride desteklenmeyen ağlarda son çare olacaktır.
             </Text>
 
-            {step === "phone" ? (
+            <Text style={styles.label}>Telefon numarası</Text>
+            <TextInput
+              value={phoneNumber}
+              onChangeText={value => {
+                setPhoneNumber(normalizeInput(value));
+                if (verificationId) resetFlow();
+                setErrorMessage("");
+              }}
+              editable={!isBusy}
+              keyboardType="phone-pad"
+              autoCapitalize="none"
+              placeholder="+905xxxxxxxxx"
+              placeholderTextColor={AyColors.textMuted}
+              style={styles.phoneInput}
+              maxLength={16}
+            />
+
+            <View style={styles.sandboxBox}>
+              <Text style={styles.sandboxTitle}>SANDBOX TEST</Text>
+              <Text style={styles.sandboxText}>
+                Şu an Orange Playground kullanılıyor. Gerçek SMS gönderilmez ve ücret oluşmaz. Test numarası: {SANDBOX_PHONE}
+              </Text>
+            </View>
+
+            {flowState === "idle" ? (
+              <TouchableOpacity
+                activeOpacity={0.88}
+                disabled={!canStart}
+                onPress={() => void startVerification()}
+                style={[
+                  styles.primaryButton,
+                  !canStart && styles.primaryButtonDisabled,
+                ]}>
+                <Text style={styles.primaryButtonText}>Sessiz Doğrulamayı Başlat</Text>
+              </TouchableOpacity>
+            ) : null}
+
+            {flowState === "checking" ? (
+              <View style={styles.progressBox}>
+                <ActivityIndicator color={AyColors.cyan} />
+                <Text style={styles.progressText}>{message}</Text>
+              </View>
+            ) : null}
+
+            {flowState === "browser" ? (
               <>
-                <Text style={styles.label}>Ülke</Text>
-                <View style={styles.countryRow}>
-                  {COUNTRIES.map(item => {
-                    const active = item.code === country.code;
-                    return (
-                      <TouchableOpacity
-                        key={item.code}
-                        activeOpacity={0.85}
-                        disabled={isBusy}
-                        style={[styles.countryChip, active && styles.countryChipActive]}
-                        onPress={() => {
-                          setCountry(item);
-                          setErrorMessage("");
-                        }}>
-                        <Text style={styles.countryFlag}>{item.flag}</Text>
-                        <Text
-                          numberOfLines={1}
-                          style={[styles.countryText, active && styles.countryTextActive]}>
-                          {item.name}
-                        </Text>
-                      </TouchableOpacity>
-                    );
-                  })}
+                <View style={styles.progressBox}>
+                  <Text style={styles.progressText}>{message}</Text>
                 </View>
-
-                <Text style={styles.label}>Telefon numarası</Text>
-                <View style={styles.phoneRow}>
-                  <View style={styles.dialCodeBox}>
-                    <Text style={styles.dialCode}>{country.dialCode}</Text>
-                  </View>
-                  <TextInput
-                    value={localNumber}
-                    onChangeText={value => {
-                      setLocalNumber(onlyDigits(value).slice(0, 15));
-                      setErrorMessage("");
-                    }}
-                    editable={!isBusy}
-                    keyboardType="phone-pad"
-                    placeholder={country.placeholder}
-                    placeholderTextColor={AyColors.textMuted}
-                    style={styles.phoneInput}
-                    maxLength={15}
-                  />
-                </View>
-
-                <Text style={styles.hint}>
-                  Başındaki 0'ı yazabilirsiniz; AyTalk numarayı uluslararası formata dönüştürür.
-                </Text>
-
                 <TouchableOpacity
                   activeOpacity={0.88}
-                  disabled={!canRequestCode || isBusy}
-                  onPress={() => void requestCode()}
-                  style={[
-                    styles.primaryButton,
-                    (!canRequestCode || isBusy) && styles.primaryButtonDisabled,
-                  ]}>
-                  {isBusy ? (
-                    <ActivityIndicator color="#FFFFFF" />
-                  ) : (
-                    <Text style={styles.primaryButtonText}>SMS Kodunu Gönder</Text>
-                  )}
+                  onPress={() => void finishVerifiedSession()}
+                  style={styles.primaryButton}>
+                  <Text style={styles.primaryButtonText}>Doğrulamayı Kontrol Et</Text>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={resetFlow} style={styles.secondaryButton}>
+                  <Text style={styles.secondaryButtonText}>Yeniden başlat</Text>
                 </TouchableOpacity>
               </>
-            ) : (
-              <>
-                <Text style={styles.label}>6 haneli kod</Text>
-                <TextInput
-                  value={verificationCode}
-                  onChangeText={value => {
-                    setVerificationCode(onlyDigits(value).slice(0, 6));
-                    setErrorMessage("");
-                  }}
-                  editable={!isBusy}
-                  keyboardType="number-pad"
-                  textContentType="oneTimeCode"
-                  autoComplete="sms-otp"
-                  placeholder="000000"
-                  placeholderTextColor={AyColors.textMuted}
-                  maxLength={6}
-                  style={styles.codeInput}
-                />
-
-                <TouchableOpacity
-                  activeOpacity={0.88}
-                  disabled={!canVerifyCode || isBusy}
-                  onPress={() => void verifyCode()}
-                  style={[
-                    styles.primaryButton,
-                    (!canVerifyCode || isBusy) && styles.primaryButtonDisabled,
-                  ]}>
-                  {isBusy ? (
-                    <ActivityIndicator color="#FFFFFF" />
-                  ) : (
-                    <Text style={styles.primaryButtonText}>Doğrula ve Devam Et</Text>
-                  )}
-                </TouchableOpacity>
-
-                <View style={styles.secondaryActions}>
-                  <TouchableOpacity
-                    disabled={isBusy}
-                    onPress={editPhoneNumber}
-                    style={styles.secondaryButton}>
-                    <Text style={styles.secondaryButtonText}>Numarayı değiştir</Text>
-                  </TouchableOpacity>
-
-                  <TouchableOpacity
-                    disabled={isBusy || resendSeconds > 0}
-                    onPress={() => void requestCode()}
-                    style={styles.secondaryButton}>
-                    <Text
-                      style={[
-                        styles.secondaryButtonText,
-                        resendSeconds > 0 && styles.secondaryButtonTextDisabled,
-                      ]}>
-                      {resendSeconds > 0
-                        ? `Tekrar gönder (${resendSeconds})`
-                        : "Kodu tekrar gönder"}
-                    </Text>
-                  </TouchableOpacity>
-                </View>
-              </>
-            )}
+            ) : null}
 
             {errorMessage ? (
               <View style={styles.errorBox}>
@@ -335,9 +250,9 @@ export default function PhoneAuthScreen({
             ) : null}
 
             <View style={styles.privacyBox}>
-              <Text style={styles.privacyTitle}>Neden doğrulama istiyoruz?</Text>
+              <Text style={styles.privacyTitle}>Maliyet ve güvenlik</Text>
               <Text style={styles.privacyText}>
-                Başka bir kişinin telefon numarasıyla hesap açılmasını, onun adına çağrı kabul edilmesini veya mesajlara erişilmesini önlemek için.
+                Normal girişte Firebase oturumu kullanılacak. Telefon sahipliği yalnız gerektiğinde sessiz ağ doğrulamasıyla kanıtlanacak; doğrulama token'ı cihazda saklanmayacak.
               </Text>
             </View>
 
@@ -358,10 +273,7 @@ export default function PhoneAuthScreen({
 
 const styles = StyleSheet.create({
   flex: {flex: 1},
-  screen: {
-    flex: 1,
-    backgroundColor: AyColors.background,
-  },
+  screen: {flex: 1, backgroundColor: AyColors.background},
   content: {
     flexGrow: 1,
     justifyContent: "center",
@@ -384,22 +296,9 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: AyColors.cyan,
   },
-  brandMarkText: {
-    color: AyColors.cyan,
-    fontSize: 25,
-    fontWeight: "900",
-  },
-  brand: {
-    color: AyColors.text,
-    fontSize: 21,
-    fontWeight: "900",
-    letterSpacing: 1.4,
-  },
-  brandSubtitle: {
-    color: AyColors.textMuted,
-    fontSize: 12,
-    marginTop: 2,
-  },
+  brandMarkText: {color: AyColors.cyan, fontSize: 25, fontWeight: "900"},
+  brand: {color: AyColors.text, fontSize: 21, fontWeight: "900", letterSpacing: 1.4},
+  brandSubtitle: {color: AyColors.textMuted, fontSize: 12, marginTop: 2},
   card: {
     backgroundColor: AyColors.surface,
     borderColor: AyColors.border,
@@ -421,12 +320,7 @@ const styles = StyleSheet.create({
     fontWeight: "800",
     letterSpacing: 0.5,
   },
-  title: {
-    color: AyColors.text,
-    fontSize: 27,
-    lineHeight: 33,
-    fontWeight: "800",
-  },
+  title: {color: AyColors.text, fontSize: 27, lineHeight: 33, fontWeight: "800"},
   description: {
     color: AyColors.textMuted,
     fontSize: 14,
@@ -440,87 +334,30 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     marginBottom: AySpacing.sm,
   },
-  countryRow: {
-    flexDirection: "row",
-    gap: AySpacing.sm,
-    marginBottom: AySpacing.xl,
-  },
-  countryChip: {
-    flex: 1,
-    minHeight: 54,
+  phoneInput: {
+    height: 58,
     borderRadius: AyRadius.medium,
+    borderWidth: 1,
+    borderColor: AyColors.cyan,
+    backgroundColor: "rgba(53,216,255,0.05)",
+    color: AyColors.text,
+    fontSize: 18,
+    paddingHorizontal: AySpacing.lg,
+  },
+  sandboxBox: {
+    marginTop: AySpacing.md,
+    borderRadius: AyRadius.small,
     borderWidth: 1,
     borderColor: AyColors.border,
     backgroundColor: "rgba(255,255,255,0.025)",
-    alignItems: "center",
-    justifyContent: "center",
-    paddingHorizontal: 6,
+    padding: AySpacing.md,
   },
-  countryChipActive: {
-    borderColor: AyColors.cyan,
-    backgroundColor: "rgba(53,216,255,0.10)",
-  },
-  countryFlag: {
-    fontSize: 20,
-  },
-  countryText: {
-    color: AyColors.textMuted,
-    fontSize: 11,
-    fontWeight: "700",
-    marginTop: 3,
-  },
-  countryTextActive: {
-    color: AyColors.text,
-  },
-  phoneRow: {
-    flexDirection: "row",
-    gap: AySpacing.sm,
-  },
-  dialCodeBox: {
-    minWidth: 78,
-    height: 56,
-    borderRadius: AyRadius.medium,
-    borderWidth: 1,
-    borderColor: AyColors.border,
-    backgroundColor: AyColors.surfaceStrong,
-    alignItems: "center",
-    justifyContent: "center",
-    paddingHorizontal: AySpacing.md,
-  },
-  dialCode: {
-    color: AyColors.cyan,
-    fontWeight: "800",
-    fontSize: 16,
-  },
-  phoneInput: {
-    flex: 1,
-    height: 56,
-    borderRadius: AyRadius.medium,
-    borderWidth: 1,
-    borderColor: AyColors.border,
-    backgroundColor: "rgba(255,255,255,0.035)",
-    color: AyColors.text,
-    fontSize: 17,
-    paddingHorizontal: AySpacing.lg,
-  },
-  codeInput: {
-    height: 64,
-    borderRadius: AyRadius.medium,
-    borderWidth: 1,
-    borderColor: AyColors.cyan,
-    backgroundColor: "rgba(53,216,255,0.06)",
-    color: AyColors.text,
-    fontSize: 28,
-    fontWeight: "800",
-    letterSpacing: 9,
-    textAlign: "center",
-    paddingHorizontal: AySpacing.lg,
-  },
-  hint: {
+  sandboxTitle: {color: AyColors.cyan, fontSize: 11, fontWeight: "900"},
+  sandboxText: {
     color: AyColors.textMuted,
     fontSize: 11,
     lineHeight: 17,
-    marginTop: AySpacing.sm,
+    marginTop: 4,
   },
   primaryButton: {
     height: 56,
@@ -530,36 +367,31 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     marginTop: AySpacing.xl,
   },
-  primaryButtonDisabled: {
-    opacity: 0.42,
-  },
-  primaryButtonText: {
-    color: "#FFFFFF",
-    fontSize: 15,
-    fontWeight: "800",
-  },
-  secondaryActions: {
+  primaryButtonDisabled: {opacity: 0.42},
+  primaryButtonText: {color: "#FFFFFF", fontSize: 15, fontWeight: "800"},
+  progressBox: {
+    marginTop: AySpacing.xl,
     flexDirection: "row",
-    justifyContent: "space-between",
+    alignItems: "center",
     gap: AySpacing.sm,
-    marginTop: AySpacing.md,
+    borderRadius: AyRadius.small,
+    borderWidth: 1,
+    borderColor: AyColors.border,
+    padding: AySpacing.md,
+  },
+  progressText: {
+    flex: 1,
+    color: AyColors.textMuted,
+    fontSize: 12,
+    lineHeight: 18,
   },
   secondaryButton: {
-    flex: 1,
-    minHeight: 42,
+    minHeight: 44,
     alignItems: "center",
     justifyContent: "center",
-    paddingHorizontal: AySpacing.sm,
+    marginTop: AySpacing.sm,
   },
-  secondaryButtonText: {
-    color: AyColors.cyan,
-    textAlign: "center",
-    fontSize: 12,
-    fontWeight: "700",
-  },
-  secondaryButtonTextDisabled: {
-    color: AyColors.textMuted,
-  },
+  secondaryButtonText: {color: AyColors.cyan, fontSize: 12, fontWeight: "700"},
   errorBox: {
     marginTop: AySpacing.lg,
     borderRadius: AyRadius.small,
@@ -568,22 +400,14 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(255,102,117,0.08)",
     padding: AySpacing.md,
   },
-  errorText: {
-    color: AyColors.danger,
-    fontSize: 12,
-    lineHeight: 18,
-  },
+  errorText: {color: AyColors.danger, fontSize: 12, lineHeight: 18},
   privacyBox: {
     marginTop: AySpacing.xl,
     borderTopWidth: 1,
     borderTopColor: AyColors.border,
     paddingTop: AySpacing.lg,
   },
-  privacyTitle: {
-    color: AyColors.text,
-    fontSize: 12,
-    fontWeight: "800",
-  },
+  privacyTitle: {color: AyColors.text, fontSize: 12, fontWeight: "800"},
   privacyText: {
     color: AyColors.textMuted,
     fontSize: 11,
@@ -596,9 +420,5 @@ const styles = StyleSheet.create({
     paddingHorizontal: AySpacing.lg,
     marginTop: AySpacing.sm,
   },
-  cancelButtonText: {
-    color: AyColors.textMuted,
-    fontSize: 12,
-    fontWeight: "700",
-  },
+  cancelButtonText: {color: AyColors.textMuted, fontSize: 12, fontWeight: "700"},
 });

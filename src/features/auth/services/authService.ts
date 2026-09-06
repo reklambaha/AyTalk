@@ -1,6 +1,7 @@
 import {
   FirebaseAuthTypes,
   getAuth,
+  signInWithCustomToken,
   signInWithPhoneNumber,
   signOut as firebaseSignOut,
 } from "@react-native-firebase/auth";
@@ -24,20 +25,35 @@ const assertE164PhoneNumber = (phoneNumber: string) => {
   }
 };
 
-const toAuthenticatedUser = (
+const resolveAuthenticatedPhone = async (
   user: FirebaseAuthTypes.User,
-): AuthenticatedUser => {
-  const phoneNumber = String(user.phoneNumber || "").trim();
-
-  if (!phoneNumber) {
-    throw new Error("Firebase doğrulanmış telefon numarasını döndürmedi.");
+): Promise<string> => {
+  const nativePhone = String(user.phoneNumber || "").trim();
+  if (nativePhone) {
+    return nativePhone;
   }
 
-  return {
-    uid: user.uid,
-    phoneNumber,
-  };
+  // Silent Network doğrulamasında Firebase Phone provider kullanılmaz.
+  // Backend, doğrulanmış E.164 numarayı Custom Token claim'i olarak taşır.
+  const tokenResult = await user.getIdTokenResult();
+  const claimedPhone = String(
+    (tokenResult.claims as Record<string, unknown>)?.aytalkPhoneE164 || "",
+  ).trim();
+
+  if (!claimedPhone) {
+    throw new Error("Doğrulanmış AyTalk telefon numarası Firebase oturumunda bulunamadı.");
+  }
+
+  assertE164PhoneNumber(claimedPhone);
+  return claimedPhone;
 };
+
+const toAuthenticatedUser = async (
+  user: FirebaseAuthTypes.User,
+): Promise<AuthenticatedUser> => ({
+  uid: user.uid,
+  phoneNumber: await resolveAuthenticatedPhone(user),
+});
 
 const createSession = async (
   user: FirebaseAuthTypes.User,
@@ -50,7 +66,7 @@ const createSession = async (
   }
 
   return {
-    user: toAuthenticatedUser(user),
+    user: await toAuthenticatedUser(user),
     idToken,
   };
 };
@@ -96,6 +112,22 @@ export const confirmPhoneVerification = async (
   }
 
   pendingConfirmation = null;
+
+  return createSession(credential.user, true);
+};
+
+export const signInWithAyTalkCustomToken = async (
+  customToken: string,
+): Promise<AuthSession> => {
+  const cleanToken = String(customToken || "").trim();
+  if (!cleanToken) {
+    throw new Error("AyTalk oturum anahtarı alınamadı.");
+  }
+
+  const credential = await signInWithCustomToken(getAuth(), cleanToken);
+  if (!credential?.user) {
+    throw new Error("AyTalk Firebase oturumu açılamadı.");
+  }
 
   return createSession(credential.user, true);
 };
