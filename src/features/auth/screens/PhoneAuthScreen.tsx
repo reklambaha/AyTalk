@@ -124,11 +124,10 @@ export default function PhoneAuthScreen({
         "Operatör doğrulama ekranı açılıyor. İşlemi tamamlayıp AyTalk'a geri dönün.",
       );
 
-      const supported = await Linking.canOpenURL(result.authorizationUrl);
-      if (!supported) {
-        throw new Error("Doğrulama bağlantısı bu cihazda açılamadı.");
-      }
-
+      // Android 11+ cihazlarda Linking.canOpenURL() <queries> manifest
+      // tanımı yoksa HTTPS bağlantılarında yanlış şekilde false dönebiliyor.
+      // Bu yüzden tarayıcı bağlantısını doğrudan açıyoruz; gerçek açma hatası
+      // olursa Linking.openURL() zaten catch bloğuna düşer.
       await Linking.openURL(result.authorizationUrl);
     } catch (error) {
       setFlowState("idle");
