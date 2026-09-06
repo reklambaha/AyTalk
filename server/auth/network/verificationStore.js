@@ -35,6 +35,10 @@ function createVerification(phoneNumber) {
     createdAt: now,
     expiresAt: now + TTL_MS,
     error: "",
+    completionClaimed: false,
+    completionClaimedAt: 0,
+    completionIssued: false,
+    completionIssuedAt: 0,
   };
 
   recordsById.set(verificationId, record);
@@ -67,9 +71,64 @@ function updateByState(state, patch) {
   return {...next};
 }
 
+function claimCompletionById(verificationId) {
+  cleanup();
+  const key = String(verificationId || "");
+  const current = recordsById.get(key);
+  if (!current) return null;
+
+  if (current.status !== "verified" || current.verified !== true) {
+    return {...current, completionError: "not_verified"};
+  }
+
+  if (current.completionClaimed || current.completionIssued) {
+    return {...current, completionError: "already_used"};
+  }
+
+  const next = {
+    ...current,
+    completionClaimed: true,
+    completionClaimedAt: Date.now(),
+  };
+  recordsById.set(key, next);
+  return {...next};
+}
+
+function releaseCompletionClaimById(verificationId) {
+  cleanup();
+  const key = String(verificationId || "");
+  const current = recordsById.get(key);
+  if (!current || current.completionIssued) return null;
+  const next = {
+    ...current,
+    completionClaimed: false,
+    completionClaimedAt: 0,
+  };
+  recordsById.set(key, next);
+  return {...next};
+}
+
+function markCompletionIssuedById(verificationId) {
+  cleanup();
+  const key = String(verificationId || "");
+  const current = recordsById.get(key);
+  if (!current) return null;
+  const next = {
+    ...current,
+    completionClaimed: true,
+    completionIssued: true,
+    completionIssuedAt: Date.now(),
+  };
+  recordsById.set(key, next);
+  return {...next};
+}
+
 module.exports = {
   createVerification,
   getById,
   getByState,
   updateByState,
+  claimCompletionById,
+  releaseCompletionClaimById,
+  markCompletionIssuedById,
 };

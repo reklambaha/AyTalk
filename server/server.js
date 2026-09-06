@@ -25,6 +25,9 @@ const {
   getById: getNetworkVerificationById,
   getByState: getNetworkVerificationByState,
   updateByState: updateNetworkVerificationByState,
+  claimCompletionById: claimNetworkVerificationCompletionById,
+  releaseCompletionClaimById: releaseNetworkVerificationCompletionClaimById,
+  markCompletionIssuedById: markNetworkVerificationCompletionIssuedById,
 } = require("./auth/network/verificationStore");
 
 // Hata takibi isteğe bağlıdır. SENTRY_DSN yanlışlıkla tanımlansa bile
@@ -406,46 +409,85 @@ app.get("/auth/network/orange/status/:verificationId", async (req, res) => {
       return res.status(404).json({error: "Doğrulama oturumu bulunamadı veya süresi doldu."});
     }
 
-    if (verification.status !== "verified" || !verification.verified) {
-      return res.json({
-        ok: true,
-        status: verification.status,
-        verified: false,
-        expiresAt: verification.expiresAt,
-      });
-    }
+    return res.json({
+      ok: true,
+      status: verification.status,
+      verified: Boolean(verification.verified),
+      phoneNumber: verification.verified ? verification.phoneNumber : undefined,
+      provider: verification.provider,
+      expiresAt: verification.expiresAt,
+      sessionReady:
+        verification.status === "verified" &&
+        verification.verified === true &&
+        !verification.completionClaimed &&
+        !verification.completionIssued,
+      sessionIssued: Boolean(verification.completionIssued),
+    });
+  } catch (error) {
+    captureServerException(error);
+    return res.status(error?.statusCode || 500).json({
+      error: error?.message || "Doğrulama durumu alınamadı.",
+    });
+  }
+});
 
+// Firebase Custom Token yalnız bir kez teslim edilir. Status endpoint'i artık
+// oturum token'ı döndürmez; böylece polling/log çıktılarında hassas token görünmez.
+app.post("/auth/network/orange/complete/:verificationId", async (req, res) => {
+  let claimed = null;
+  try {
     if (getApps().length === 0) {
       return res.status(503).json({
         error: "Firebase Admin hazır değil; AyTalk oturumu üretilemedi.",
       });
     }
 
+    claimed = claimNetworkVerificationCompletionById(req.params.verificationId);
+    if (!claimed) {
+      return res.status(404).json({
+        error: "Doğrulama oturumu bulunamadı veya süresi doldu.",
+      });
+    }
+    if (claimed.completionError === "not_verified") {
+      return res.status(409).json({
+        error: "Telefon doğrulaması henüz tamamlanmadı.",
+      });
+    }
+    if (claimed.completionError === "already_used") {
+      return res.status(409).json({
+        error: "Bu doğrulama oturumu daha önce AyTalk oturumuna dönüştürüldü.",
+      });
+    }
+
     const phoneHash = crypto
       .createHash("sha256")
-      .update(verification.phoneNumber)
+      .update(claimed.phoneNumber)
       .digest("hex")
       .slice(0, 40);
     const uid = `silent_${phoneHash}`;
     const customToken = await getAuth().createCustomToken(uid, {
-      aytalkPhoneE164: verification.phoneNumber,
+      aytalkPhoneE164: claimed.phoneNumber,
       phoneVerified: true,
       authMethod: "silent_network",
-      authProvider: "orange_playground",
+      authProvider: claimed.provider || "orange_playground",
     });
+
+    markNetworkVerificationCompletionIssuedById(claimed.verificationId);
 
     return res.json({
       ok: true,
-      status: "verified",
       verified: true,
-      phoneNumber: verification.phoneNumber,
+      phoneNumber: claimed.phoneNumber,
       firebaseCustomToken: customToken,
-      provider: verification.provider,
+      provider: claimed.provider,
     });
   } catch (error) {
+    if (claimed?.verificationId && !claimed.completionError) {
+      releaseNetworkVerificationCompletionClaimById(claimed.verificationId);
+    }
     captureServerException(error);
     return res.status(error?.statusCode || 500).json({
-      error: error?.message || "Doğrulama durumu alınamadı.",
+      error: error?.message || "AyTalk oturumu tamamlanamadı.",
     });
   }
 });
