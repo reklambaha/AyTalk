@@ -12,7 +12,20 @@ const {AccessToken, AgentDispatchClient} = require("livekit-server-sdk");
 const {cert, getApps, initializeApp} = require("firebase-admin/app");
 const {getMessaging} = require("firebase-admin/messaging");
 const {getStorage} = require("firebase-admin/storage");
+const {getAuth} = require("firebase-admin/auth");
 const {requireFirebaseAuth} = require("./auth/firebaseAuth");
+const {
+  buildAuthorizationUrl: buildOrangeAuthorizationUrl,
+  exchangeAuthorizationCode: exchangeOrangeAuthorizationCode,
+  normalizeE164: normalizeOrangeE164,
+  verifyPhoneNumber: verifyOrangePhoneNumber,
+} = require("./auth/network/orangePlayground");
+const {
+  createVerification: createNetworkVerification,
+  getById: getNetworkVerificationById,
+  getByState: getNetworkVerificationByState,
+  updateByState: updateNetworkVerificationByState,
+} = require("./auth/network/verificationStore");
 
 // Hata takibi isteğe bağlıdır. SENTRY_DSN yanlışlıkla tanımlansa bile
 // @sentry/node kurulu değilse sunucu hata yakalama yolunda tekrar hata vermez.
@@ -298,11 +311,143 @@ app.use((req, res, next) => {
   if (
     req.path === "/" ||
     req.path === "/health" ||
+    req.path === "/auth/network/orange/callback" ||
     req.path.startsWith("/livebridge/chat/file/content/")
   ) {
     return next();
   }
   return requireAppKey(req, res, next);
+});
+
+// Global Auth Router - Orange/CAMARA Number Verification Playground.
+// Bu üç endpoint yalnız sandbox entegrasyonunu hazırlar; production operatör
+// seçimi daha sonra sağlayıcı bağımsız router üzerinden yapılacaktır.
+app.post("/auth/network/orange/start", async (req, res) => {
+  try {
+    const phoneNumber = normalizeOrangeE164(req.body?.phoneNumber);
+    const verification = createNetworkVerification(phoneNumber);
+    const authorizationUrl = buildOrangeAuthorizationUrl({
+      phoneNumber,
+      state: verification.state,
+    });
+
+    return res.json({
+      ok: true,
+      verificationId: verification.verificationId,
+      authorizationUrl,
+      expiresAt: verification.expiresAt,
+      provider: "orange_playground",
+    });
+  } catch (error) {
+    return res.status(error?.statusCode || 500).json({
+      error: error?.message || "Sessiz numara doğrulaması başlatılamadı.",
+    });
+  }
+});
+
+app.get("/auth/network/orange/callback", async (req, res) => {
+  const state = String(req.query?.state || "").trim();
+  const code = String(req.query?.code || "").trim();
+  const oauthError = String(req.query?.error || "").trim();
+
+  const verification = getNetworkVerificationByState(state);
+  if (!verification) {
+    return res.status(400).type("html").send(
+      "<!doctype html><meta charset=\"utf-8\"><title>AyTalk</title><h2>AyTalk doğrulaması geçersiz veya süresi dolmuş.</h2>",
+    );
+  }
+
+  if (oauthError || !code) {
+    updateNetworkVerificationByState(state, {
+      status: "failed",
+      verified: false,
+      error: oauthError || "authorization_code_missing",
+    });
+    return res.status(400).type("html").send(
+      "<!doctype html><meta charset=\"utf-8\"><title>AyTalk</title><h2>Telefon doğrulaması tamamlanamadı.</h2><p>AyTalk uygulamasına dönüp tekrar deneyin.</p>",
+    );
+  }
+
+  try {
+    const accessToken = await exchangeOrangeAuthorizationCode(code);
+    const verified = await verifyOrangePhoneNumber({
+      accessToken,
+      phoneNumber: verification.phoneNumber,
+    });
+
+    updateNetworkVerificationByState(state, {
+      status: verified ? "verified" : "failed",
+      verified,
+      error: verified ? "" : "phone_mismatch",
+    });
+
+    return res.status(verified ? 200 : 403).type("html").send(
+      verified
+        ? "<!doctype html><meta charset=\"utf-8\"><title>AyTalk</title><h2>Telefon doğrulandı.</h2><p>AyTalk uygulamasına dönebilirsiniz.</p>"
+        : "<!doctype html><meta charset=\"utf-8\"><title>AyTalk</title><h2>Telefon doğrulanamadı.</h2><p>Numara bu oturumla eşleşmedi.</p>",
+    );
+  } catch (error) {
+    updateNetworkVerificationByState(state, {
+      status: "failed",
+      verified: false,
+      error: String(error?.message || "provider_error").slice(0, 200),
+    });
+    captureServerException(error);
+    return res.status(error?.statusCode || 502).type("html").send(
+      "<!doctype html><meta charset=\"utf-8\"><title>AyTalk</title><h2>Doğrulama servisine ulaşılamadı.</h2><p>AyTalk uygulamasına dönüp tekrar deneyin.</p>",
+    );
+  }
+});
+
+app.get("/auth/network/orange/status/:verificationId", async (req, res) => {
+  try {
+    const verification = getNetworkVerificationById(req.params.verificationId);
+    if (!verification) {
+      return res.status(404).json({error: "Doğrulama oturumu bulunamadı veya süresi doldu."});
+    }
+
+    if (verification.status !== "verified" || !verification.verified) {
+      return res.json({
+        ok: true,
+        status: verification.status,
+        verified: false,
+        expiresAt: verification.expiresAt,
+      });
+    }
+
+    if (getApps().length === 0) {
+      return res.status(503).json({
+        error: "Firebase Admin hazır değil; AyTalk oturumu üretilemedi.",
+      });
+    }
+
+    const phoneHash = crypto
+      .createHash("sha256")
+      .update(verification.phoneNumber)
+      .digest("hex")
+      .slice(0, 40);
+    const uid = `silent_${phoneHash}`;
+    const customToken = await getAuth().createCustomToken(uid, {
+      aytalkPhoneE164: verification.phoneNumber,
+      phoneVerified: true,
+      authMethod: "silent_network",
+      authProvider: "orange_playground",
+    });
+
+    return res.json({
+      ok: true,
+      status: "verified",
+      verified: true,
+      phoneNumber: verification.phoneNumber,
+      firebaseCustomToken: customToken,
+      provider: verification.provider,
+    });
+  } catch (error) {
+    captureServerException(error);
+    return res.status(error?.statusCode || 500).json({
+      error: error?.message || "Doğrulama durumu alınamadı.",
+    });
+  }
 });
 
 // Firebase OTP sonrası mobil uygulamanın doğrulanmış kimliği AyTalk hesabına
@@ -318,12 +463,17 @@ app.post("/auth/session", requireFirebaseAuth, async (req, res) => {
 
     const firebaseUser = req.firebaseUser || {};
     const firebaseUid = String(firebaseUser.uid || "").trim();
-    const phoneE164 = String(firebaseUser.phone_number || "").trim();
+    const phoneE164 = String(
+      firebaseUser.phone_number || firebaseUser.aytalkPhoneE164 || "",
+    ).trim();
+    const phoneVerified = Boolean(
+      firebaseUser.phone_number || firebaseUser.phoneVerified,
+    );
     const displayName = String(req.body?.displayName || "").trim().slice(0, 80);
 
-    if (!firebaseUid || !phoneE164) {
+    if (!firebaseUid || !phoneE164 || !phoneVerified) {
       return res.status(403).json({
-        error: "Telefon numarası Firebase tarafından doğrulanmamış.",
+        error: "Telefon numarası doğrulanmış bir kimlik sağlayıcısı tarafından onaylanmamış.",
       });
     }
 
