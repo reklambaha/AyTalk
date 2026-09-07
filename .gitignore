@@ -69,3 +69,6 @@ yarn-error.log*
 /ios
 # Local archive files
 *.7z
+.claude/src/
+*.dialect-step11.bak
+AyTalk-dialect-step11/
