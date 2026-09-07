@@ -1095,6 +1095,7 @@ function RoomView({
             // Karşı tarafın profil/dil tercihi bu isteği değiştiremez.
             from: sourceLanguage.name,
             to: targetLanguage.name,
+            sourceLocale: sourceLanguage.locale,
             profanityMode,
             context: translationHistory
               .slice(-16)
@@ -1265,9 +1266,12 @@ function RoomView({
           method: "POST",
           body: JSON.stringify({
             audioBase64,
-            language: sourceLanguage.locale
-              .split("-")[0]
-              .toLowerCase(),
+            language: sourceLanguage.locale,
+            context: translationHistory
+              .filter(entry => entry.side === "local")
+              .slice(-4)
+              .map(entry => entry.original)
+              .join("\n"),
           }),
         },
         15000,

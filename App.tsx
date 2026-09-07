@@ -2456,7 +2456,7 @@ function AyTalkMainApp() {
     const audioBase64 = String(result?.audioBase64 || "");
     if (!audioBase64) throw new Error("Ses kaydı alınamadı.");
 
-    const languageCode = language.speech.split("-")[0].toLowerCase();
+    const languageLocale = String(language.speech || "").trim();
     const transcribeResponse = await fetchJson<{text?: string; error?: string}>(
       "/audio/transcribe",
       {
@@ -2465,7 +2465,7 @@ function AyTalkMainApp() {
         body: JSON.stringify(
           autoDetectLanguage
             ? {audioBase64}
-            : {audioBase64, language: languageCode},
+            : {audioBase64, language: languageLocale},
         ),
       },
       20000,

@@ -1241,9 +1241,13 @@ app.post("/audio/transcribe", async (req, res) => {
 
     const requestedLanguage = String(
       req.body?.language || "",
+    ).trim();
+
+    const transcriptionContext = String(
+      req.body?.context || "",
     )
       .trim()
-      .toLowerCase();
+      .slice(-1200);
 
     if (!audioBase64) {
       return res.status(400).json({
@@ -1267,9 +1271,19 @@ app.post("/audio/transcribe", async (req, res) => {
     }
 
     // OpenAI language guidance expects ISO-639-1.
+    const normalizedLanguage =
+      requestedLanguage
+        .replace(/_/g, "-")
+        .toLowerCase();
+
+    const languageMatch =
+      normalizedLanguage.match(
+        /^([a-z]{2})(?:-[a-z]{2})?$/,
+      );
+
     const language =
-      /^[a-z]{2}$/.test(requestedLanguage)
-        ? requestedLanguage
+      languageMatch
+        ? languageMatch[1]
         : undefined;
 
     const transcription =
@@ -1281,10 +1295,9 @@ app.post("/audio/transcribe", async (req, res) => {
         ),
         model: "gpt-4o-mini-transcribe",
         ...(language ? {language} : {}),
-        prompt:
-          "Transcribe the speaker exactly. Preserve names, numbers, " +
-          "kinship terms, honorifics and ordinary words as spoken. " +
-          "Do not reinterpret normal words as acronyms.",
+        ...(transcriptionContext
+          ? {prompt: transcriptionContext}
+          : {}),
       });
 
     const text = String(
@@ -1510,6 +1523,17 @@ app.post("/call/translate", async (req, res) => {
     const message = String(req.body?.message || "").trim();
     const from = String(req.body?.from || "Auto").trim();
     const to = String(req.body?.to || "English").trim();
+    const sourceLocaleRaw =
+      String(req.body?.sourceLocale || "")
+        .trim()
+        .slice(0, 20);
+
+    const sourceLocale =
+      /^[A-Za-z]{2,3}(?:-[A-Za-z]{2,4})?$/.test(
+        sourceLocaleRaw,
+      )
+        ? sourceLocaleRaw
+        : "";
     const rawContext = Array.isArray(req.body?.context) ? req.body.context : [];
     const context = rawContext
       .slice(-18)
@@ -1546,6 +1570,11 @@ app.post("/call/translate", async (req, res) => {
       instructions:
         "You are LiveBridge, a professional real-time human interpreter. " +
         `Translate ONLY the CURRENT utterance from ${from} to ${to}. ` +
+        `The source locale hint is ${sourceLocale || "unknown"}. ` +
+        "This locale is only a broad technical hint from the language selector; it is NOT proof of the speaker's country or dialect. " +
+        "Infer the speaker's actual regional dialect or variety from the CURRENT utterance and dialogue context. If the locale hint conflicts with the actual speech, trust the actual speech. " +
+        "Understand regional vocabulary, colloquial grammar, idioms, slang and dialect-specific meanings before translating. Translate the intended conversational meaning, not a literal standard-language gloss. " +
+        "Never announce or explain which dialect you detected; return only the translation. " +
         "The dialogue history may contain both speakers. Use it to resolve pronouns, references, names, terminology, register and implied subjects. Keep names and terminology consistent across turns unless the speaker clearly changes them. " +
         "Do not translate previous turns again. Do not answer either speaker. " +
         "Before translating, silently repair only obvious speech-to-text slips when the intended wording is unambiguous from the current sentence and dialogue context; never invent missing meaning. " +
