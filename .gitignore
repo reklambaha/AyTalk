@@ -69,3 +69,4 @@ yarn-error.log*
 /ios
 # Local archive files
 *.7z
+.claude/
